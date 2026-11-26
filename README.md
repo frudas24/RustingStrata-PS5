@@ -42,11 +42,15 @@ Measured on one console (PS5 under Linux 7.3.3, `amdgpu.gttsize=12888`, Qwen3.6-
 |---|---:|---:|---:|
 | this fork, PS5 profile on (`STRATA_PS5=1`) | **294.5 / 86.8** | **347.0 / 83.5** | **9703/10240** (94.2% hit) |
 | same binary, profile off (`STRATA_PS5=0`) | 144.9 / 33.2 | 300.1 / 41.5 | 5344/10240 (51.4%) |
-| fork's 1.3.7 + prefill-protect binary, for reference | 185.7 / 41.1 | 278.0 / 42.0 | — |
+| 1.3.7 + prefill-protect only (`b7b832b`), for reference | 185.7 / 41.1 | 278.0 / 42.0 | — |
 
 That run reported `PS5 fresh weights: mapped 1 401 266 176 bytes, staged 1 034 752 bytes` (0.07% still through the
 staging path), and `worker busy` fell from 13 706 to 1 833 µs/token. It is one session in one order with 3 samples per
 cell, so order and thermals can bias small deltas; the method and its limits are in [docs/PS5.md](docs/PS5.md).
+
+The first two rows are the PS5 port alone and the third is the prefill-protect build from before the merge; `main`
+now carries both. The merged tree compiles with `tools/ps5/build.sh` on the console, but the combination has not been
+re-measured yet.
 
 Build and run on the console (no sudo):
 
@@ -62,11 +66,12 @@ Rollback is one variable: `STRATA_PS5=0` disables the Vulkan profile (the CPU an
 
 Branches of this fork:
 
-- `main` — upstream 1.3.7, this PS5 port and this README. Experimental: what is still unmeasured is listed in
-  [docs/PS5.md](docs/PS5.md).
-- `feat/expert-cache-prefill-protect` — `STRATA_PREFILL_PROTECT` (default on), which stops a long prompt from
-  flushing the hot decode cache, overlaps the next layer's cold NVMe read-ahead and releases cold prefill experts.
-  Proposed upstream; not merged into `main` here.
+- `main` — upstream 1.3.7, this PS5 port, the `STRATA_PREFILL_PROTECT` change described below, and this README.
+  Experimental: what is still unmeasured is listed in [docs/PS5.md](docs/PS5.md).
+- `feat/expert-cache-prefill-protect` — the prefill-protect change alone (`b7b832b`, on upstream `8df1c22`), kept
+  clean as the upstream PR branch: `STRATA_PREFILL_PROTECT` (default on) stops a long prompt from flushing the hot
+  decode cache, overlaps the next layer's cold NVMe read-ahead and releases cold prefill experts. It is merged into
+  `main` here, and the branch must stay free of the PS5 port or the PR would carry it.
 
 The licence and the credit are unchanged: original RustingStrata by Vasyl Trefilov, distributed under the same
 [LICENSE.md](LICENSE.md), no endorsement implied. Upstream's own README follows.
