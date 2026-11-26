@@ -35,6 +35,19 @@ pub fn total_ram() -> Option<u64> {
     None
 }
 
+/// Linux's estimate of RAM that can be reclaimed without swapping. Unlike total_ram,
+/// this includes reclaimable file cache and reflects the current workload.
+pub fn available_ram() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let m = std::fs::read_to_string("/proc/meminfo").ok()?;
+        return m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim()
+            .strip_suffix("kB")?.trim().parse::<u64>().ok()?.checked_mul(1024));
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 /// Usable cap in bytes: `max_ram` if nonzero, else `total - margin`. `None` means unlimited (RAM undetectable).
 pub fn ram_cap(margin: u64, max_ram: u64) -> Option<u64> {
     if max_ram > 0 {

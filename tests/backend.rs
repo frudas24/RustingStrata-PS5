@@ -175,3 +175,47 @@ fn batched_quantized_gemm_uses_prepared_x() {
         assert!(gemm(x.addr()) == want, "{backend}: GEMM used the quantization of the rows x held before");
     }
 }
+
+/// Run explicitly on the console. Do not let common::backends() silently skip a missing Vulkan device.
+#[test]
+#[ignore = "requires the AMD Vulkan device; run tools/ps5/test.sh --gpu"]
+fn ps5_fresh_upload_roundtrip_and_compute() {
+    use rusting_strata::backend::Backend;
+    let g = rusting_strata::vulkan::Vk::new(0).expect("PS5 Vulkan device required");
+    let n = 32769usize; // > 64 KiB, not a round workgroup size
+    let x: Vec<f32> = (0..n).map(|i| (i % 251) as f32 - 125.0).collect();
+    let bytes: Vec<u8> = x.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let a = g.upload_bytes(&bytes).unwrap();
+    let mut copy = vec![0u8; bytes.len()];
+    let b = g.alloc(bytes.len()).unwrap();
+    g.add(b.addr(), a.addr(), n).unwrap();
+    g.dtoh(&b, 0, &mut copy).unwrap();
+    assert_eq!(copy, bytes, "compute must see host writes on its first dispatch");
+    g.dtoh(&a, 0, &mut copy).unwrap();
+    assert_eq!(copy, bytes);
+    let (free, total) = g.mem_info().unwrap();
+    assert!(free <= total);
+}
+
+/// Cross the bounded conversion chunk and verify the original F16 -> F32 representation.
+#[test]
+#[ignore = "requires the AMD Vulkan device; run tools/ps5/test.sh --gpu"]
+fn ps5_f16_streamed_upload_matches() {
+    use rusting_strata::{backend::Backend, quant::GgmlType, weights::Tensor};
+    let g = rusting_strata::vulkan::Vk::new(0).expect("PS5 Vulkan device required");
+    let (rows, cols) = (32769usize, 32usize);
+    let bytes: Vec<u8> = (0..rows).flat_map(|r| {
+        let h = if r % 2 == 0 { [0u8, 0x3c] } else { [0u8, 0x40] }; // 1 or 2
+        (0..cols).flat_map(move |_| h)
+    }).collect();
+    let w = g.upload(&Tensor { ty: GgmlType::F16, rows, cols, data: &bytes, scale: 1.0 }).unwrap();
+    assert_eq!(w.ty, GgmlType::F32);
+    let x = g.upload_bytes(&[1.0f32; 32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let y = g.alloc(rows * 4).unwrap();
+    g.gemv(&w, x.addr(), y.addr()).unwrap();
+    let mut out = vec![0u8; rows * 4];
+    g.dtoh(&y, 0, &mut out).unwrap();
+    for (r, b) in out.chunks_exact(4).enumerate() {
+        assert_eq!(f32::from_le_bytes(b.try_into().unwrap()), if r % 2 == 0 { 32.0 } else { 64.0 });
+    }
+}

@@ -128,6 +128,8 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tab
 /// Memory types to allocate from, in order of preference (`Inner::buffer`). Flags: 1 device-local, 2 host-visible,
 /// 4 host-coherent, 8 host-cached.
 const DEVICE: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(1)];
+// Fresh immutable weights only: device local, host visible and coherent; no AMD uncached flags.
+const MAPPED_DEVICE: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(15), vk::MemoryPropertyFlags::from_raw(7)];
 /// Host memory: cached if possible, as CUDA's pinned memory (host reads of uncached memory are slow).
 const HOST: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
 /// Device memory the host maps through the PCIe BAR, for the CPU expert mailbox. A kernel polling host memory for the
@@ -166,6 +168,11 @@ struct Inner {
     budget: bool,
     /// Integrated GPU (APU sharing unified system LPDDR memory between device and host heaps).
     igpu: bool,
+    ps5: bool,
+    ps5_gtt: bool,
+    ps5_direct: bool,
+    ps5_host_reserve: u64,
+    ps5_upload_bytes: [std::sync::atomic::AtomicU64; 2],
     /// AMD RDNA3 / RDNA3.5 (gfx11xx) or iGPU whose small L2 cache hurts from next-layer MoE prefetch.
     gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
@@ -294,6 +301,10 @@ impl Drop for Mem {
 impl Drop for Inner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
+        if self.ps5 {
+            let [mapped, staged] = self.ps5_upload_bytes.each_ref().map(|v| v.load(std::sync::atomic::Ordering::Relaxed));
+            eprintln!("PS5 fresh weights: mapped {mapped} bytes, staged {staged} bytes");
+        }
         if let Some((_, _, tot)) = &st.prof {
             let scale = self.ts_period as f64;
             let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
@@ -426,7 +437,17 @@ impl Vk {
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
         let dev_props = unsafe { instance.get_physical_device_properties(pd) };
         let limits = dev_props.limits;
-        let igpu = dev_props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let ps5 = dev_props.vendor_id == 0x1002 && std::env::var("STRATA_PS5").is_ok_and(|v| v == "1");
+        let ps5_gtt = ps5 && budget && std::env::var("STRATA_PS5_GTT").is_ok_and(|v| v == "1");
+        let ps5_direct = ps5 && std::env::var("STRATA_PS5_DIRECT").is_ok_and(|v| v == "1");
+        let ps5_host_reserve = if ps5 {
+            std::env::var("STRATA_PS5_HOST_RESERVE_MB").ok().map(|v| v.parse::<u64>()).transpose()
+                .context("STRATA_PS5_HOST_RESERVE_MB")?.unwrap_or(1536).checked_mul(1 << 20)
+                .context("STRATA_PS5_HOST_RESERVE_MB overflow")?
+        } else { 0 };
+        let igpu = dev_props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU || ps5;
+        if ps5 { crate::say!("PS5 profile: GTT {}, mapped upload {}, host reserve {} MiB (driver budget {})",
+            ps5_gtt, ps5_direct, ps5_host_reserve >> 20, budget); }
         let name_up = name.to_ascii_uppercase();
         let gfx11 = dev_props.vendor_id == 0x1002 && (igpu || (coop && coop_i8 != 32)
             || ["GFX11", "STRIX", "PHOENIX", "KRACKAN", "NAVI3", "RADEON 8", "RADEON 7", "RX 7"]
@@ -505,7 +526,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -569,6 +590,24 @@ impl Vk {
 impl Inner {
     fn st(&self) -> MutexGuard<'_, State> { self.st.lock().unwrap_or_else(|e| e.into_inner()) }
 
+    fn heap_budget(&self) -> vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'static> {
+        let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        {
+            let mut p = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
+            unsafe { self.instance.get_physical_device_memory_properties2(self.pd, &mut p) };
+        }
+        b
+    }
+
+    fn ps5_host_room(&self) -> u64 {
+        // Unknown host availability is not permission to borrow from system RAM.
+        crate::memory::available_ram().unwrap_or(0).saturating_sub(self.ps5_host_reserve)
+    }
+
+    fn heap_free(&self, b: &vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>, h: usize) -> u64 {
+        b.heap_budget[h].min(self.mem.memory_heaps[h].size).saturating_sub(b.heap_usage[h])
+    }
+
     /// A buffer usable by kernels (device address) and copies, of at least `bytes`, in the first memory of `wants`
     /// (`DEVICE`, `HOST` or `BAR`) there is.
     fn buffer(&self, bytes: usize, wants: &[vk::MemoryPropertyFlags]) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
@@ -583,17 +622,31 @@ impl Inner {
         // Memory the GPU does not cache (AMD flags 0xc0) only when asked for: it would be slow for anything else.
         let ok = |f: vk::MemoryPropertyFlags, want| f.contains(want) && (f & vk::MemoryPropertyFlags::from_raw(0xc0) & !want).is_empty();
         // On an iGPU, device-local and GTT heaps live in the same LPDDR: fall back to HOST if DEVICE heap is full.
-        let candidates: Vec<vk::MemoryPropertyFlags> = if wants == DEVICE && self.igpu {
+        let candidates: Vec<vk::MemoryPropertyFlags> = if wants == DEVICE && ((self.igpu && !self.ps5) || self.ps5_gtt) {
             wants.iter().chain(HOST.iter()).copied().collect()
         } else {
             wants.to_vec()
         };
+        // Do not let RADV silently oversubscribe a heap on PS5. Unlike a discrete GPU,
+        // GTT borrows from the same physical RAM the CPU experts and Linux need.
+        let budget = (self.ps5 && self.budget && (wants == DEVICE || wants == MAPPED_DEVICE)).then(|| self.heap_budget());
+        let host_room = if budget.is_some() { self.ps5_host_room() } else { 0 };
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let mut last_err = anyhow::anyhow!("no matching memory type for {bytes} bytes");
         let mut mem_ok = None;
         'outer: for want in candidates {
             for i in 0..self.mem.memory_type_count {
                 if req.memory_type_bits & (1 << i) != 0 && ok(self.mem.memory_types[i as usize].property_flags, want) {
+                    let h = self.mem.memory_types[i as usize].heap_index as usize;
+                    if let Some(b) = &budget {
+                        let local = self.mem.memory_heaps[h].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+                        let free = self.heap_free(b, h);
+                        let room = if local { free } else if self.ps5_gtt { free.min(host_room) } else { 0 };
+                        if req.size > room {
+                            last_err = anyhow::anyhow!("PS5 heap {h}: need {} MiB, budget {} MiB", req.size >> 20, room >> 20);
+                            continue;
+                        }
+                    }
                     match unsafe {
                         self.dev.allocate_memory(
                             &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(i).push_next(&mut flags),
@@ -607,7 +660,10 @@ impl Inner {
             }
         }
         let mem = match mem_ok { Some(m) => m, None => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(last_err); } };
-        unsafe { self.dev.bind_buffer_memory(buf, mem, 0) }?;
+        if let Err(e) = unsafe { self.dev.bind_buffer_memory(buf, mem, 0) } {
+            unsafe { self.dev.destroy_buffer(buf, None); self.dev.free_memory(mem, None); }
+            return Err(e.into());
+        }
         Ok((buf, mem))
     }
 
@@ -1055,6 +1111,36 @@ impl Backend for Vk {
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
 
+    fn upload_bytes(&self, src: &[u8]) -> anyhow::Result<Buf> {
+        // New buffer, never used by a submitted or recorded command: the next queue
+        // submission makes coherent host writes available to device operations.
+        // Do not use this path for live expert slots, KV, scratch or mailbox updates.
+        if self.0.ps5_direct && src.len() > 65536 {
+            if let Ok((buf, mem)) = self.0.buffer(src.len(), MAPPED_DEVICE) {
+                match unsafe { self.0.dev.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
+                    Ok(p) => {
+                        unsafe {
+                            let p = p.cast::<u8>();
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+                            // Match the old zeroed allocation's tail, up to Vulkan's 4-byte alignment.
+                            p.add(src.len()).write_bytes(0, src.len().next_multiple_of(4) - src.len());
+                            self.0.dev.unmap_memory(mem);
+                        }
+                        let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
+                        self.0.st().bufs.insert(addr, (buf, src.len()));
+                        self.0.ps5_upload_bytes[0].fetch_add(src.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(Buf::new(addr, src.len(), Mem { vk: self.0.clone(), buf, mem, addr }));
+                    }
+                    Err(_) => unsafe { self.0.dev.destroy_buffer(buf, None); self.0.dev.free_memory(mem, None); },
+                }
+            }
+        }
+        let b = self.alloc(src.len())?;
+        self.htod(src, &b, 0)?;
+        if self.0.ps5 { self.0.ps5_upload_bytes[1].fetch_add(src.len() as u64, std::sync::atomic::Ordering::Relaxed); }
+        Ok(b)
+    }
+
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
@@ -1158,11 +1244,26 @@ impl Backend for Vk {
             .context("no device-local heap")?;
         let total = m.memory_heaps[h].size as usize;
         if !self.0.budget { return Ok((total.saturating_sub(self.0.st().bufs.values().map(|b| b.1).sum()), total)); }
-        let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-        let mut p = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
-        unsafe { self.0.instance.get_physical_device_memory_properties2(self.0.pd, &mut p) };
-        let _ = p;
-        Ok((b.heap_budget[h].saturating_sub(b.heap_usage[h]) as usize, total))
+        let b = self.0.heap_budget();
+        if !self.0.ps5_gtt {
+            return Ok((self.0.heap_free(&b, h) as usize, total));
+        }
+        // Count each eligible non-local heap once, even if it has several HOST types.
+        // Do not add a second copy of a unified/device-local heap to the total.
+        let mut seen = [false; 16];
+        let (mut host_free, mut host_total) = (0u64, 0u64);
+        for t in &m.memory_types[..m.memory_type_count as usize] {
+            let i = t.heap_index as usize;
+            if seen[i] || m.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                || !HOST.iter().any(|&want| t.property_flags.contains(want))
+                || !(t.property_flags & vk::MemoryPropertyFlags::from_raw(0xc0)).is_empty() { continue; }
+            seen[i] = true;
+            host_free = host_free.saturating_add(self.0.heap_free(&b, i));
+            host_total = host_total.saturating_add(m.memory_heaps[i].size);
+        }
+        let free = self.0.heap_free(&b, h).saturating_add(host_free.min(self.0.ps5_host_room()));
+        let total = (total as u64).saturating_add(host_total);
+        Ok((free.min(total) as usize, total as usize))
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.0.flush(&mut self.0.st()) }

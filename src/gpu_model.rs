@@ -1109,7 +1109,10 @@ impl<'a> GpuModel<'a> {
             {
                 Some(mb) => {
                     crate::say!("note: STRATA_EXPERT_MB={mb} override active (reported free device heap: {} MB)", free1 >> 20);
-                    mb << 20
+                    let requested = mb.saturating_mul(1 << 20);
+                    if std::env::var("STRATA_PS5").is_ok_and(|v| v == "1") {
+                        requested.min(free1.saturating_sub(vram_margin))
+                    } else { requested }
                 }
                 None => free1.saturating_sub(vram_margin),
             };

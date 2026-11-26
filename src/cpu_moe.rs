@@ -35,12 +35,14 @@ pub fn quantize_q8k(x: &[f32]) -> Vec<Q8K> {
         let max = *b.iter().find(|v| v.abs() == amax).unwrap();
         let is = -127.0 / max;
         let mut qs = [0i8; 256];
-        #[cfg(target_feature = "avx2")]
-        avx2::quant_block(is, b, &mut qs);
-        #[cfg(not(target_feature = "avx2"))]
-        for (q, &v) in qs.iter_mut().zip(b) { *q = ((is * v).round_ties_even() as i32).min(127) as i8; }
         let mut bs = [0i16; 16];
-        for (s, c) in bs.iter_mut().zip(qs.chunks_exact(16)) { *s = c.iter().map(|&v| v as i16).sum(); }
+        #[cfg(target_feature = "avx2")]
+        avx2::quant_block(is, b, &mut qs, &mut bs);
+        #[cfg(not(target_feature = "avx2"))]
+        {
+            for (q, &v) in qs.iter_mut().zip(b) { *q = ((is * v).round_ties_even() as i32).min(127) as i8; }
+            for (s, c) in bs.iter_mut().zip(qs.chunks_exact(16)) { *s = c.iter().map(|&v| v as i16).sum(); }
+        }
         Q8K { d: 1.0 / is, qs, bs }
     }).collect()
 }
@@ -405,13 +407,22 @@ mod avx2 {
         _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)))
     } }
     /// qs = round(is * b), as the scalar path (|is * b| <= 127, so the saturating packs equal its min(127)).
-    pub fn quant_block(is: f32, b: &[f32], qs: &mut [i8; 256]) { unsafe {
+    pub fn quant_block(is: f32, b: &[f32], qs: &mut [i8; 256], bs: &mut [i16; 16]) { unsafe {
         let s = _mm256_set1_ps(is);
         let q = |i: usize| _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(s, _mm256_loadu_ps(b[i..i + 8].as_ptr())), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
         for j in (0..256).step_by(32) {
             let p = _mm256_packs_epi16(_mm256_packs_epi32(q(j), q(j + 8)), _mm256_packs_epi32(q(j + 16), q(j + 24)));
-            _mm256_storeu_si256(qs[j..j + 32].as_mut_ptr() as *mut __m256i, _mm256_permutevar8x32_epi32(p, perm));
+            let packed = _mm256_permutevar8x32_epi32(p, perm);
+            _mm256_storeu_si256(qs[j..j + 32].as_mut_ptr() as *mut __m256i, packed);
+            // Fuse both 16-value sums into the quantizer; no second walk of qs.
+            // Pair sums fit i16 (even for -128), four-value sums fit i32.
+            let pair = _mm256_maddubs_epi16(_mm256_set1_epi8(1), packed);
+            let four = _mm256_madd_epi16(pair, _mm256_set1_epi16(1));
+            let eight = _mm256_hadd_epi32(four, four);
+            let sixteen = _mm256_hadd_epi32(eight, eight);
+            bs[j / 16] = _mm_cvtsi128_si32(_mm256_castsi256_si128(sixteen)) as i16;
+            bs[j / 16 + 1] = _mm_cvtsi128_si32(_mm256_extracti128_si256(sixteen, 1)) as i16;
         }
     } }
     #[inline(always)]
@@ -1491,12 +1502,33 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
     });
 }
 
+/// Quantize each *identical input slice* only once during this call. The router
+/// supplies the same token activation for multiple experts; pointer+length is
+/// sufficient because every input is immutably borrowed for the entire pass.
+/// Do not persist these identities across calls or deduplicate by float equality.
+fn quantize_unique(xs: &[&[f32]]) -> (Vec<Vec<Q8K>>, Vec<usize>) {
+    if xs.len() == 1 { return (vec![quantize_q8k(xs[0])], vec![0]); }
+    let mut seen = std::collections::HashMap::with_capacity(xs.len());
+    let mut unique = Vec::new();
+    let mut indices = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let k = (x.as_ptr() as usize, x.len());
+        let i = *seen.entry(k).or_insert_with(|| {
+            let i = unique.len();
+            unique.push(quantize_q8k(x));
+            i
+        });
+        indices.push(i);
+    }
+    (unique, indices)
+}
+
 /// Rows `out.len()` of a batch of matrices: out[i] = mats[i / rows] row (i % rows) · x of that matrix, where
 /// matrix j uses xs[j * xs.len() / mats.len()] (one x for all, or one each), so a shared x is quantized once.
 fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
     let (dot, fdot) = (int_dot(mats[0].ty), float_dot(mats[0].ty));
-    let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
+    let (xq, xq_indices) = if dot.is_some() { quantize_unique(xs) } else { (vec![], vec![]) };
     // Q2_0 experts benefit from fewer Rayon tasks on AVX2. Keep enough chunks to occupy the pool,
     // including when only one expert misses; other formats keep their existing granularity.
     let batch = if mats[0].ty == GgmlType::Q2_0 && cfg!(target_feature = "avx2")
@@ -1507,7 +1539,7 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
             let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
             *v = match (dot, fdot) {
-                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]) * t.scale,
+                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[xq_indices[x]]) * t.scale,
                 (_, Some(d)) => d(&t.data[r * rb..(r + 1) * rb], xs[x]) * t.scale,
                 _ => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
@@ -1598,6 +1630,39 @@ pub fn expert_rows(m: &Model, il: usize, hs: &[Vec<f32>], pairs: &[(usize, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_quantization_is_slice_identity_not_value_or_pointer_alone() {
+        let a: Vec<f32> = (0..640).map(|i| i as f32 - 320.0).collect();
+        let b = a.clone();
+        let xs = [&a[..], &a[..], &a[..256], &b[..], &a[..]];
+        let (q, ids) = quantize_unique(&xs);
+        assert_eq!(ids, [0, 0, 1, 2, 0]);
+        assert_eq!(q.len(), 3);
+        for (x, i) in xs.iter().zip(ids) {
+            let want = quantize_q8k(x);
+            assert_eq!(q[i].len(), want.len());
+            for (v, w) in q[i].iter().zip(want) {
+                assert_eq!(v.d.to_bits(), w.d.to_bits());
+                assert_eq!(v.qs, w.qs);
+                assert_eq!(v.bs, w.bs);
+            }
+        }
+    }
+
+    #[test]
+    fn q8_group_sums_match_scalar_including_tail_and_zero() {
+        for n in [1, 32, 255, 256, 257, 640, 4096] {
+            for zero in [false, true] {
+                let x: Vec<f32> = (0..n).map(|i| if zero { 0.0 } else { ((i * 131 % 509) as f32 - 254.0) * 0.13 }).collect();
+                for q in quantize_q8k(&x) {
+                    for (bs, group) in q.bs.iter().zip(q.qs.chunks_exact(16)) {
+                        assert_eq!(*bs, group.iter().map(|&v| v as i16).sum::<i16>());
+                    }
+                }
+            }
+        }
+    }
 
     /// A 4-activation kernel must give the bits of the single kernel (72 blocks, and 9: an odd count).
     #[test]

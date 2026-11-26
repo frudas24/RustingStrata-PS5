@@ -181,18 +181,35 @@ pub trait Backend: Send {
     /// shared-memory limit have nothing to check.
     fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
 
+    /// A fresh buffer entirely initialized by `src`. Backends may avoid staging/clearing it.
+    /// The returned bytes are ready for the next queued GPU operation.
+    fn upload_bytes(&self, src: &[u8]) -> anyhow::Result<Buf> {
+        let b = self.alloc(src.len())?;
+        self.htod(src, &b, 0)?;
+        Ok(b)
+    }
+
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
         let gt = match upload_type(t.ty) {
             GgmlType::F32 if t.ty == GgmlType::F16 => {
-                let mut f = vec![0f32; t.rows * t.cols];
-                crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
-                let b = self.alloc(4 * f.len())?;
-                self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
+                // Bound transient RAM even for a multi-GiB F16 tensor. Keep the existing
+                // F32 device representation and exact conversion, with 4 MiB scratch.
+                let n = t.rows.checked_mul(t.cols).ok_or_else(|| anyhow::anyhow!("F16 tensor size overflow"))?;
+                anyhow::ensure!(n.checked_mul(2) == Some(t.data.len()), "invalid F16 tensor size");
+                let b = self.alloc(n.checked_mul(4).ok_or_else(|| anyhow::anyhow!("F32 tensor size overflow"))?)?;
+                const ELEMS: usize = 1 << 20;
+                let mut scratch = Vec::with_capacity(n.min(ELEMS) * 4);
+                for (i, chunk) in t.data.chunks(ELEMS * 2).enumerate() {
+                    scratch.clear();
+                    for h in chunk.chunks_exact(2) {
+                        scratch.extend_from_slice(&half::f16::from_le_bytes([h[0], h[1]]).to_f32().to_le_bytes());
+                    }
+                    self.htod(&scratch, &b, i * ELEMS * 4)?;
+                }
                 GpuTensor::new(GgmlType::F32, t.rows, t.cols, b)
             }
             ty => {
-                let b = self.alloc(t.data.len())?;
-                self.htod(t.data, &b, 0)?;
+                let b = self.upload_bytes(t.data)?;
                 GpuTensor::new(ty, t.rows, t.cols, b)
             }
         };
@@ -200,8 +217,7 @@ pub trait Backend: Send {
     }
 
     fn upload_raw(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
-        let b = self.alloc(t.data.len())?;
-        self.htod(t.data, &b, 0)?;
+        let b = self.upload_bytes(t.data)?;
         Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 

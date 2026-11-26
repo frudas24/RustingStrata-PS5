@@ -12,6 +12,8 @@ GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the
 
 Version 1.3.7.
 
+**Modified experimental PS5 Linux edition (R1)** — original RustingStrata by Vasyl Trefilov. See [docs/PS5.md](docs/PS5.md) for the changes, target build, validation limitations and rollback. The original license is unchanged.
+
 ## Numbers
 
 Qwen3.6-35B-A3B on an RTX 3060 12 GB (Ryzen 5 7600X, 32 GB RAM), CUDA, greedy, against llama.cpp tuned for the same
