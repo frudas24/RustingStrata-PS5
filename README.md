@@ -12,7 +12,64 @@ GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the
 
 Version 1.3.7.
 
-**Modified experimental PS5 Linux edition (R1)** — original RustingStrata by Vasyl Trefilov. See [docs/PS5.md](docs/PS5.md) for the changes, target build, validation limitations and rollback. The original license is unchanged.
+## This fork is meant for the PS5
+
+This is a fork of [RustingStrata](https://github.com/RustingStudio/RustingStrata) with one purpose: running the engine
+on a **PlayStation 5 under Linux** — Zen 2 x86-64 with AVX2/FMA/F16C, AMD GFX1013 through the RADV Vulkan driver, and
+one pool of shared GDDR6 instead of separate RAM and VRAM. Nothing here targets a desktop. The upstream engine, its
+docs and its numbers below are unchanged and still describe upstream behaviour; this fork adds an opt-in PS5 path on
+top of them.
+
+What the fork adds (all of it in `main`):
+
+- **`STRATA_PS5` Vulkan profile** (`src/vulkan/mod.rs`): the device is treated as sharing memory, with separate
+  local-device and GTT (host-visible) heap budgets, a per-allocation budget check, and a reserve borrowed from Linux
+  `MemAvailable` (`src/memory.rs`), so expert pools are sized from what the console actually has instead of from a
+  desktop's assumption.
+- **Direct uploads** (`src/vulkan/mod.rs`, `src/backend.rs`): fresh uploads above 64 KiB go straight into
+  `HOST_VISIBLE` + `HOST_COHERENT` device-local memory with no staging copy and no pre-clear, and F16 weights stream
+  to F32 through a bounded 4 MiB scratch buffer (`upload_bytes`) instead of a whole-tensor F32 host allocation.
+- **CPU side** (`src/cpu_moe.rs`): Q8_K block sums fused into the existing AVX2 packing, and per-batch deduplication
+  of activation quantization. These apply to every build, not only to the PS5 one.
+- **Tooling** (`tools/ps5/`): `build.sh` (explicit `znver2`, fat LTO, target feature check), a `run.sh` preset,
+  `diagnose.sh`, `test.sh`, `bench.sh` (A/B over the memory paths) and `summarize.py`. [docs/PS5.md](docs/PS5.md)
+  documents every change, the assumptions about the console, the rollback and the limits.
+
+Measured on one console (PS5 under Linux 7.3.3, `amdgpu.gttsize=12888`, Qwen3.6-35B-A3B UD-Q2_K_XL, Vulkan,
+`--ctx 8192 --chunk 512 --kv q8 --threads 6 --mtp 0`, `STRATA_FIXED_EXPERTS=1`, 3 repetitions, one session, serial):
+
+| run | pp512 prefill / decode tok/s | pp4096 prefill / decode | experts resident |
+|---|---:|---:|---:|
+| this fork, PS5 profile on (`STRATA_PS5=1`) | **294.5 / 86.8** | **347.0 / 83.5** | **9703/10240** (94.2% hit) |
+| same binary, profile off (`STRATA_PS5=0`) | 144.9 / 33.2 | 300.1 / 41.5 | 5344/10240 (51.4%) |
+| fork's 1.3.7 + prefill-protect binary, for reference | 185.7 / 41.1 | 278.0 / 42.0 | — |
+
+That run reported `PS5 fresh weights: mapped 1 401 266 176 bytes, staged 1 034 752 bytes` (0.07% still through the
+staging path), and `worker busy` fell from 13 706 to 1 833 µs/token. It is one session in one order with 3 samples per
+cell, so order and thermals can bias small deltas; the method and its limits are in [docs/PS5.md](docs/PS5.md).
+
+Build and run on the console (no sudo):
+
+```sh
+bash tools/ps5/diagnose.sh
+bash tools/ps5/build.sh
+bash tools/ps5/test.sh --gpu
+bash tools/ps5/run.sh chat --model /path/to/model.gguf
+```
+
+Rollback is one variable: `STRATA_PS5=0` disables the Vulkan profile (the CPU and F16 changes stay), while
+`STRATA_PS5_GTT=0` and `STRATA_PS5_DIRECT=0` switch off the GTT budget and the direct uploads on their own.
+
+Branches of this fork:
+
+- `main` — upstream 1.3.7, this PS5 port and this README. Experimental: what is still unmeasured is listed in
+  [docs/PS5.md](docs/PS5.md).
+- `feat/expert-cache-prefill-protect` — `STRATA_PREFILL_PROTECT` (default on), which stops a long prompt from
+  flushing the hot decode cache, overlaps the next layer's cold NVMe read-ahead and releases cold prefill experts.
+  Proposed upstream; not merged into `main` here.
+
+The licence and the credit are unchanged: original RustingStrata by Vasyl Trefilov, distributed under the same
+[LICENSE.md](LICENSE.md), no endorsement implied. Upstream's own README follows.
 
 ## Numbers
 
@@ -126,6 +183,7 @@ Inkling 2 open the GPU by themselves.
 - [HOSTING.md](docs/HOSTING.md): running a server for other people.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
+- [PS5.md](docs/PS5.md): this fork's PS5 port, what changed, the build, the rollback and the benchmark method.
 - [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
