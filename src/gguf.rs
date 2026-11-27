@@ -63,7 +63,9 @@ impl<'a> Cur<'a> {
         let n = usize::try_from(self.u64()?).context("GGUF string length out of range")?;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
-    fn val(&mut self, t: u32) -> anyhow::Result<Value> {
+    fn val(&mut self, t: u32) -> anyhow::Result<Value> { self.val_depth(t, 0) }
+    fn val_depth(&mut self, t: u32, depth: usize) -> anyhow::Result<Value> {
+        anyhow::ensure!(depth <= 32, "GGUF metadata nesting exceeds 32");
         Ok(match t {
             0 => Value::U8(self.take(1)?[0]),
             1 => Value::I8(self.take(1)?[0] as i8),
@@ -76,9 +78,10 @@ impl<'a> Cur<'a> {
             8 => Value::Str(self.str()?),
             9 => {
                 let (et, n) = (self.u32()?, usize::try_from(self.u64()?).context("GGUF array length out of range")?);
+                anyhow::ensure!(et <= 12, "unknown GGUF array element type {et}");
                 if n > self.b.len().saturating_sub(self.p) { bail!("GGUF array length exceeds remaining data"); }
                 let mut a = Vec::with_capacity(n.min(1024));
-                for _ in 0..n { a.push(self.val(et)?); }
+                for _ in 0..n { a.push(self.val_depth(et, depth + 1)?); }
                 Value::Arr(a)
             }
             10 => Value::U64(self.u64()?),

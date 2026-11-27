@@ -352,3 +352,21 @@ fn audit_rejects_inconsistent_tensor_layouts() {
     let mut t=t.clone(); t.offset=u64::MAX; assert!(g.raw_bytes(&t,4).is_err());
     t.file=usize::MAX; assert!(g.raw_bytes(&t,4).is_err());
 }
+
+#[test]
+fn audit_rejects_deep_metadata() {
+    for bad_type in [false,true] {
+        let mut b=b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes()); b.extend(0u64.to_le_bytes()); b.extend(1u64.to_le_bytes());
+        w_str(&mut b,"test.array"); b.extend(9u32.to_le_bytes());
+        if bad_type { b.extend(99u32.to_le_bytes()); b.extend(0u64.to_le_bytes()); }
+        else {
+            for _ in 0..34 { b.extend(9u32.to_le_bytes()); b.extend(1u64.to_le_bytes()); }
+            b.extend(0u32.to_le_bytes()); b.extend(1u64.to_le_bytes()); b.push(0);
+        }
+        b.resize(b.len().next_multiple_of(32),0);
+        let p=std::env::temp_dir().join(format!("strata-audit-meta-{}-{bad_type}.gguf",std::process::id()));
+        std::fs::write(&p,b).unwrap(); let r=Gguf::open(&p); std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+}
