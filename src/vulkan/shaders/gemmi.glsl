@@ -93,6 +93,13 @@ void main() {
     } else {
         wt = U8(p.wd); m0 = gl_WorkGroupID.y * XM; cnt = min(XM, p.nd - m0);
     }
+#ifdef STRATA_R12_ROUTED
+    // z partitions positions, NOT K. A uniform early return precedes all barriers.
+    // Host submits the original 128-position tile list; no routing or weight changes.
+    uint base = gl_WorkGroupID.z * XM;
+    if (uint64_t(p.tiles) == 0 || base >= cnt) return;
+    m0 += base; cnt = min(XM, cnt - base);
+#endif
 #if COOP
     if (uint64_t(p.tiles) != 0 && (cnt <= 32) != (SM != 0)) return;
 #endif
@@ -131,7 +138,7 @@ void main() {
     bool wok = n0 + wr < p.rows;
     // Split K (gemmi_s in batched decode, z = segment): this workgroup sums K steps k0 .. k1 into its own y slice.
     // Only SM: the same code in gemmi cost a third of its prefill speed.
-#if SM
+#if SM && !defined(STRATA_R12_ROUTED)
     uint nkl = (p.nk + gl_NumWorkGroups.z - 1) / gl_NumWorkGroups.z, k0 = gl_WorkGroupID.z * nkl, k1 = min(p.nk, k0 + nkl), kz = gl_WorkGroupID.z;
 #else
     const uint k0 = 0, kz = 0;

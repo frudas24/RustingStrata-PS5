@@ -73,6 +73,10 @@ const SPV: &[(&str, &[u8])] = &[
     #[cfg(feature = "ps5-r2")]
     ("moe_gemv_q_ps5_128", include_bytes!(concat!(env!("OUT_DIR"), "/moe_gemv_q_ps5_128.spv"))),
     #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_iq32", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_iq32.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_iq64", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_iq64.spv"))),
+    #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_64", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_64.spv"))),
     #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_32", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_32.spv"))),
@@ -1125,6 +1129,8 @@ impl Vk {
                 "gemmi_dp_ps5_32" => 4,
                 "gemmi_dp_ps5_64" => 1 << 8,
                 "gemm_f_dp_ps5_iq32" => 1 << 9,
+                "gemmi_dp_ps5_iq32" => 1 << 12,
+                "gemmi_dp_ps5_iq64" => 1 << 13,
                 "attn_prefill_ps5_256" => 8,
                 "attn_prefill_ps5_512" => 16,
                 "attn_prefill_ps5_1024" => 32,
@@ -1220,6 +1226,16 @@ impl Vk {
             && *ENABLE.get_or_init(|| std::env::var("STRATA_PS5_R11_IQ32").as_deref() == Ok("1"))
     }
 
+    // R12: independent routed INT8 tiles, no cooperative matrices or changed arithmetic.
+    fn r12_iq_tile(&self, ty: GgmlType) -> usize {
+        static TILE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        if !cfg!(feature = "ps5-r2") || !self.0.ps5 || self.0.wave64 || self.0.coop_i8 != 0
+            || !matches!(ty, GgmlType::IQ3XXS | GgmlType::IQ4XS) { return 0; }
+        *TILE.get_or_init(|| match std::env::var("STRATA_PS5_R12_IQ_INT_TILE").as_deref() {
+            Ok("32") => 32, Ok("64") => 64, _ => 0,
+        })
+    }
+
     fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if n_x <= crate::cpu_worker::TMAX && need <= (1 << 20) { &self.4 } else { &self.3 }
@@ -1305,6 +1321,15 @@ impl Vk {
         }
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
+        if tiles != 0 {
+            let tile = self.r12_iq_tile(ty);
+            if tile != 0 {
+                // Original routed tile list is bounded to 128 positions. z selects
+                // a disjoint subtile; each output still reduces the entire K dimension.
+                return self.run(if tile == 32 { "gemmi_dp_ps5_iq32" } else { "gemmi_dp_ps5_iq64" },
+                    &spec, [grid[0], grid[1], crate::backend::GEMM_BM / tile], &args);
+            }
+        }
         if self.0.r2.tiled64(self.0.coop_i8, tiles, nd) {
             // SM=2 uses two 16-column fragments per logical wave and 64 dense positions.
             // No split-K (z=1); original tile-list and cooperative routes remain untouched.
