@@ -12,9 +12,14 @@ case "${1:---offline}" in
     python3 tools/test_kld_compare.py
     ;;
   --cpu)
-    cargo test "${args[@]}" --test gguf audit_rejects_inconsistent_tensor_layouts -- --exact --nocapture
-    cargo test "${args[@]}" --test gguf audit_rejects_deep_metadata -- --exact --nocapture
-    cargo test "${args[@]}" --bin rustingstrata audit_log_probs_rejects_invalid_input -- --exact --nocapture
+    log=$(mktemp); trap 'rm -f "$log"' EXIT
+    checked_one() {
+      cargo test "${args[@]}" "$@" -- --exact --nocapture 2>&1 | tee "$log"
+      grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+    }
+    checked_one --test gguf audit_rejects_inconsistent_tensor_layouts
+    checked_one --test gguf audit_rejects_deep_metadata
+    checked_one --bin rustingstrata audit_log_probs_rejects_invalid_input
     ;;
   --gpu)
     while IFS= read -r name; do unset "$name"; done < <(compgen -e | grep -E '^(STRATA_|PS5_)' || true)
@@ -22,6 +27,7 @@ case "${1:---offline}" in
     log=$(mktemp); trap 'rm -f "$log"' EXIT
     cargo test "${args[@]}" --test ps5_audit moe_duplicate_slots_complete -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
     grep -Fq 'AUDIT_MOE_DUPLICATES PASS: 5 shapes, including overflow' "$log"
+    grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
     ;;
   *) echo 'usage: test-r11u1-audit.sh [--offline|--cpu|--gpu]' >&2; exit 2;;
 esac

@@ -10,9 +10,11 @@ export STRATA_PS5=1 STRATA_VK_NO_COOP=1 STRATA_PS5_R6=1 STRATA_TEST_BACKENDS=vul
 args=(--locked --release --target "$PS5_TARGET" --features ps5-r2)
 git rev-parse HEAD > "$out/commit.txt"
 cargo test "${args[@]}" --test r12_iq shared_bound -- --exact --nocapture 2>&1 | tee "$out/lds.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/lds.log"
 grep -Fq 'R12 LDS type=18' "$out/lds.log"; grep -Fq 'R12 LDS type=23' "$out/lds.log"
 for flag in 0 32 64; do
   STRATA_PS5_R12_IQ_INT_TILE=$flag PS5_R12_GPU_FILE="$out/gpu-$flag.bin" cargo test "${args[@]}" --test r12_iq fingerprint -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$out/gpu-$flag.log"
+  grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/gpu-$flag.log"
   [[ $(stat -c %s "$out/gpu-$flag.bin") == 37981440 ]]
   grep -Fq 'R12 IQ integer GPU parity: 1296 cases' "$out/gpu-$flag.log"
   for tile in 32 64; do

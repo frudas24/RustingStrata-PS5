@@ -47,7 +47,7 @@ def expected(tile, lut, test='model'):
 
 
 def check_marks(log, tile, lut, test='model'):
-    all_marks = set(re.findall(r'^PS5 R6 exercised: (\w+)[ \t]*$', log, re.M))
+    all_marks = r6.dispatch_marks(log)
     r6.require(not all_marks - KNOWN - ALLOWED_OTHER, f'unexpected dispatch markers: {sorted(all_marks - KNOWN - ALLOWED_OTHER)}')
     found = all_marks & KNOWN
     want = expected(tile, lut, test)
@@ -76,6 +76,13 @@ def check_lds(log):
         seen.add(key)
     r6.require(seen == set(expected), 'missing LDS records')
     return len(seen)
+
+
+def arm(base_tile, tile, lut, candidate):
+    # A winning integer tile remains independently testable when every LUT loses.
+    # Distinct filenames avoid overwriting the two quality arms when both use off.
+    if not candidate: return base_tile, 'off', 'off'
+    return tile, lut, 'candidate-off' if lut == 'off' else lut
 
 
 def flags(tile, lut):
@@ -124,31 +131,34 @@ def run_campaign(a):
     reports = {}
     base_tile = a.tile if a.base_tile is None else a.base_tile
     try:
+        r6.require(a.profile_only or a.lut != 'off' or base_tile != a.tile, 'no experimental change: use a different --base-tile with --lut off')
         if a.corpus:
             r6.require(128 <= a.ctx_len <= a.ctx and a.chunks > 0, 'invalid quality settings')
             corpus = r6.file_id(a.corpus)
             hashes = []
-            for lut in ('off', a.lut):
-                tile = base_tile if lut == 'off' else a.tile
+            for candidate in (False, True):
+                tile, lut, stem = arm(base_tile, a.tile, a.lut, candidate)
                 env = r6.child_env(k); env.update(flags(tile, lut))
-                dump, log = session.out/f'{lut}.bin', session.out/f'{lut}.log'
+                dump, log = session.out/f'{stem}.bin', session.out/f'{stem}.log'
                 cmd = [str(session.binary), 'perplexity', *r6.engine_args(a.model,k,s),'--file',str(a.corpus.resolve()),'--ctx-len',str(a.ctx_len),'--chunks',str(a.chunks),'--kld-base',str(dump)]
-                r6.atomic_json(session.out/f'{lut}-request.json',dict(cmd=cmd,flags=flags(tile,lut)))
+                r6.atomic_json(session.out/f'{stem}-request.json',dict(cmd=cmd,flags=flags(tile,lut)))
+                r6.require(corpus==r6.file_id(a.corpus), 'corpus changed before quality arm')
                 memory=r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
+                r6.require(corpus==r6.file_id(a.corpus), 'corpus changed during quality arm')
                 text=log.read_text(errors='replace'); r6.evidence(text,k); check_marks(text,tile,lut)
                 quality.check_dump(dump,text,a.ctx_len,a.chunks)
                 hashes.append(r6.digest(dump))
-                r6.atomic_json(session.out/f'{lut}-memory.json',memory)
+                r6.atomic_json(session.out/f'{stem}-memory.json',memory)
             r6.require(ident==r6.identity(a.model,a.bin) and corpus==r6.file_id(a.corpus),'identity changed')
             same=hashes[0]==hashes[1]
             r6.atomic_json(session.out/'summary.json',dict(encoded_identity=same,hashes=hashes,identity=ident,corpus=corpus,base_tile=base_tile,tile=a.tile,lut=a.lut,production_promotion=False))
             return 0 if same else 1
         for task in ('prose','holdout'):
             runs=[]
-            for i,lut in enumerate(('off',a.lut) if a.profile_only else ('off',a.lut,a.lut,'off'),1):
-                stem=f'{task}-{i}-{lut}'
+            for i,candidate in enumerate((False,True) if a.profile_only else (False,True,True,False),1):
+                tile,lut,label=arm(base_tile,a.tile,a.lut,candidate)
+                stem=f'{task}-{i}-{label}'
                 log,result=(session.out/(stem+ext) for ext in ('.log','.json'))
-                tile=base_tile if lut=='off' else a.tile
                 env=r6.child_env(k);env.update(flags(tile,lut))
                 if a.profile_only:
                     env.update(STRATA_VK_PROF='1',STRATA_VK_STATS='1',STRATA_PS5_R11_PROFILE='1',STRATA_PS5_R13_MEM_TRACE='1',STRATA_PS5_R13_QUANT_TRACE='1')
@@ -182,7 +192,7 @@ def main():
     ld=sub.add_parser('lds');ld.add_argument('--log',type=Path,required=True)
     b=sub.add_parser('run');b.add_argument('--model',type=Path,required=True);b.add_argument('--bin',type=Path,default=r6.DEFAULT_BIN);b.add_argument('--out',type=Path,required=True)
     for x in (m,b):
-        x.add_argument('--tile',type=int,choices=(0,32,64),default=0);x.add_argument('--lut',choices=('off','iq2','int','all') if x is m else ('iq2','int','all'),required=True)
+        x.add_argument('--tile',type=int,choices=(0,32,64),default=0);x.add_argument('--lut',choices=('off','iq2','int','all'),required=True)
     b.add_argument('--base-tile',type=int,choices=(0,32,64),help='default: same as candidate tile; set 0 for final combined vs R11')
     b.add_argument('--ctx',type=int,default=8192);b.add_argument('--pp',default='128,512,2048,4096');b.add_argument('--tg',type=int,default=32);b.add_argument('--reps',type=int,default=3)
     b.add_argument('--threads',type=int,choices=(4,6,8,16),default=6);b.add_argument('--chunk',type=int,choices=(128,256,512,1024),default=512);b.add_argument('--kv',choices=('f16','q8','q4','q2'),default='q8')

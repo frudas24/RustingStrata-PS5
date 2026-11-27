@@ -963,5 +963,6 @@ fn u1_ps5_batch_quarantine() {
         for v in logits { out.write_all(&v.to_bits().to_le_bytes()).unwrap(); }
     }
     out.flush().unwrap();
+    eprintln!("R11U1_BATCH_GUARD VOCAB: {}", model.cfg.n_vocab);
     eprintln!("R11U1_BATCH_GUARD ARM PASS: frac={frac} 6 finite full-logit rows");
 }

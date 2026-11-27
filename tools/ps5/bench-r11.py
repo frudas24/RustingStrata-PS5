@@ -52,7 +52,8 @@ def main():
     k = r6.knobs_ok({**r6.BASE, 'threads':a.threads, 'chunk':a.chunk})
     session = r6.Session(a.model, a.bin, s, a.out)
     ident = r6.identity(a.model, a.bin)
-    r6.atomic_json(session.out/'identity.json', ident)
+    holdout_id = r6.file_id(session.holdout)
+    r6.atomic_json(session.out/'identity.json', dict(environment=ident,holdout=holdout_id))
     int_tile = a.candidate in ('iqint32','iqint64')
     if int_tile: key, value, mark = 'STRATA_PS5_R12_IQ_INT_TILE', a.candidate[-2:], 'gemmi_dp_ps5_iq'+a.candidate[-2:]
     elif a.candidate == 'iq32': key, value, mark = 'STRATA_PS5_R11_IQ32', '1', 'gemm_f_dp_ps5_iq32'
@@ -73,7 +74,9 @@ def main():
                 if task == 'holdout': cmd += ['--prompt-file',str(session.holdout)]
                 r6.atomic_json(session.out/(stem+'-request.json'), dict(cmd=cmd,knobs=k,candidate=a.candidate,enabled=bool(tile),profile_only=a.profile_only, base_iq32=int_tile, flags={key:env[key], **({'STRATA_PS5_R11_IQ32':'1'} if int_tile else {})}))
                 print(stem, flush=True)
+                r6.require(r6.file_id(session.holdout)==holdout_id,'holdout changed before measurement')
                 memory = r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
+                r6.require(r6.file_id(session.holdout)==holdout_id,'holdout changed during measurement')
                 rates, signatures = r6.checked_rates(json.loads(result.read_text()),k,s,a.model)
                 r6.match_signatures(signatures,signatures)
                 evidence = r6.evidence(log.read_text(errors='replace'),k)
@@ -86,7 +89,7 @@ def main():
                 r6.atomic_json(session.out/(stem+'-checked.json'),run)
                 runs.append(run)
             reports[task] = dict(profile_only=True, accepted=False) if a.profile_only else compare(runs, mark)
-        r6.require(r6.identity(a.model,a.bin)==ident, 'model, binary or hardware identity changed')
+        r6.require(r6.identity(a.model,a.bin)==ident and r6.file_id(session.holdout)==holdout_id, 'model, binary, holdout or hardware identity changed')
         if a.profile_only:
             r6.atomic_json(session.out/'summary.json',dict(profile_only=True,accepted=False,reports=reports))
             print('Profiling only: no performance acceptance'); return 0

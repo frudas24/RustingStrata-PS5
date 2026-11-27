@@ -61,7 +61,9 @@ def main():
             dump=a.out/f'{flag}.bin';log=a.out/f'{flag}.log'
             cmd=[str(a.bin.resolve()),'perplexity',*r6.engine_args(a.model,k,s),'--file',str(a.corpus.resolve()),'--ctx-len',str(a.ctx_len),'--chunks',str(a.chunks),'--kld-base',str(dump)]
             r6.atomic_json(a.out/f'{flag}-request.json',dict(cmd=cmd,candidate=a.candidate,enabled=bool(flag),base_iq32=int_tile,flags={key:env[key], **({'STRATA_PS5_R11_IQ32':'1'} if int_tile else {})}))
+            r6.require(corpus==r6.file_id(a.corpus),'corpus changed before quality arm')
             r6.run_child(cmd,env,log,a.timeout,1024)
+            r6.require(corpus==r6.file_id(a.corpus),'corpus changed during quality arm')
             evidence=r6.evidence(log.read_text(errors='replace'),k)
             r6.require((mark in evidence['marks'])==bool(flag),'missing dispatch or leaked into control')
             if int_tile:

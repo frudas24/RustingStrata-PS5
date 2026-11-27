@@ -134,7 +134,8 @@ def run_child(cmd,env,log,timeout,min_ram):
                     for line in Path(f'/proc/{p.pid}/status').read_text().splitlines():
                         if line.startswith('VmHWM:'): peak=max(peak,int(line.split()[1]))
                 except (FileNotFoundError,ProcessLookupError): pass
-                time.sleep(.2)
+                time.sleep(min(.2,max(0.,timeout-(time.monotonic()-start))))
+            require(time.monotonic()-start<=timeout, 'timeout at completion')
             require(p.returncode==0, f'child exited {p.returncode}; see {log}')
             after=meminfo(); low=min(low,after['MemAvailable']); swap_peak=max(swap_peak,used(after))
             require(low>=min_ram*1024, 'available RAM below guard at completion')
@@ -182,8 +183,17 @@ def match_signatures(ref,candidate,tol=.05):
                 require([x[0] for x in a['top5']]==[x[0] for x in b['top5']],f'top5 order differs at pp={pp}')
                 require(max(abs(x[1]-y[1]) for x,y in zip(a['top5'],b['top5']))<=tol,f'top5 logprob drift at pp={pp}')
 
+def dispatch_marks(log):
+    marks=set()
+    for line in log.splitlines():
+        if not line.startswith('PS5 R6 exercised:'): continue
+        m=re.fullmatch(r'PS5 R6 exercised: ([A-Za-z0-9_]+)[ \t]*',line)
+        require(m is not None, 'malformed dispatch marker: '+line)
+        marks.add(m[1])
+    return marks
+
 def evidence(log,k):
-    marks=set(re.findall(r'^PS5 R6 exercised: (\w+)\s*$',log,re.M))
+    marks=dispatch_marks(log)
     require('PS5 profile: GTT ' in log,'PS5 AMD profile not active')
     modes=re.findall(r'PS5 profile: GTT (true|false), mapped upload (true|false)',log)
     require(modes and all(d==str(bool(k['direct'])).lower() and (k['gtt'] or g=='false') for g,d in modes),'GTT/direct settings not respected')

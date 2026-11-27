@@ -7,8 +7,11 @@ args=(--locked --release --target "$PS5_TARGET" --features ps5-r2)
 case "${1:---compile}" in
   --compile)
     bash tools/ps5/build.sh
-    cargo test "${args[@]}" --lib u1_batch_tests -- --nocapture
-    cargo test "${args[@]}" --lib layer_lookup_outside_partition_is_none -- --nocapture
+    log=$(mktemp); trap 'rm -f "$log"' EXIT
+    cargo test "${args[@]}" --lib u1_batch_tests -- --nocapture 2>&1 | tee "$log"
+    grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored;' "$log"
+    cargo test "${args[@]}" --lib layer_lookup_outside_partition_is_none -- --nocapture 2>&1 | tee "$log"
+    grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
     cargo test "${args[@]}" --test gpu_model --no-run
     for n in 9 10 11; do python3 "tools/ps5/check-r$n.py"; done
     python3 tools/test_kld_compare.py
@@ -29,19 +32,7 @@ case "${1:---compile}" in
       STRATA_CPU_FRAC=$frac STRATA_PS5_U1_BATCH_OUT="$log.$frac.bits" \
         cargo test "${args[@]}" --test gpu_model u1_ps5_batch_quarantine -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log.$frac.log"
     done
-    python3 - "$log" <<'PYARM'
-import pathlib,re,sys
-base=sys.argv[1]; arms=[]
-for frac in (0,1):
-    s=pathlib.Path(f'{base}.{frac}.log').read_text()
-    rows=re.findall(r'R11U1_BATCH layer=\d+ rows=\d+ staged=(\d+) cpu=(\d+)',s)
-    assert rows and all(int(staged)>0 and int(cpu)==0 for staged,cpu in rows), 'batch guard not exercised or selected CPU'
-    assert f'R11U1_BATCH_GUARD ARM PASS: frac={frac} 6 finite full-logit rows' in s, 'no physical result'
-    arms.append(pathlib.Path(f'{base}.{frac}.bits').read_bytes())
-    print(f'arm {frac}: {len(rows)} batch layer decisions; all staged, no CPU batch experts')
-assert arms[0] and arms[0]==arms[1], 'full-logit bits differ between arms'
-print('PASS: identical full logits and greedy tokens across isolated frac=0/1 processes')
-PYARM
+    python3 tools/ps5/verify-r11u1-batch.py "$log"
     printf '%s\n' 'PASS: both arms exercised, full logits identical' > "$log"
     ;;
   *) echo 'usage: test-r11u1.sh [--compile | --batch model.gguf new-output.log]' >&2; exit 2;;

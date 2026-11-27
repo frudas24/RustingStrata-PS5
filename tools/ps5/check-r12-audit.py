@@ -30,7 +30,7 @@ class ParityScript(unittest.TestCase):
             cargo.write_text('''#!/bin/bash
 set -eu
 if [[ " $* " == *" shared_bound "* ]]; then
-  echo 'R12 LDS type=18'; echo 'R12 LDS type=23'; exit 0
+  echo 'R12 LDS type=18'; echo 'R12 LDS type=23'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; exit 0
 fi
 flag=$STRATA_PS5_R12_IQ_INT_TILE
 size=37981440
@@ -43,6 +43,7 @@ echo "PS5 R6 exercised: r13_int_${tag}_iq3xxs"
 echo "PS5 R6 exercised: r13_int_${tag}_iq4xs"
 if [[ $AUDIT_MOCK == leak && $flag == 0 ]]; then echo 'PS5 R6 exercised: gemmi_dp_ps5_iq32'; fi
 if [[ $AUDIT_MOCK == wrong && $flag == 32 ]]; then echo 'PS5 R6 exercised: gemmi_dp_ps5_iq64'; fi
+echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'
 ''');cargo.chmod(0o755)
             env={**os.environ,'PATH':str(p)+os.pathsep+os.environ['PATH'],'AUDIT_MOCK':mode}
             return subprocess.run(['bash',str(HERE/'test-r12-iq.sh'),str(p/'out')],env=env,capture_output=True,text=True)

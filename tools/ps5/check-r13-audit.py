@@ -122,7 +122,7 @@ class MockCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d); cargo=p/'cargo';cargo.write_text(MOCK);cargo.chmod(0o755)
             env={**os.environ,'PATH':str(p)+os.pathsep+os.environ['PATH'],'AUDIT_MOCK':mode}
-            return subprocess.run(['bash',str(HERE/'test-r13-lut.sh'),str(p/'out')],env=env,capture_output=True,text=True,timeout=30)
+            return subprocess.run(['bash',str(HERE/'test-r13-lut.sh'),str(p/'out')],env=env,capture_output=True,text=True,timeout=120)
     def test_valid_mock(self):
         p=self.run_mock('valid');self.assertEqual(p.returncode,0,p.stdout+p.stderr)
     def reject(self,mode):
