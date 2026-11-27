@@ -1441,6 +1441,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            let r6 = std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1");
+            if r6 { anyhow::ensure!(json_out.is_some() && reps > 0 && tg > 0, "R6 requires JSON output and positive reps/tg"); }
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
                 anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
@@ -1448,6 +1450,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
+            if r6 {
+                let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
+                anyhow::ensure!(!rusting_strata::config::OWN_ARCHS.contains(&arch), "R6 fingerprint currently requires the generic engine, not {arch}");
+            }
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
                 if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || rusting_strata::inkling2::is_arch(arch) {
@@ -1474,18 +1480,35 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
+            let mut r6_rows = Vec::new();
+            if r6 {
+                anyhow::ensure!(r.backend_name() == "vulkan" && engine.mtp() == 0, "R6 requires Vulkan and no MTP");
+                anyhow::ensure!(engine.threads == Some(rayon::current_num_threads()), "R6 Rayon pool differs from requested threads");
+            }
             for n in pp {
                 let ids = prose(&tok, n)?;
                 let (mut p, mut d) = (Vec::new(), Vec::new());
+                let mut fingerprints = Vec::new();
                 for _ in 0..reps {
                     r.reset()?;
                     let t = Instant::now();
                     let l = r.prefill(&ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
+                    let prefill_fp = if r6 {
+                        anyhow::ensure!(!l.is_empty() && l.iter().all(|v| v.is_finite()), "R6 non-finite/empty prefill logits");
+                        let top = ops::top_k(&l, 5);
+                        let max = l[top[0]] as f64;
+                        let lse = max + l.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
+                        Some(top.into_iter().map(|j| (j, l[j] as f64 - lse)).collect::<Vec<_>>())
+                    } else { None };
                     let t = Instant::now();
-                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false))?.0.len();
-                    d.push(k as f64 / t.elapsed().as_secs_f64());
+                    let (tokens, stopped) = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false))?;
+                    d.push(tokens.len() as f64 / t.elapsed().as_secs_f64());
+                    if let Some(top5) = prefill_fp {
+                        fingerprints.push(json!({"top5":top5, "tokens":tokens, "stopped":stopped}));
+                    }
                 }
+                if r6 { r6_rows.push(json!({"pp":n, "samples":fingerprints})); }
                 let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
                 println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
                 // R3: the attained expert-read bandwidth (bytes per token x tokens per second), against the ~900 GB/s
@@ -1519,6 +1542,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 // The arch-specific benchners print this; putting it in the JSON too gives tools one reliable source.
                 let drafts = if let Runner::Gpu(g) = &r { g.drafts } else { (0, 0) };
                 record["drafts"] = json!({"made": drafts.0, "accepted": drafts.1});
+                if r6 {
+                    record["r6"] = json!({"threads":rayon::current_num_threads(), "short":engine.short,
+                        "rows":r6_rows});
+                }
                 let mut line = serde_json::to_string(&record)?;
                 line.push('\n');
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;

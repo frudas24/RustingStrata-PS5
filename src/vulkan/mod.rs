@@ -194,6 +194,9 @@ struct Inner {
     ps5_direct: bool,
     ps5_host_reserve: u64,
     ps5_upload_bytes: [std::sync::atomic::AtomicU64; 2],
+    // R6 records only first actual dispatch/allocation per class, never pipeline creation.
+    r6_trace: bool,
+    r6_seen: std::sync::atomic::AtomicU32,
     /// AMD RDNA3 / RDNA3.5 (gfx11xx) or iGPU whose small L2 cache hurts from next-layer MoE prefetch.
     gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
@@ -576,7 +579,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -684,6 +687,7 @@ impl Inner {
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let mut last_err = anyhow::anyhow!("no matching memory type for {bytes} bytes");
         let mut mem_ok = None;
+        let mut nonlocal = false;
         'outer: for want in candidates {
             for i in 0..self.mem.memory_type_count {
                 if req.memory_type_bits & (1 << i) != 0 && ok(self.mem.memory_types[i as usize].property_flags, want) {
@@ -703,7 +707,10 @@ impl Inner {
                             None,
                         )
                     } {
-                        Ok(m) => { mem_ok = Some(m); break 'outer; }
+                        Ok(m) => {
+                            nonlocal = wants == DEVICE && !self.mem.memory_heaps[h].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+                            mem_ok = Some(m); break 'outer;
+                        }
                         Err(e) => last_err = anyhow::Error::from(e).context(format!("allocate {bytes} bytes")),
                     }
                 }
@@ -714,7 +721,14 @@ impl Inner {
             unsafe { self.dev.destroy_buffer(buf, None); self.dev.free_memory(mem, None); }
             return Err(e.into());
         }
+        if nonlocal { self.r6_mark(1 << 7, "gtt_nonlocal"); }
         Ok((buf, mem))
+    }
+
+    fn r6_mark(&self, bit: u32, name: &str) {
+        if self.r6_trace && self.r6_seen.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+            eprintln!("PS5 R6 exercised: {name}");
+        }
     }
 
     /// Where ops record: the graph being recorded, else the open command buffer.
@@ -1009,6 +1023,18 @@ impl Vk {
                 if names.is_empty() { d.cmd_reset_query_pool(cb, *qp, 0, 65536); }
                 d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
+        }
+        if self.0.r6_trace {
+            let bit = match name {
+                "gemv_q_ps5_64" | "moe_gemv_q_ps5_64" => 1,
+                "gemv_q_ps5_128" | "moe_gemv_q_ps5_128" => 2,
+                "gemmi_dp_ps5_32" => 4,
+                "attn_prefill_ps5_256" => 8,
+                "attn_prefill_ps5_512" => 16,
+                "attn_prefill_ps5_1024" => 32,
+                _ => 0,
+            };
+            if bit != 0 { self.0.r6_mark(bit, name); }
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
         if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {

@@ -1,0 +1,130 @@
+=== R6 Python unit/integration tests (simulated child) ===
+test_cli_mock_end_to_end (__main__.Tests.test_cli_mock_end_to_end) ... ok
+test_dispatch_noop (__main__.Tests.test_dispatch_noop) ... ok
+test_metadata_and_fingerprint_rejections (__main__.Tests.test_metadata_and_fingerprint_rejections) ... ok
+test_metrics_guard (__main__.Tests.test_metrics_guard) ... ok
+test_numerics (__main__.Tests.test_numerics) ... ok
+test_random_metrics (__main__.Tests.test_random_metrics) ... ok
+test_record (__main__.Tests.test_record) ... ok
+test_settings_and_env (__main__.Tests.test_settings_and_env) ... ok
+test_shards_and_atomic (__main__.Tests.test_shards_and_atomic) ... ok
+test_timeout_and_child_failure (__main__.Tests.test_timeout_and_child_failure) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 35.857s
+
+OK
+
+=== R2–R5 independent reference checks ===
+PASS: 4080 GEMV/MoE dispatch and split cases
+PASS: GEMM 32/128 tile bijections, 780 tail cases
+LDS PW=20: 40960 -> 20992 bytes; reduction 48.75%
+LDS PW=36: 49152 -> 29184 bytes; reduction 40.62%
+NOTE: CPU geometry only; GLSL/SPIR-V validation and GPU parity require target toolchain.
+PASS: 100000 independent window geometry cases (23220 eligible), plus 5 boundaries
+PASS: 20,000 randomized router/cache/budget cases; 60,000 partitions and scatter checks
+PASS: deterministic exploration and EWMA convergence (1,024 synthetic observations)
+PASS: 6,000 dispatch geometries; 100,000 window bounds; 9 pair geometries; 60,000 reference quantized pairs
+
+=== R1 standalone SIMD ===
+PASS: 1000000 AVX2 vectors / 2000000 signed group sums (including -128 and +127 extremes)
+
+=== R6 host-only probe (not PS5) ===
+working_set_bytes,cpu_single_thread_read_GB_s,dependent_load_ns
+16384,174.976,1.558
+262144,103.390,4.926
+4194304,89.798,18.059
+33554432,32.957,143.858
+67108864,26.103,167.995
+
+=== R6 script syntax ===
+PASS: shell and Python syntax
+
+=== R6 dry run: 64K ===
+{
+  "baseline": {
+    "gemv": 256,
+    "small": 0,
+    "attn": 0,
+    "threads": 6,
+    "chunk": 512,
+    "gtt": 1,
+    "direct": 1,
+    "zero": 0,
+    "sched": "off"
+  },
+  "space": {
+    "gemv": [
+      64,
+      128,
+      256
+    ],
+    "small": [
+      0,
+      1
+    ],
+    "attn": [
+      0,
+      256,
+      512,
+      1024
+    ],
+    "threads": [
+      4,
+      6,
+      8,
+      16
+    ],
+    "chunk": [
+      64,
+      128,
+      256,
+      512,
+      1024
+    ],
+    "gtt": [
+      0,
+      1
+    ],
+    "direct": [
+      0,
+      1
+    ],
+    "zero": [
+      0,
+      1
+    ],
+    "sched": [
+      "off",
+      "half",
+      "auto"
+    ]
+  },
+  "settings": {
+    "ctx": 65536,
+    "kv": "q8",
+    "pp": [
+      32,
+      64,
+      512,
+      8192,
+      32768,
+      65024
+    ],
+    "tg": 32,
+    "reps": 2,
+    "timeout": 900,
+    "min_ram_mb": 512
+  },
+  "budget": 12,
+  "experimental": false,
+  "maximum_child_runs": 25
+}
+
+=== Toolchain availability ===
+MISSING: cargo
+MISSING: rustc
+MISSING: glslc
+MISSING: spirv-val
+MISSING: vulkaninfo
+Rust/GLSL compilation, GPU parity, real PS5 inference and PGO compilation were not run.

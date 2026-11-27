@@ -817,6 +817,12 @@ impl GpuModel<'_> {
                         let ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                         let cpu_rows: usize = cpu.as_ref().map_or(0, |(cm, _)| cm.iter().map(|&e| off[e + 1] - off[e]).sum());
                         self.ps5_r4.as_mut().unwrap().observe(key, arm, ns, cpu_rows, ids.len() - cpu_rows);
+                        if cpu_rows > 0 && cpu_rows < ids.len() && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1") {
+                            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("PS5 R6 exercised: hybrid_prefill");
+                            }
+                        }
                         if std::env::var("STRATA_PS5_SCHED_LOG").is_ok_and(|v| v == "1") {
                             crate::say!("PS5 R4 trial: layer={il} tokens={t} arm={arm} cpu_rows={cpu_rows} gpu_rows={} ns={ns}", ids.len() - cpu_rows);
                         }
