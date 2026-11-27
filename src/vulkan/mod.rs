@@ -247,6 +247,7 @@ struct Inner {
     /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     ts_period: f32,
     r7_trace: bool,
+    r7_commands: R7Commands,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -331,6 +332,21 @@ struct State {
     step_pos: Option<(u64, usize)>,
 }
 
+#[derive(Default)]
+struct R7Commands {
+    dispatch: std::sync::atomic::AtomicU64,
+    barrier: std::sync::atomic::AtomicU64,
+    conditional_barrier: std::sync::atomic::AtomicU64,
+    graph_create: std::sync::atomic::AtomicU64,
+    graph_reuse: std::sync::atomic::AtomicU64,
+    transfer_submit: std::sync::atomic::AtomicU64,
+    buffer_alloc: std::sync::atomic::AtomicU64,
+    buffer_drop: std::sync::atomic::AtomicU64,
+    upload_bytes: std::sync::atomic::AtomicU64,
+    download_bytes: std::sync::atomic::AtomicU64,
+    device_copy_bytes: std::sync::atomic::AtomicU64,
+}
+
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
 struct Mem { vk: Arc<Inner>, buf: vk::Buffer, mem: vk::DeviceMemory, addr: u64, imported: Option<(Arc<crate::gguf::Map>, u64, crate::weights::ImportedRange)> }
 
@@ -348,6 +364,7 @@ impl Drop for Mem {
             }
         }
         st.bufs.remove(&self.addr);
+        if self.vk.r7_trace { self.vk.r7_commands.buffer_drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         unsafe { self.vk.dev.destroy_buffer(self.buf, None); self.vk.dev.free_memory(self.mem, None) }
         if let Some((_, bytes, _)) = &self.imported {
             if let Some(r3) = &self.vk.r3 { r3.release(*bytes); }
@@ -362,6 +379,20 @@ impl Drop for Inner {
         if self.ps5 {
             let [mapped, staged] = self.ps5_upload_bytes.each_ref().map(|v| v.load(std::sync::atomic::Ordering::Relaxed));
             eprintln!("PS5 fresh weights: mapped {mapped} bytes, staged {staged} bytes");
+        }
+        if self.r7_trace {
+            use std::sync::atomic::Ordering::Relaxed;
+            let c = &self.r7_commands;
+            for (name, counter) in [
+                ("dispatch_recorded", &c.dispatch), ("barrier_recorded", &c.barrier),
+                ("conditional_barrier_recorded", &c.conditional_barrier), ("graph_created", &c.graph_create),
+                ("graph_reused", &c.graph_reuse), ("transfer_submit", &c.transfer_submit),
+                ("buffer_alloc", &c.buffer_alloc), ("buffer_drop", &c.buffer_drop),
+                ("upload_bytes", &c.upload_bytes), ("download_bytes", &c.download_bytes),
+                ("device_copy_bytes", &c.device_copy_bytes),
+            ] {
+                eprintln!("r7_count,{name},{}", counter.load(Relaxed));
+            }
         }
         if let Some((_, _, tot)) = &st.prof {
             let scale = self.ts_period as f64;
@@ -609,7 +640,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), r7_commands: Default::default(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -782,6 +813,7 @@ impl Inner {
 
     /// Orders everything recorded so far before what follows (`HOST`: also before host reads).
     fn barrier(&self, cb: vk::CommandBuffer, host: bool) {
+        if self.r7_trace { self.r7_commands.barrier.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let all = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
         let (dst, dst_access) = if host { (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ) } else {
             (all, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
@@ -804,6 +836,7 @@ impl Inner {
 
     fn cond_on(&self, st: &mut State, cb: vk::CommandBuffer) {
         let Some(cr) = self.cr.as_ref().filter(|_| !st.no_cond) else { return };
+        if self.r7_trace { self.r7_commands.conditional_barrier.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let m = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
         unsafe {
             self.dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
@@ -947,6 +980,7 @@ impl Inner {
         let si = vk::SubmitInfo::default().command_buffers(&cs).wait_semaphores(&ws).wait_dst_stage_mask(&wst)
             .signal_semaphores(&ss).push_next(&mut tl);
         unsafe { self.dev.queue_submit(q, &[si], vk::Fence::null()) }?;
+        if self.r7_trace { self.r7_commands.transfer_submit.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         st.busy = true;
         Ok(())
     }
@@ -1076,6 +1110,7 @@ impl Vk {
                 d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
+        if self.0.r7_trace { self.0.r7_commands.dispatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         if self.0.r6_trace {
             let bit = match name {
                 "gemv_q_ps5_64" | "moe_gemv_q_ps5_64" => 1,
@@ -1109,6 +1144,7 @@ impl Vk {
     /// A zeroed buffer of `bytes` in memory `wants`; unless `DEVICE`, mapped, with its host pointer.
     fn buf(&self, bytes: usize, wants: &[vk::MemoryPropertyFlags]) -> anyhow::Result<(Buf, *mut u8)> {
         let (buf, mem) = self.0.buffer(bytes, wants)?;
+        if self.0.r7_trace { self.0.r7_commands.buffer_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let host = wants != DEVICE;
         let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
         let owner = Mem { vk: self.0.clone(), buf, mem, addr, imported: None };
@@ -1299,6 +1335,7 @@ impl Backend for Vk {
     }
 
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
+        if self.0.r7_trace { self.0.r7_commands.upload_bytes.fetch_add(src.len() as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
@@ -1359,6 +1396,7 @@ impl Backend for Vk {
     }
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
+        if self.0.r7_trace { self.0.r7_commands.download_bytes.fetch_add(dst.len() as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         let mut st = self.0.st();
         for (i, c) in dst.chunks_mut(STAGING).enumerate() {
@@ -1375,6 +1413,7 @@ impl Backend for Vk {
     }
 
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()> {
+        if self.0.r7_trace { self.0.r7_commands.device_copy_bytes.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
         ensure!(src_off + bytes <= src.len() && dst_off + bytes <= dst.len(), "dtod: {bytes} bytes out of range");
         if bytes == 0 { return Ok(()); }
@@ -1474,7 +1513,10 @@ impl Backend for Vk {
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        if let Some(&g) = st.graphs.get(&key) { return self.0.enqueue_cb(&mut st, Some(g)); }
+        if let Some(&g) = st.graphs.get(&key) {
+            if self.0.r7_trace { self.0.r7_commands.graph_reuse.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            return self.0.enqueue_cb(&mut st, Some(g));
+        }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
@@ -1490,6 +1532,7 @@ impl Backend for Vk {
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
         st.graphs.insert(key, c);
+        if self.0.r7_trace { self.0.r7_commands.graph_create.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         self.0.enqueue_cb(&mut st, Some(c))
     }
     fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
