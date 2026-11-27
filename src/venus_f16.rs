@@ -18,6 +18,11 @@ pub(crate) fn eligible(t: &Tensor<'_>, n: usize) -> bool {
 
 /// Returns false without touching out if the candidate cannot run.
 pub(crate) fn try_matmul(t: &Tensor<'_>, x: &[f32], n: usize, out: &mut [f32]) -> bool {
+    let tails = std::env::var("STRATA_PS5_VENUS_TAIL").as_deref() == Ok("1");
+    try_matmul_with_tail(t, x, n, out, tails)
+}
+
+fn try_matmul_with_tail(t: &Tensor<'_>, x: &[f32], n: usize, out: &mut [f32], tails: bool) -> bool {
     if !eligible(t, n) || t.cols.checked_mul(n) != Some(x.len()) || t.rows.checked_mul(n) != Some(out.len()) { return false; }
     #[cfg(target_arch = "x86_64")]
     {
@@ -39,7 +44,15 @@ pub(crate) fn try_matmul(t: &Tensor<'_>, x: &[f32], n: usize, out: &mut [f32]) -
                 }
                 start = n - n % 4;
             }
-            if start < n {
+            if start < n && tails {
+                for i in 0..nr {
+                    let w = &t.data[(r+i)*rb..(r+i+1)*rb];
+                    for tok in start..n {
+                        // SAFETY: same shape and CPU-feature checks as the full tile.
+                        ys[i*n+tok] = unsafe { dot_f16(w, &x[tok*t.cols..(tok+1)*t.cols]) };
+                    }
+                }
+            } else if start < n {
                 let mut scratch = vec![0f32; t.cols];
                 for i in 0..nr {
                     t.row(r + i, &mut scratch);
@@ -244,7 +257,7 @@ mod tests {
                     let t = Tensor { ty: GgmlType::F16, cols, rows, data: &data[1..], scale: 1.0 };
                     let x: Vec<_> = (0..n * cols).map(|i| ((i * 41 % 173) as f32 - 86.) / 79.).collect();
                     let mut y = vec![f32::NAN; rows * n];
-                    assert!(try_matmul(&t, &x, n, &mut y));
+                    assert!(try_matmul_with_tail(&t, &x, n, &mut y, false));
                     let mut w = vec![0.; cols];
                     for r in 0..rows {
                         t.row(r, &mut w);
@@ -256,6 +269,36 @@ mod tests {
                             let exact: f64 = w.iter().zip(input).map(|(&a,&b)| a as f64 * b as f64).sum();
                             assert!(actual.is_finite() && (actual as f64 - exact).abs() <= 2e-6 * abs_sum + 1e-6);
                             if r >= rows - rows % 3 || tok >= n - n % 4 { assert_eq!(actual.to_bits(), want.to_bits()); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn venus_f16_tail_reference() {
+        if !supported() { eprintln!("SKIP: requires AVX/FMA/F16C"); return; }
+        for rows in [3,4,5,6,7,17,384] {
+            for cols in [8,24,32,128,1032] {
+                for n in [4,5,6,7,8,9,15,16,17] {
+                    let mut data = vec![0x55];
+                    for i in 0..rows*cols { data.extend(f16::from_f32(((i*71%197) as f32-98.)/71.).to_le_bytes()); }
+                    let t=Tensor{ty:GgmlType::F16,cols,rows,data:&data[1..],scale:1.};
+                    let x:Vec<_>=(0..n*cols).map(|i| ((i*41%173) as f32-86.)/79.).collect();
+                    let mut old=vec![f32::NAN;rows*n]; let mut new=old.clone();
+                    assert!(try_matmul_with_tail(&t,&x,n,&mut old,false));
+                    assert!(try_matmul_with_tail(&t,&x,n,&mut new,true));
+                    let mut w=vec![0.;cols];
+                    for r in 0..rows {
+                        t.row(r,&mut w);
+                        for tok in 0..n {
+                            let v=&x[tok*cols..(tok+1)*cols];
+                            let exact:f64=w.iter().zip(v).map(|(&a,&b)| a as f64*b as f64).sum();
+                            let abs_sum:f64=w.iter().zip(v).map(|(&a,&b)| (a as f64*b as f64).abs()).sum();
+                            let y=new[tok*rows+r];
+                            assert!(y.is_finite() && (y as f64-exact).abs()<=2e-6*abs_sum+1e-6);
+                            if r<rows-rows%3 && tok<n-n%4 { assert_eq!(y.to_bits(),old[tok*rows+r].to_bits()); }
                         }
                     }
                 }
@@ -317,6 +360,46 @@ mod tests {
             let mut y = [17.; 12];
             assert!(!try_matmul(&t, &[0.;32], 4, &mut y));
             assert_eq!(y, [17.;12]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local F16 GGUF; compares old/new Venus tails"]
+    fn venus_f16_tail_real_gguf() {
+        assert!(supported(), "AVX/FMA/F16C required");
+        let path=std::env::var("VENUS_F16_MODEL").expect("provide F16 GGUF");
+        let gg=crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+        let chosen=std::env::var("VENUS_F16_TENSOR").unwrap_or_else(|_| "blk.0.ffn_gate.weight".into());
+        let info=gg.tensors.values().find(|t| t.name==chosen && t.ty==1 && t.dims.len()==2 && t.dims[0]>=8 && t.dims[0]<=8192 && t.dims[0]%8==0 && t.dims[1]>=3).expect("no eligible F16 matrix");
+        let cols=info.dims[0] as usize;
+        for rows in [info.dims[1].min(384) as usize,info.dims[1].min(385) as usize] {
+            let t=Tensor{ty:GgmlType::F16,cols,rows,data:gg.raw_bytes(info,2*cols*rows).unwrap(),scale:1.};
+            for n in [4,5,7,8,9,15,16,17,31,32,33] {
+                let x:Vec<_>=(0..n*cols).map(|i| (((i*41+17)%173) as f32-86.)/79.).collect();
+                let mut a=vec![0.;rows*n]; let mut b=a.clone();
+                assert!(try_matmul_with_tail(&t,&x,n,&mut a,false));
+                assert!(try_matmul_with_tail(&t,&x,n,&mut b,true));
+                let mut w=vec![0.;cols]; let mut worst=0f64;
+                for r in 0..rows {
+                    t.row(r,&mut w);
+                    for j in 0..n {
+                        let v=&x[j*cols..(j+1)*cols];
+                        let exact:f64=w.iter().zip(v).map(|(&p,&q)| p as f64*q as f64).sum();
+                        let sum:f64=w.iter().zip(v).map(|(&p,&q)| (p as f64*q as f64).abs()).sum();
+                        let y=b[j*rows+r]; let z=a[j*rows+r];
+                        assert!(y.is_finite() && z.is_finite() && (y as f64-exact).abs()<=2e-6*sum+1e-6);
+                        if r<rows-rows%3 && j<n-n%4 { assert_eq!(y.to_bits(),z.to_bits()); }
+                        worst=worst.max((y as f64-z as f64).abs());
+                    }
+                }
+                let mut samples=Vec::new();
+                for tail in [false,true,true,false,false,true,true,false] {
+                    let now=std::time::Instant::now();
+                    assert!(try_matmul_with_tail(&t,&x,n,&mut b,tail)); std::hint::black_box(&b);
+                    samples.push((tail,now.elapsed().as_nanos() as u64));
+                }
+                println!("VENUS_R10_TAIL {}",serde_json::json!({"tensor":info.name,"rows":rows,"cols":cols,"tokens":n,"max_abs":worst,"samples_ns":samples}));
+            }
         }
     }
 

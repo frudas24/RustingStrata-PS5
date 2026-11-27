@@ -10,7 +10,8 @@ def key(r): return r['pos'],r['layer']
 def same(a,b):
     return a.keys()==b.keys() and all(bits(a[k],b[k]) if k=='weights' else a[k]==b[k] for k in a)
 def read_routes(root, arm):
-    rows=[json.loads(s.split(',',1)[1]) for s in (root/(arm+'.log')).open() if s.startswith('r10_route,')]
+    with (root/(arm+'.log')).open() as f:
+        rows=[json.loads(s.split(',',1)[1]) for s in f if s.startswith('r10_route,')]
     require(rows and len({key(x['effective']) for x in rows})==len(rows),arm+' missing or duplicate routes')
     mode='replay' if arm.startswith('replay-') else 'record'
     for row in rows:
@@ -31,7 +32,8 @@ def logits(root,arm):
     return v
 
 def layers(root,arm):
-    rows=[(int(p[1]),int(p[2]),json.loads(p[3])) for s in (root/(arm+'.log')).open() if s.startswith('r9_layer_out,') for p in [s.split(',',3)]]
+    with (root/(arm+'.log')).open() as f:
+        rows=[(int(p[1]),int(p[2]),json.loads(p[3])) for s in f if s.startswith('r9_layer_out,') for p in [s.split(',',3)]]
     require(rows and len({(pos,layer) for layer,pos,_ in rows})==len(rows) and all(r9.finite(v) for _,_,v in rows),arm+' invalid layer outputs')
     return rows
 
