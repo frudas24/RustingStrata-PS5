@@ -1057,6 +1057,12 @@ impl GpuModel<'_> {
                             let (cross, own) = acts.as_ref().ok_or_else(|| anyhow::anyhow!("R9 missing gate/up capture"))?;
                             compare_stage("r9_activation_gpu_inputs", cross, &activation);
                             compare_stage("r9_activation_own", own, &activation);
+                            if r9_mode == "shadow" && kind == crate::ps5_r8::Contract::Q8_32 {
+                                eprintln!("r9_q8_inputs,{}", serde_json::json!({
+                                    "layer": il, "pos": self.pos, "token": token, "rank": r9_rank,
+                                    "expert": expert, "gpu": &activation, "cpu_silu": cross, "cpu_own": own
+                                }));
+                            }
                             let cross_down = crate::ps5_r8::projection(&down, &activation, kind, down.rows)?;
                             let silu_down = crate::ps5_r8::projection(&down, cross, kind, down.rows)?;
                             let own_down = crate::ps5_r8::projection(&down, own, kind, down.rows)?;
