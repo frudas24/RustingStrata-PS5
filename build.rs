@@ -22,6 +22,10 @@ fn main() {
         ("gemm_f_dp_ps5_iq32", "gemm_f_dp.comp", &["-DSM=1", "-DSTRATA_R11_SHORT=1"][..]),
         ("gemmi_dp_ps5_iq32", "gemmi_dp.comp", &["-DSM=1", "-DSTRATA_PS5_SMALL=1", "-DSTRATA_R12_ROUTED=1"][..]),
         ("gemmi_dp_ps5_iq64", "gemmi_dp.comp", &["-DSM=2", "-DSTRATA_R12_ROUTED=1"][..]),
+        ("gemm_f_dp_ps5_iq32_lut", "gemm_f_dp.comp", &["-DSM=1", "-DSTRATA_R11_SHORT=1", "-DSTRATA_R13_LUT=1"][..]),
+        ("gemmi_dp_ps5_lut", "gemmi_dp.comp", &["-DSTRATA_R13_LUT=1"][..]),
+        ("gemmi_dp_ps5_iq32_lut", "gemmi_dp.comp", &["-DSM=1", "-DSTRATA_PS5_SMALL=1", "-DSTRATA_R12_ROUTED=1", "-DSTRATA_R13_LUT=1"][..]),
+        ("gemmi_dp_ps5_iq64_lut", "gemmi_dp.comp", &["-DSM=2", "-DSTRATA_R12_ROUTED=1", "-DSTRATA_R13_LUT=1"][..]),
         ("gemmi_dp_ps5_64", "gemmi_dp.comp", &["-DSM=2"][..]),
         ("gemmi_dp_ps5_32", "gemmi_dp.comp", &["-DSM=1", "-DSTRATA_PS5_SMALL=1"][..]),
     ] {

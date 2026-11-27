@@ -77,6 +77,14 @@ const SPV: &[(&str, &[u8])] = &[
     #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_iq64", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_iq64.spv"))),
     #[cfg(feature = "ps5-r2")]
+    ("gemm_f_dp_ps5_iq32_lut", include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f_dp_ps5_iq32_lut.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_lut", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_lut.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_iq32_lut", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_iq32_lut.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_iq64_lut", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_iq64_lut.spv"))),
+    #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_64", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_64.spv"))),
     #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_32", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_32.spv"))),
@@ -1134,12 +1142,23 @@ impl Vk {
                 "gemm_f_dp_ps5_iq32" => 1 << 9,
                 "gemmi_dp_ps5_iq32" => 1 << 12,
                 "gemmi_dp_ps5_iq64" => 1 << 13,
+                "gemm_f_dp_ps5_iq32_lut" => 1 << 16,
+                "gemmi_dp_ps5_lut" => 1 << 17,
+                "gemmi_dp_ps5_iq32_lut" => 1 << 18,
+                "gemmi_dp_ps5_iq64_lut" => 1 << 19,
                 "attn_prefill_ps5_256" => 8,
                 "attn_prefill_ps5_512" => 16,
                 "attn_prefill_ps5_1024" => 32,
                 _ => 0,
             };
             if bit != 0 { self.0.r6_mark(bit, name); }
+            if matches!(name, "gemmi_dp_ps5_lut" | "gemmi_dp_ps5_iq32_lut" | "gemmi_dp_ps5_iq64_lut") {
+                match spec.get(1).copied() {
+                    Some(18) => self.0.r6_mark(1 << 20, "r13_lut_iq3xxs"),
+                    Some(23) => self.0.r6_mark(1 << 21, "r13_lut_iq4xs"),
+                    _ => (),
+                }
+            }
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
         if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
@@ -1239,6 +1258,34 @@ impl Vk {
         })
     }
 
+    // R13: independent LUT locality experiment, restricted to routed PS5 kernels.
+    fn r13_lut(&self, ty: GgmlType) -> bool {
+        static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if !cfg!(feature = "ps5-r2") || !self.0.ps5 || self.0.wave64 || self.0.coop || self.0.coop_i8 != 0 { return false; }
+        let mode = MODE.get_or_init(|| std::env::var("STRATA_PS5_R13_LUT").ok()).as_deref();
+        match ty {
+            GgmlType::IQ2XS => self.r11_iq32(ty) && matches!(mode, Some("iq2" | "all")),
+            GgmlType::IQ3XXS | GgmlType::IQ4XS => matches!(mode, Some("int" | "all")),
+            _ => false,
+        }
+    }
+
+    // Same selector for preflight and dispatch. Exceeding the physical LDS limit
+    // falls back to the exact corresponding non-LUT kernel (never another contract).
+    fn r13_gemm_kernel(&self, ty: GgmlType, base: &'static str) -> &'static str {
+        if !self.r13_lut(ty) { return base; }
+        let name = match base {
+            "gemm_f_dp_ps5_iq32" => "gemm_f_dp_ps5_iq32_lut",
+            "gemmi_dp" => "gemmi_dp_ps5_lut",
+            "gemmi_dp_ps5_iq32" => "gemmi_dp_ps5_iq32_lut",
+            "gemmi_dp_ps5_iq64" => "gemmi_dp_ps5_iq64_lut",
+            _ => return base,
+        };
+        // Conservative device gate; the actual specialized SPIR-V size is checked
+        // in preflight and pipeline creation, not on every hot dispatch.
+        if self.0.smem_limit >= 64 * 1024 { name } else { base }
+    }
+
     fn gemm_q8_supported(&self, ty: GgmlType, cols: usize) -> bool {
         // LLAMA_Q8 reduces over all 16 lanes of a 256-element block. A trailing
         // half block would shuffle from inactive invocations in quant_q8.comp.
@@ -1311,7 +1358,7 @@ impl Vk {
             if !same { q8.1 = None; }
             let args: [&dyn Arg; 12] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
             if tiles != 0 && self.r11_iq32(ty) {
-                return self.run("gemm_f_dp_ps5_iq32", &spec, grid, &args);
+                return self.run(self.r13_gemm_kernel(ty, "gemm_f_dp_ps5_iq32"), &spec, grid, &args);
             }
             self.run(if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" }, &spec, grid, &args)?;
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
@@ -1345,9 +1392,12 @@ impl Vk {
             if tile != 0 {
                 // Original routed tile list is bounded to 128 positions. z selects
                 // a disjoint subtile; each output still reduces the entire K dimension.
-                return self.run(if tile == 32 { "gemmi_dp_ps5_iq32" } else { "gemmi_dp_ps5_iq64" },
+                return self.run(self.r13_gemm_kernel(ty, if tile == 32 { "gemmi_dp_ps5_iq32" } else { "gemmi_dp_ps5_iq64" }),
                     &spec, [grid[0], grid[1], crate::backend::GEMM_BM / tile], &args);
             }
+        }
+        if tiles != 0 && self.0.coop_i8 == 0 {
+            return self.run(self.r13_gemm_kernel(ty, "gemmi_dp"), &spec, grid, &args);
         }
         if self.0.r2.tiled64(self.0.coop_i8, tiles, nd) {
             // SM=2 uses two 16-column fragments per logical wave and 64 dense positions.

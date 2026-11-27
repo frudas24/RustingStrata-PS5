@@ -31,11 +31,18 @@ shared uint s_iq4[T == 20 || T == 23 || T == 40 ? 256 : 1];
 #define IQ3S_GRID s_g3
 #define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
+#ifdef STRATA_R13_LUT
+shared uint64_t s_iq2xs[T == 17 ? 512 : 1];
+#define IQ2XS_GRID s_iq2xs
+#endif
 #else
 #define IQ3S_GRID iq3s_grid
 #define IQ3XXS_GRID iq3xxs_grid
 #define IQ2S_GRID iq2s_grid
 void load_tables() {}  // the tables come from the buffer
+#endif
+#ifndef IQ2XS_GRID
+#define IQ2XS_GRID iq2xs_grid
 #endif
 
 
@@ -95,6 +102,9 @@ uvec2 ld8(U8 w, uint o) {
 #ifdef SHARED_TABLES
 void load_tables() {
     uint li = gl_LocalInvocationIndex, n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+    #ifdef STRATA_R13_LUT
+    if (T == 17) { for (uint i = li; i < 512; i += n) s_iq2xs[i] = iq2xs_grid[i]; barrier(); }
+    #endif
     if (T == 18) { for (uint i = li; i < 256; i += n) s_g3[i] = iq3xxs_grid[i]; barrier(); }
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
@@ -192,7 +202,7 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
             uint sc = u8_(w, b + (T == 22 ? 74 : 66) + ib);
             if (T == 17) {
                 uint k = ld16(w, b + 2 + 2 * (4 * ib + l));
-                g = iq2xs_grid[k & 511];
+                g = IQ2XS_GRID[k & 511];
                 sg = ksign(k >> 9);
             } else {
                 g = IQ2S_GRID[u8_(w, b + 2 + 4 * ib + l) | ((u8_(w, b + 66 + ib) << (8 - 2 * l)) & 0x300)];
