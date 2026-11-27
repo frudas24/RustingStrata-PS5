@@ -1,5 +1,9 @@
 # RustingStrata — PS5 Linux experimental port, R1
 
+> Historical R1 documentation. The uploaded fork reports physical R1 results in [its archived report](archive/PS5-fork-612c3c9-R1-report.md); these are not measurements of the R6U1 merge. See [PS5-R6U1.md](PS5-R6U1.md) for current status.
+
+> R2 extends this release: see [PS5-R2.md](PS5-R2.md). The PS5 build script now enables the optional R2 shaders by default; set `PS5_R2_BUILD=0` for the original shader-only build.
+
 Original RustingStrata 1.3.7 by Vasyl Trefilov, archive commit `8df1c22e24645d4e9ec5980548ddabe11251548e`.
 This modified edition is distributed under the original LICENSE.md. Uses RustingStrata by Vasyl Trefilov. No endorsement is implied.
 
@@ -7,13 +11,7 @@ This modified edition is distributed under the original LICENSE.md. Uses Rusting
 
 Base PS5 / Slim, x86-64 Zen 2 with AVX2/FMA/F16C, AMD custom GPU through a working Linux amdgpu/Mesa RADV Vulkan driver. The 16 GB GDDR6 is shared, not 16 GB RAM plus 16 GB VRAM; the Linux memory split depends on the image and boot configuration. No assumptions about accessible capacity, GPU clocks, CU unlocks, native INT8 acceleration, or cooperative matrix support. No firmware, internal SSD, boot configuration, GPU power limits, or kernel settings are modified by this package. Not a native PS5 OS executable. No model weights are bundled.
 
-**Built and measured on one console** (PS5 under Linux 7.3.3, `amdgpu.gttsize=12888`, Qwen3.6-35B-A3B UD-Q2_K_XL on
-Vulkan): `tools/ps5/build.sh` compiles the tree with `-march=znver2` and fat LTO, the Vulkan pipeline `check` passes
-(81 pairs, largest 49 152 B of the 65 536 allowed), and `tools/ps5/bench.sh` produced the numbers and the
-mapped/staged counts quoted in the fork README: 294.5/86.8 tok/s at pp512 and 347.0/83.5 at pp4096 with the profile
-on, 144.9/33.2 and 300.1/41.5 with `STRATA_PS5=0`, over one session in one order with three samples per cell on one
-unit. The engine still requires all Vulkan features checked by upstream `unusable()`; do not fake features or change GPU
-target IDs to bypass that gate.
+**Experimental source release; not compiled or run in Rust in the preparation environment** (no Rust toolchain, no PS5 GPU, no dependency network, no GGUF). No tokens/s measurements or claim of PS5 compatibility yet. A standalone C test of the new AVX2 group-sum primitive passed 1,000,000 vectors (2,000,000 signed 16-element sums), on AMD EPYC x86-64, compiled with `-march=znver2`; this is not a Rust test or an end-to-end benchmark. Shell syntax, CLI argument construction with a fake binary, and Python summary syntax were checked. Rust tests supplied below remain to be executed on the target. The engine still requires all Vulkan features checked by upstream `unusable()`; do not fake features or change GPU target IDs to bypass that gate.
 
 ## What changed
 
@@ -28,16 +26,6 @@ target IDs to bypass that gate.
 | `tools/ps5/` | Explicit Zen 2 build, launch preset, diagnostics, tests, A/B benchmark scripts | Reproducible deployment and tuning. |
 
 The upstream SPIR-V binaries, all attention/quantization formulas, model architectures and CUDA/HIP kernel sources are untouched. Existing wave32/wave64 and hardware-feature detection remains. The PS5 profile marks the GPU as sharing memory so the existing next-layer expert prefetch is disabled (avoids extra pressure on the shared bus); no GPU shader was retuned or rewritten. The CPU and F16 changes apply to all builds; the Vulkan PS5 paths are opt-in and independently switchable.
-
-`main` also carries the upstream-PR `STRATA_PREFILL_PROTECT` change in `src/expert_cache.rs` and `src/gpu_model/prefill.rs` (see the README branch list). It is not part of this port and the measurements above were taken without it; it interacts with the prefetch the PS5 profile disables, and that combination is not measured yet.
-
-## Later PS5 checkpoints (R2–R6)
-
-This document describes **R1**, the base port. The fork's `main` continues the PS5 line with one commit and one tag per
-version, and R6 is the tip: it contains R1–R5, so the last version alone is enough to run, while the earlier ones stay
-reconstructible from their tags. **[docs/PS5-R2.md](PS5-R2.md)** starts the rest of the series (R3, R4, R5, R6 are
-`PS5-R3.md` … `PS5-R6.md`, and the README carries the full map with each version's opt-in switches). The R2–R6
-checkpoints are integrated here but **not measured on a console**; the numbers in this document are R1's.
 
 ## Build / run
 

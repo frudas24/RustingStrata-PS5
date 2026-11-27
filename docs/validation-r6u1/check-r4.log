@@ -1,0 +1,2 @@
+PASS: 20,000 randomized router/cache/budget cases; 60,000 partitions and scatter checks
+PASS: deterministic exploration and EWMA convergence (1,024 synthetic observations)

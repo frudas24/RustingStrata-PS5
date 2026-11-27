@@ -9,13 +9,19 @@ export STRATA_PS5=1 STRATA_VK_NO_COOP=1 STRATA_PS5_ZERO_COPY=0 STRATA_PS5_SCHED=
 export STRATA_PS5_GEMV_WG=256 STRATA_PS5_SMALL_GEMM=0
 # Force query slicing on long cases: exercise q_off and the last partial slice.
 export STRATA_VK_ATTN_BUDGET=262144
-unset STRATA_VK_DP_OLD STRATA_LLAMA_NUMERICS STRATA_KV_Q8
+unset STRATA_VK_DP_OLD STRATA_LLAMA_NUMERICS STRATA_KV_Q8 STRATA_KV STRATA_KV_K STRATA_KV_V STRATA_VK_TURBO STRATA_KV_HOST
 args=(--locked --release --target "$PS5_TARGET" --features ps5-r2 --test ps5_r5)
 cargo test "${args[@]}" shared_memory_bounds
-for kv in f16 q8 q4 q2; do
+pairs=(f16:f16 q8:q8 q4:q4 q2:q2 f16:q4 q4:f16 q8:q2 q2:q8)
+if [[ ${PS5_R5_ALL_PAIRS:-0} == 1 ]]; then
+  pairs=(); for k in f16 q8 q4 q2; do for v in f16 q8 q4 q2; do pairs+=("$k:$v"); done; done
+fi
+for pair in "${pairs[@]}"; do
+  k=${pair%:*}; v=${pair#*:}; kv=$k-$v
+  [[ $k != "$v" ]] || kv=$k
   for wg in 0 256 512 1024; do
     name=$kv-$wg; rm -f "$out/$name.bin"
-    STRATA_KV=$kv STRATA_PS5_ATTN_WG=$wg PS5_R5_PARITY_FILE="$out/$name.bin" \
+    STRATA_KV_K=$k STRATA_KV_V=$v STRATA_PS5_ATTN_WG=$wg PS5_R5_PARITY_FILE="$out/$name.bin" \
       cargo test "${args[@]}" fingerprint -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$out/$name.log"
     test -s "$out/$name.bin"
     if ((wg)); then
@@ -25,4 +31,4 @@ for kv in f16 q8 q4 q2; do
   done
 done
 sha256sum "$out"/*.bin > "$out/sha256.txt"
-echo 'PASS: all R5 outputs match R4 bit for bit on this device/driver.'
+echo 'PASS: all R5 outputs match upstream 1.4.0 tiled baseline bit for bit on this device/driver.'

@@ -74,6 +74,8 @@ const DONE: &str = "<|content_model_end_sampling|>";
 pub fn gpu_defaults() {
     crate::deepseek::chat::gpu_defaults();
     if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.6,0.9") } }
+    // Local patch: with several GPUs the plain weights stay on GPU 0, where the device decode state lives.
+    if std::env::var_os("STRATA_DS_PLAIN_FIRST").is_none() { unsafe { std::env::set_var("STRATA_DS_PLAIN_FIRST", "1") } }
 }
 
 /// The template's `tojson(sort_keys=true, separators=(",", ":"))`.
@@ -581,20 +583,25 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
             c
         }).collect();
         let done = if !calls.is_empty() { "tool_calls" } else if stopped { "stop" } else { "length" };
+        let d = crate::serve::Done { prompt: ids.len(), cached: keep, completion: count, prefill_s, finish: done };
+        let timings = d.timings(t);
         let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": count, "total_tokens": ids.len() + count, "prompt_tokens_details": {"cached_tokens": keep}});
         if q.stream {
             if !calls.is_empty() { let _ = write!(c, "data: {}\n\n", chunk(json!({"tool_calls": calls}), None)); }
-            let _ = write!(c, "data: {}\n\n", chunk(json!({}), Some(done)));
+            let mut last = chunk(json!({}), Some(done));
+            last["usage"] = usage.clone();
+            last["timings"] = timings;
+            let _ = write!(c, "data: {last}\n\n");
             if q.include_usage { let _ = write!(c, "data: {}\n\n", json!({"object": "chat.completion.chunk", "model": name, "choices": [], "usage": usage})); }
             let _ = write!(c, "data: [DONE]\n\n");
         } else {
             let mut message = json!({"role": "assistant", "content": content});
             if !reasoning.is_empty() { message["reasoning_content"] = reasoning.into(); }
             if !calls.is_empty() { message["tool_calls"] = calls.into(); }
-            let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}], "usage": usage});
+            let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}], "usage": usage, "timings": timings});
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
-        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: count, prefill_s, finish: done })
+        Ok(d)
     }))
 }
 

@@ -29,6 +29,9 @@ struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
+    /// Accelerate CPU generation using Q8_K activations. This can change logits and generated tokens.
+    #[arg(long)]
+    fast_cpu: bool,
     /// GPU context length (KV cache size) in tokens. Inkling 2, Hy4, GLM, DeepSeek and Gemma 4: the prompt plus reply
     /// limit, the model's trained context when not given (their caches grow with the text).
     #[arg(long, default_value_t = 4096)]
@@ -151,8 +154,14 @@ struct Engine {
     thinking_budget: usize,
     /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo4-3", "turbo4-2", "turbo3", "turbo2", "turbo3-2"])]
     kv: String,
+    /// K cache type; overrides the K half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    k: Option<String>,
+    /// V cache type; overrides the V half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    v: Option<String>,
     /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
@@ -173,23 +182,48 @@ struct Engine {
     /// Sequences in GPU memory at once (`serve --parallel`).
     #[arg(skip)]
     parallel: usize,
-    /// Multimodal projector (mmproj) GGUF used by `--image`.
+    /// Multimodal projector (mmproj) GGUF used by `--image` (default: an `mmproj*.gguf` next to the model; `none`
+    /// loads no projector).
     #[arg(long)]
     mmproj: Option<PathBuf>,
 }
 
-fn set_kv_env(kv: &str) {
-    match kv {
-        "q8" | "q4" | "q2" => {
-            unsafe { std::env::set_var("STRATA_KV", kv) };
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
-            else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
-        }
-        _ => {
-            unsafe { std::env::remove_var("STRATA_KV") };
-            unsafe { std::env::remove_var("STRATA_KV_Q8") };
-        }
+/// Resolve the independent K and V cache types. `--kv` supplies both unless `--k`/`--v` override a half.
+fn effective_kv(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<(String, String)> {
+    let valid = |s: &str| matches!(s, "f16" | "q8" | "q4" | "q2" | "turbo4" | "turbo3" | "turbo2");
+    let base = match kv {
+        "turbo4-3" => ("turbo4", "turbo3"),
+        "turbo4-2" => ("turbo4", "turbo2"),
+        "turbo3-2" => ("turbo3", "turbo2"),
+        other => (other, other),
+    };
+    let (k, v) = match (k, v) {
+        (None, None) => base,
+        (Some(k), None) => (k, base.1),
+        (None, Some(v)) => (base.0, v),
+        (Some(k), Some(v)) => (k, v),
+    };
+    anyhow::ensure!(valid(k) && valid(v), "unsupported KV combination K={k}, V={v}");
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// Publish the resolved types to both backends. `STRATA_KV_K`/`STRATA_KV_V` are independent; `STRATA_KV` is
+/// kept as a symmetric-only alias for code paths that have not been split yet (serve/Vulkan).
+fn set_kv_env(k: &str, v: &str) {
+    unsafe {
+        std::env::set_var("STRATA_KV_K", k);
+        std::env::set_var("STRATA_KV_V", v);
+        if k == v { std::env::set_var("STRATA_KV", k); }
+        else { std::env::remove_var("STRATA_KV"); }
+        if k == "q8" || v == "q8" { std::env::set_var("STRATA_KV_Q8", "1"); }
+        else { std::env::remove_var("STRATA_KV_Q8"); }
     }
+}
+
+fn set_kv_env_for(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<()> {
+    let (k, v) = effective_kv(kv, k, v)?;
+    set_kv_env(&k, &v);
+    Ok(())
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -271,7 +305,8 @@ impl Runner<'_> {
         match self {
             Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
             Runner::Gpu(g) => g.prefill_image(p, embs),
-            Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("image input is not supported on a serve slot"),
+            Runner::Slot(c) => c.chat_image(p, embs),
+            Runner::Own(_) => anyhow::bail!("image input on a model outside the main engine"),
         }
     }
     /// Forget the sequence so far.
@@ -372,13 +407,28 @@ fn restore_calib_env() {
 }
 
 impl Engine {
+    /// The projector for `model`: `--mmproj`, else an `mmproj*.gguf` next to it; `--mmproj none` gives none.
+    fn mmproj_for(&self, model: &Path) -> Option<PathBuf> {
+        match &self.mmproj {
+            Some(p) if p.as_os_str() == "none" => None,
+            Some(p) => Some(p.clone()),
+            None => vision::find_sibling(model),
+        }
+    }
+
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
-    fn ds_env(&self) {
+    fn ds_env(&self) -> anyhow::Result<()> {
+        if self.gpu { vision::use_gpu(self.backend.clone(), self.device.first().copied().unwrap_or(0)); }
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
-        if self.kv != "f16" && std::env::var_os("STRATA_KV").is_none() { set_kv_env(&self.kv); }
+        // `--k`/`--v` must take effect even when `--kv` is left at its f16 default; otherwise an Inkling 2
+        // mixed layout silently degrades to plain f16.
+        if (self.kv != "f16" || self.k.is_some() || self.v.is_some()) && std::env::var_os("STRATA_KV_K").is_none() {
+            set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Models on their own code path never call `Engine::runner`, the only place that reads a calibration file.
@@ -442,7 +492,7 @@ impl Engine {
             }
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
+        set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;  // read by Gpu::new and Vk::new
         let open = || backend::open_all(self.backend.as_deref(), &self.device);
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -467,6 +517,7 @@ impl Engine {
         }
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
+        let auto_chunk = self.chunk.is_none();
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         // The draft count was measured with this draft file (`calibrate --mtp-model/--draft-model`), or with none.
         let aux = self.aux_model_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
@@ -526,10 +577,20 @@ impl Engine {
             Some(s) => Some(s),
             None => calibrated_split(&v, &self.device, &bk.iter().map(|b| b.device()).collect::<Vec<_>>()),
         };
-        let mut g = if self.parallel > 1 {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), 0, self.parallel).context(LOAD_HINT)?
-        } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), mtp, 1).context(LOAD_HINT)?
+        let (ns, k) = if self.parallel > 1 { (self.parallel, 0) } else { (1, mtp) };
+        let mut bk = Some(bk);
+        let mut g = loop {
+            match GpuModel::load_split_margins(m, bk.take().unwrap(), self.ctx, self.chunk(), &margins, split.as_deref(), k, ns) {
+                // The prefill scratch grows with the chunk: when the default or calibrated chunk runs VRAM out or
+                // leaves it under the margin, halve it (down to 512) and load again on freshly opened devices.
+                Err(e) if auto_chunk && self.chunk() > 512 && vram_short(&e) => {
+                    let half = self.chunk() / 2;
+                    say!("prefill chunk {} leaves too little VRAM, loading again with {half} (--chunk sets it)", self.chunk());
+                    self.chunk = Some(half);
+                    bk = Some(backend::open_all(self.backend.as_deref(), &self.device)?);
+                }
+                r => break r.context(LOAD_HINT)?,
+            }
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
@@ -717,6 +778,12 @@ fn seed(s: Option<u64>) -> u64 {
         .wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
 }
 
+/// Whether a load failed for VRAM: the driver's out-of-memory error (CUDA, HIP, Vulkan) or `GpuModel::load`'s check
+/// that the loaded model leaves the margin free.
+fn vram_short(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    ["out_of_memory", "out of memory", "outofmemory", "out_of_device_memory", "of vram free, under the"].iter().any(|k| s.contains(k))
+}
 const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or close programs using VRAM)";
 
 /// Settle the flag combinations that cannot all take effect: an invalid request (`--parallel` outside 1..=255) is an
@@ -777,6 +844,23 @@ fn calibration_fits(v: &serde_json::Value, gpu: &str) -> bool {
 
 /// Values a calibrated chunk may write to the environment. An explicit value set by the user must win, so the
 /// caller skips names that are already present.
+/// OpenAI stream deltas for tool calls (issue 122): a call not sent yet goes out with its id and name, then the part
+/// of its arguments past what `sent` holds. Arguments that do not start with what was sent add nothing.
+fn call_deltas(calls: &[(String, String)], sent: &mut Vec<String>, i: impl std::fmt::Display) -> Vec<serde_json::Value> {
+    let mut v = Vec::new();
+    for (k, (f, a)) in calls.iter().enumerate() {
+        if k == sent.len() {
+            v.push(json!({"index": k, "id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": ""}}));
+            sent.push(String::new());
+        }
+        if a.len() > sent[k].len() && a.starts_with(sent[k].as_str()) {
+            v.push(json!({"index": k, "function": {"arguments": &a[sent[k].len()..]}}));
+            sent[k] = a.clone();
+        }
+    }
+    v
+}
+
 fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
     if !(1..=(1 << 20)).contains(&n) { return vec![]; }
     ["STRATA_DS_CHUNK", "STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"].into_iter()
@@ -786,6 +870,10 @@ fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static 
 }
 
 impl Engine {
+    fn load_inference_model<'a>(&self, g: &'a Gguf, aux: Option<&'a Gguf>) -> anyhow::Result<Model<'a>> {
+        Model::load_with_matvec(g, aux, &self.lora_specs(), self.fast_cpu && !self.gpu)
+    }
+
     pub fn lora_specs(&self) -> Vec<(String, f32)> {
         self.lora.iter().map(|s| {
             if let Some(idx) = s.rfind(':') {
@@ -956,6 +1044,10 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Print the tokens `serve` answered, by model and by API key name, over all runs. The totals are kept in
+    /// usage.json next to the default models folder; delete that file to start again.
+    #[command(alias = "statistics")]
+    Stats,
     /// Replace this binary with the newest GitHub release (Linux and Windows x86_64). The old one is kept as
     /// `<name>.old`.
     Update {
@@ -1244,6 +1336,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
+        Cmd::Stats => {
+            let f = usage_file();
+            let u = serve::Usage::load(&f)?;
+            if u.models.is_empty() { println!("no requests recorded yet in {}", f.display()); }
+            else { print!("{}", u.table()); println!("({})", f.display()); }
+        }
         Cmd::Update { check } => rusting_strata::update::run(check)?,
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
@@ -1274,7 +1372,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // Kolibri and Inkling 2 have their own forwards: the continuation goes in a token at a time.
             macro_rules! score_tokenwise { ($chat:path, $model:path) => {{
                 use $chat as chat; use $model as Fwd;
-                engine.ds_env();
+                engine.ds_env()?;
                 chat::gpu_defaults();
                 let mut m = Fwd::new(&g)?;
                 let (mut argmax, mut top5) = (Vec::new(), Vec::new());
@@ -1313,13 +1411,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.own_calib(&model);
-            engine.ds_env();
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 return rusting_strata::gemma4::generate_image(&g, &prompt, &input.grids, &input.embeddings, n);
@@ -1344,10 +1443,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::kolibri::chat::generate(&g, &prompt, n);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::raon::chat::generate(&g, &prompt, n, engine.draft_model.as_deref());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1365,7 +1469,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::inkling2::chat::generate_image_opts(&g, &prompt, Some((&input.grids, &input.embeddings)), n, opts);
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -1375,7 +1479,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let vision_prompt = if image.is_empty() {
                 None
             } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
@@ -1406,16 +1510,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
             let n_chunk = (ids.len() / n).min(chunks.unwrap_or(usize::MAX));
             anyhow::ensure!(n >= 4 && n_chunk > 0, "{} tokens: need at least one chunk of --ctx-len {n} (>= 4)", ids.len());
             engine.ctx = engine.ctx.max(n);
-            let mut r = engine.runner(&m, &model)?;
-            let nv = m.cfg.n_vocab;
+            // Inkling 2 runs its own forward (`Model` does not load that architecture); it scores the same way, so
+            // `--kld-base` compares it with another build the same as it compares llama.cpp with the others.
+            let mut ink = if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
+                rusting_strata::inkling2::chat::gpu_defaults();
+                engine.ds_env()?;
+                Some(rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, n)?)
+            } else {
+                None
+            };
+            let aux_g = if ink.is_none() { open_mtp_gguf(engine.aux_model_path())? } else { None };
+            let m = if ink.is_none() { Some(Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?) } else { None };
+            let mut r = match &m { Some(m) => Some(engine.runner(m, &model)?), None => None };
+            let nv = match (&ink, &m) { (Some(im), _) => im.cfg.n_vocab, (_, Some(m)) => m.cfg.n_vocab, _ => unreachable!() };
             let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
             if let Some(o) = &mut out {
                 o.write_all(b"_logits_")?;
@@ -1425,10 +1538,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (mut nll, mut count, mut row) = (0f64, 0usize, Vec::new());
             let first = n / 2;
             for c in ids.chunks_exact(n).take(n_chunk) {
-                r.reset()?;
-                let mut logits = r.prefill(&c[..=first])?;
+                let mut logits = match (&mut ink, &mut r) {
+                    (Some(im), _) => { im.reset(); im.prefill(&c[..=first]) }
+                    (_, Some(run)) => { run.reset()?; run.prefill(&c[..=first])? }
+                    _ => unreachable!(),
+                };
                 for i in first..n - 1 {
-                    if i > first { logits = r.step(c[i])?; }
+                    if i > first {
+                        logits = match (&mut ink, &mut r) {
+                            (Some(im), _) => im.step(c[i]),
+                            (_, Some(run)) => run.step(c[i])?,
+                            _ => unreachable!(),
+                        };
+                    }
                     anyhow::ensure!(logits.len() == nv, "{} logits, vocabulary {nv}", logits.len());
                     nll += log_probs(&logits, c[i + 1], &mut row);
                     if let Some(o) = &mut out { for v in &row { o.write_all(&v.to_le_bytes())?; } }
@@ -1438,11 +1560,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if let Some(o) = &mut out { o.flush()?; }
             println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
-            r.finish()?;
+            if let Some(run) = &mut r { run.finish()?; }
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            let (kv_k, kv_v) = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let r6 = std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1");
-            if r6 { anyhow::ensure!(json_out.is_some() && reps > 0 && tg > 0, "R6 requires JSON output and positive reps/tg"); }
+            if r6 {
+                anyhow::ensure!(json_out.is_some() && reps > 0 && tg > 0, "R6 requires JSON output and positive reps/tg");
+                anyhow::ensure!(kv_k == engine.kv && kv_v == engine.kv && matches!(engine.kv.as_str(), "f16" | "q8" | "q4" | "q2"),
+                    "R6 profiles require symmetric legacy K/V; benchmark mixed formats without STRATA_PS5_R6");
+            }
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
                 anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
@@ -1456,8 +1583,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || rusting_strata::inkling2::is_arch(arch) {
-                    engine.ds_env();
+                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                    engine.ds_env()?;
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
                     return if arch == "deepseek41" {
@@ -1468,6 +1595,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::kolibri::ARCH {
                         bench_kolibri(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::raon::ARCH {
+                        bench_raon(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
                         bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
@@ -1476,7 +1605,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
@@ -1542,6 +1671,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 // The arch-specific benchners print this; putting it in the JSON too gives tools one reliable source.
                 let drafts = if let Runner::Gpu(g) = &r { g.drafts } else { (0, 0) };
                 record["drafts"] = json!({"made": drafts.0, "accepted": drafts.1});
+                record["kv_k"] = json!(kv_k);
+                record["kv_v"] = json!(kv_v);
                 if r6 {
                     record["r6"] = json!({"threads":rayon::current_num_threads(), "short":engine.short,
                         "rows":r6_rows});
@@ -1554,7 +1685,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,
                          samples, reps, warmup, pp, tg, chunk_values, task, seed,
                          dry_run, timeout, minutes, out, sub } => {
-            set_kv_env(&kv);  // read by Gpu::new and Vk::new
+            set_kv_env_for(&kv, None, None)?;  // read by Gpu::new and Vk::new; expands turbo pair aliases
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
 
@@ -1611,6 +1742,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 let m = rusting_strata::kolibri::forward::KolibriModel::new(&g)?;
                 println!("check: kolibri1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                let m = rusting_strata::raon::forward::RaonModel::new(&g)?;
+                println!("check: raon1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
@@ -1676,15 +1812,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             std::process::exit(cmd.status()?.code().unwrap_or(1));
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let think = engine.think_default;
             term::live(false);
             engine.own_calib(&model);
-            engine.ds_env();
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let input = if image.is_empty() { None } else {
-                    let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                    let mmproj = engine.mmproj_for(&model);
                     let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                     Some(load_images(mmproj, &image)?)
                 };
@@ -1709,9 +1846,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
                 return rusting_strata::kolibri::chat::chat(&g, system, n, think);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                return rusting_strata::raon::chat::chat(&g, system, n, think, engine.draft_model.as_deref());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1733,10 +1874,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 };
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 Some(load_images(mmproj, &image)?)
             };
@@ -1784,7 +1925,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             rusting_strata::update::notice();
             term::live(true);
-            engine.ds_env();
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
@@ -2023,13 +2165,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // The models outside the main engine read their limit here (`ctx_limit`).
                     if !o["ctx"].is_null() { rusting_strata::CTX.store(engine.ctx, Relaxed); }
                     // `runner` also sets it, and calibrate runs before `runner`.
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                 }
                 // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
                 // (they replace `--chunk`/`--mtp` and the page's earlier values).
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                     s.stats.lock().unwrap().unload(Some(s.name(&p)));
                     vram_margins(&engine.vram_margin, &engine.device)
                         .and_then(|mb| calibrate(&p, engine.aux_model_path(), engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
@@ -2062,7 +2204,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Err(e) => {
                         engine = old;
                         rusting_strata::CTX.store(old_ctx, Relaxed);
-                        set_kv_env(&engine.kv);
+                        set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                         s.stats.lock().unwrap().unload(None);
                         say!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
@@ -2218,6 +2360,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
+bench_tokenwise!(bench_raon, rusting_strata::raon::forward::RaonModel);
 
 /// `strata bench` for Gemma 4, with the `gpu_defaults` of its generate and chat paths.
 fn bench_gemma4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
@@ -2268,7 +2411,9 @@ fn gemma_bench_chunk(v: Option<&str>) -> usize {
 
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
-    rusting_strata::deepseek::chat::gpu_defaults();
+    // The same defaults `chat`, `generate` and `serve` set: without them the plain weights spread over both cards,
+    // `Device::new` refuses the second one and the whole benchmark runs the host path (about a fifth of the speed).
+    rusting_strata::inkling2::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
     let opts = rusting_strata::inkling2::chat::Inkling2Opts {
@@ -3309,6 +3454,8 @@ enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused, the slot and when the prefill began.
     /// `gone` is set when the client leaves while the chat waits for a slot; the chat is then dropped.
     Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
+    /// `prefill_image` in a free slot, answered as `Chat` (no tokens reused).
+    Image { p: vision::Prompt, embs: Vec<Vec<Vec<f32>>>, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
@@ -3322,10 +3469,20 @@ struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u6
 
 impl Client {
     fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        let ids = ids.to_vec();
+        self.submit(|owner, gone, back| Job::Chat { ids, sys, keep, owner, gone, back })
+    }
+    fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        let (p, embs) = (p.clone(), embs.to_vec());
+        Ok(self.submit(|owner, gone, back| Job::Image { p, embs, owner, gone, back })?.0)
+    }
+    /// Send a prompt job and wait for its slot.
+    fn submit(&mut self, job: impl FnOnce(u64, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>>) -> Job)
+        -> anyhow::Result<(Vec<f32>, usize)> {
         if let Some(s) = self.slot.take() { let _ = self.tx.send(Job::Done(s)); }
         let (back, r) = std::sync::mpsc::channel();
         let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, gone: gone.clone(), back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        self.tx.send(job(self.owner, gone.clone(), back)).map_err(|_| anyhow::anyhow!("model gone"))?;
         let (logits, reused, s, started) = loop {
             match r.recv_timeout(Duration::from_millis(250)) {
                 Ok(x) => break x?,
@@ -3378,7 +3535,7 @@ impl Sched {
     /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
     fn next_chat(&self) -> Option<usize> {
         let holds = |o: u64| self.held.iter().zip(&self.who).filter(|&(&h, &w)| h && w == o).count();
-        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
+        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } | Job::Image { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
     }
 
     /// How long to wait for jobs: until the steps of all decoding slots are in, at most `GATHER` after the first.
@@ -3411,12 +3568,31 @@ impl Sched {
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
-        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 8 });
+        // Dense 4: at 4 rows step_batch took 15.9 ms against step_rows' 17.0 (Qwen3-4B Q4_K_M) and 29.4 against 36.9
+        // (BF16), and from 5 rows step_rows needs two forwards.
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 4 });
         let big = g.batch_cap() > 0 && self.steps.len() >= min;
         let cap = if big { g.batch_cap() } else { rusting_strata::gpu_model::STEP_ROWS };
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
-        batch.sort_by_key(|s| s.0);
+        let batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
+        // ponytail: a slot that holds an image prompt (RoPE offset from its KV rows) steps alone; give the batched
+        // forwards per-row offsets if image chats under --parallel get common.
+        let (lone, mut batch): (Vec<_>, Vec<_>) = batch.into_iter().partition(|b| g.slot_shifted(b.0));
+        for (sl, token, want, back) in lone {
+            g.use_slot(sl);
+            let _ = back.send(g.step(token).map(|l| (rusting_strata::ops::argmax(&l) as u32, if want { l } else { vec![] })));
+        }
+        // A slot whose KV cannot grow for its token (no VRAM left) fails alone, not the whole forward.
+        batch.retain(|b| match g.kv_step(b.0) { Ok(()) => true, Err(err) => { let _ = b.3.send(Err(err)); false } });
+        if batch.is_empty() { return; }
+        batch.sort_by_key(|s| s.0);
+        // The batched forwards read the current slot's RoPE offset: make an unshifted slot current.
+        g.use_slot(batch[0].0);
+        let big = big && batch.len() >= min;
+        if !big && batch.len() > rusting_strata::gpu_model::STEP_ROWS {
+            self.steps.extend(batch.drain(rusting_strata::gpu_model::STEP_ROWS..));
+            self.since = Some(Instant::now() - Self::GATHER);
+        }
         let rows: Vec<_> = batch.iter().map(|b| (b.0, b.1, b.2)).collect();
         match if big { g.step_batch(&rows) } else { g.step_rows(&rows) } {
             Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
@@ -3479,12 +3655,17 @@ impl Serving {
                 s.take(&jobs, s.wait());
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
-                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } if gone.load(Relaxed)));
+                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
                 // Models with a batched forward prefill the queued prompts together, one free slot each.
                 let lim = g.batch_cap().max(1);
                 let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
                 let mut adm: Vec<(usize, Job)> = vec![];
-                while adm.len() < lim {
+                // An image prompt runs alone, in the least recently used free slot.
+                if let Some(j) = s.next_chat().filter(|&j| matches!(s.chats[j], Job::Image { .. }))
+                    && let Some(sl) = (0..n).filter(|&i| !s.held[i]).min_by_key(|&i| s.freed[i]) {
+                    adm.push((sl, s.chats.remove(j).unwrap()));
+                }
+                while adm.len() < lim && !matches!(adm.first(), Some((_, Job::Image { .. }))) {
                     let Some(j) = s.next_chat() else { break };
                     if !adm.is_empty() && !(fits(&s.chats[j]) && fits(&adm[0].1)) { break; }
                     let Job::Chat { ids, keep, owner, .. } = &s.chats[j] else { break };
@@ -3522,14 +3703,23 @@ impl Serving {
                                 Err(e) => adm.iter().map(|_| Err(serve::copy_err(&e))).collect(),
                             }
                         } else {
-                            let (sl, Job::Chat { ids, sys, keep, owner, .. }) = &adm[0] else { unreachable!() };
-                            g.use_slot(*sl);
-                            g.owner = *owner;
-                            vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                            match &adm[0] {
+                                (sl, Job::Chat { ids, sys, keep, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                                }
+                                (sl, Job::Image { p, embs, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_image_with(p, embs, &mut between).map(|l| (l, 0))]
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                     };
                     for ((sl, c), r) in adm.into_iter().zip(res) {
-                        let Job::Chat { owner, back, .. } = c else { unreachable!() };
+                        let (Job::Chat { owner, back, .. } | Job::Image { owner, back, .. }) = c else { unreachable!() };
                         (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
                         // A client that left during the prefill takes no slot.
                         if back.send(r.map(|(l, u)| (l, u, sl, started))).is_err() && s.held[sl] {
@@ -3649,20 +3839,21 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(OwnState::new);
     let (aux_g, m);
     let mut r = if _own.is_some() {
-        let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(model));
+        let mmproj = engine.mmproj_for(model);
         Runner::Own(match arch {
             "gemma4" => rusting_strata::gemma4::serve(&g, &tok, &name, mmproj.as_deref())?,
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
             rusting_strata::kolibri::ARCH => rusting_strata::kolibri::chat::serve(&g, &tok, &name)?,
+            rusting_strata::raon::ARCH => rusting_strata::raon::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;
-        m = { let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?; if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; } m };
+        m = engine.load_inference_model(&g, aux_g.as_ref())?;
         engine.runner(&m, model)?
     };
     // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.
@@ -3727,6 +3918,9 @@ fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+/// The totals behind `rustingstrata stats`, next to the default models folder.
+fn usage_file() -> PathBuf { models_dir_default().with_file_name("usage.json") }
+
 fn models_dir_default() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").or_else(|| std::env::var_os("LOCALAPPDATA")).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
@@ -3752,25 +3946,8 @@ fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<
     sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
 }
 
-/// The `timings` block llama-server puts in its responses. llama-swap and other
-/// OpenAI-compatible clients read it for prefill/decode rates. `prompt_n` is the
-/// uncached part of the prompt and `cache_n` the part served from cache, as in
-/// llama-server.
 fn llama_timings(l: &serve::Last) -> serde_json::Value {
-    let prompt_n = l.prompt_tokens.saturating_sub(l.cached_tokens);
-    let per_token_ms = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
-    let per_second = |ms: f64, n: usize| if ms > 0.0 { n as f64 * 1e3 / ms } else { 0.0 };
-    json!({
-        "prompt_n": prompt_n,
-        "prompt_ms": l.prefill_ms,
-        "prompt_per_token_ms": per_token_ms(l.prefill_ms, prompt_n),
-        "prompt_per_second": per_second(l.prefill_ms, prompt_n),
-        "predicted_n": l.completion_tokens,
-        "predicted_ms": l.decode_ms,
-        "predicted_per_token_ms": per_token_ms(l.decode_ms, l.completion_tokens),
-        "predicted_per_second": per_second(l.decode_ms, l.completion_tokens),
-        "cache_n": l.cached_tokens,
-    })
+    serve::timings(l.prompt_tokens, l.cached_tokens, l.completion_tokens, l.prefill_ms, l.decode_ms)
 }
 
 /// The chat page, served by the connection threads of `strata serve`.
@@ -3819,7 +3996,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         ("GET", "/api/models") => {
             // The model `--auto-unload` freed counts as loaded: a chat loads it again.
             let asleep = s.asleep.lock().unwrap().clone();
-            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj_for(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
             // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
@@ -3888,7 +4065,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
                     let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
-                        let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                        let mmproj = e.mmproj_for(&l.path);
                         let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                         let input = load_images(mmproj, &images)?;
                         build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
@@ -3928,6 +4105,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     // A failed write must not fail the reply; it is reported.
                     if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { say!("usage log: {err}"); }
                 }
+                if let Err(err) = serve::Usage::add(&usage_file(), key_name, last) { say!("stats: {err:#}"); }
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
@@ -3967,7 +4145,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think.unwrap_or(e.think_default), preserve, false);
             let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
             let image_input = if images.is_empty() { None } else {
-                let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                let mmproj = e.mmproj_for(&l.path);
                 let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                 Some(load_images(mmproj, &images)?)
             };
@@ -4011,6 +4189,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let mut k = 0;  // tokens decoded
             let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
+            let mut streamed = Vec::new();  // the tool-call arguments a stream has sent
             // A prompt that ends in an open think block makes the reply start with reasoning, up to `</think>`.
             let think_open = prompt.trim_end().ends_with("<think>");
             let mut think = Think::new(think_open);
@@ -4066,6 +4245,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
                             w.write_all(b": keep-alive\n\n")?;
                             last_stream_activity = Instant::now();
+                        }
+                        if tools && !anth {
+                            for d in call_deltas(&tpl.partial_calls(&hold.text, &req.tools), &mut streamed, i) {
+                                write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?;
+                                last_stream_activity = Instant::now();
+                            }
                         }
                     }
                     Ok(hold.stopped)
@@ -4143,7 +4328,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 "prompt_tokens_details": {"cached_tokens": cached}});
             if req.stream {
                 match &calls {
-                    Some(c) => write!(w, "data: {}\n\n", chunk(calls_json(c, true), None))?,
+                    Some(c) => for d in call_deltas(&c.1, &mut streamed, i) { write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?; },
+                    // ponytail: a call that streamed and then fails to parse also goes out as text; the client saw part of a call.
                     None => {
                         let (r, a) = think.feed(hold.rest());
                         send_split(&mut w, &chunk, (r, a))?;
@@ -4346,6 +4532,29 @@ mod bench_tests {
     use clap::Parser;
     use serde_json::Value;
     use std::path::Path;
+
+    #[test]
+    fn cpu_inference_loader_selects_requested_numerics() {
+        use super::{Cmd, Gguf, Model, State, ops};
+        let Some(path) = std::env::var_os("STRATA_CPU_PARITY_MODEL") else { return };
+        let g = Gguf::open(Path::new(&path)).unwrap();
+        let reference = Model::load(&g).unwrap();
+        let Some(Cmd::Bench { mut engine, .. }) = Cli::parse_from(["rustingstrata", "bench", "--model", "fixture"]).cmd else { unreachable!() };
+        let model = engine.load_inference_model(&g, None).unwrap();
+        let mut a = State::new(&reference.cfg);
+        let mut b = State::new(&model.cfg);
+        let mut token = 42;
+        for _ in 0..4 {
+            let want = reference.step(&mut a, token);
+            let got = model.step(&mut b, token);
+            assert_eq!(got, want, "CPU generation logits changed at step {}", b.pos);
+            token = ops::argmax(&want) as u32;
+        }
+        engine.fast_cpu = true;
+        let fast = engine.load_inference_model(&g, None).unwrap();
+        let expected = Model::load_with_matvec(&g, None, &[], true).unwrap();
+        assert_eq!(fast.step(&mut State::new(&fast.cfg), token), expected.step(&mut State::new(&expected.cfg), token));
+    }
 
     fn meta() -> BenchMeta<'static> {
         BenchMeta {
@@ -4726,5 +4935,43 @@ mod calibrate_cli_tests {
         let b = spec_baseline(&s);
         assert_eq!((b.i("spec_type"), b.i("draft_max"), b.i("ngram_n"), b.i("mtp")),
                    (Some(1), Some(2), Some(2), Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod kv_type_tests {
+    use super::effective_kv;
+
+    fn pair(kv: &str, k: Option<&str>, v: Option<&str>) -> (String, String) {
+        effective_kv(kv, k, v).unwrap()
+    }
+
+    #[test]
+    fn symmetric_flag_and_overrides() {
+        assert_eq!(pair("f16", None, None), ("f16".into(), "f16".into()));
+        assert_eq!(pair("turbo4", None, None), ("turbo4".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo4"), None), ("turbo4".into(), "f16".into()));
+        assert_eq!(pair("f16", None, Some("q8")), ("f16".into(), "q8".into()));
+    }
+
+    #[test]
+    fn turbo_aliases_expand_to_independent_types() {
+        assert_eq!(pair("turbo4-3", None, None), ("turbo4".into(), "turbo3".into()));
+        assert_eq!(pair("turbo4-2", None, None), ("turbo4".into(), "turbo2".into()));
+        assert_eq!(pair("turbo3-2", None, None), ("turbo3".into(), "turbo2".into()));
+    }
+
+    #[test]
+    fn arbitrary_kv_pairs_are_allowed() {
+        assert_eq!(pair("f16", Some("f16"), Some("q4")), ("f16".into(), "q4".into()));
+        assert_eq!(pair("f16", Some("q8"), Some("turbo4")), ("q8".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo3"), Some("turbo2")), ("turbo3".into(), "turbo2".into()));
+        assert_eq!(pair("f16", Some("turbo4"), Some("turbo3")), ("turbo4".into(), "turbo3".into()));
+    }
+
+    #[test]
+    fn invalid_types_are_rejected() {
+        assert!(effective_kv("f16", Some("bogus"), None).is_err());
+        assert!(effective_kv("f16", None, Some("turbo9")).is_err());
     }
 }

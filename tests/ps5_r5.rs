@@ -1,16 +1,16 @@
 //! Real Vulkan A/B fingerprint. No CUDA requirement, no silent GPU skip.
 #![cfg(feature = "ps5-r2")]
 mod common;
-use rusting_strata::{backend::Backend, vulkan::{Vk, spv_smem::shared_bytes}};
+use rusting_strata::{backend::Backend, vulkan::{Vk, spv_smem::shared_bytes_split}};
 
 #[test]
 fn shared_memory_bounds() {
     for wg in [256usize, 512, 1024] {
         for hd in [64, 128, 256] {
-            for kv in 0..4 {
-                let n = shared_bytes(&format!("attn_prefill_ps5_{wg}"), &[0, hd], kv).unwrap() as usize;
-                assert!((wg * 32..=wg * 32 + 128).contains(&n), "wg={wg} hd={hd} kv={kv}: {n}");
-            }
+            for k in 0..4 { for v in 0..4 {
+                let n = shared_bytes_split(&format!("attn_prefill_ps5_{wg}"), &[0, hd], k, v).unwrap() as usize;
+                assert!((wg * 32..=wg * 32 + 128).contains(&n), "wg={wg} hd={hd} k={k} v={v}: {n}");
+            }}
         }
     }
 }
@@ -39,7 +39,7 @@ fn fingerprint() {
         let k = common::up(&g, &vals(n, 11));
         let v = common::up(&g, &vals(n, 97));
         let kc = g.zeros::<u16>(g.kv_words(n)).unwrap();
-        let vc = g.zeros::<u16>(g.kv_words(n)).unwrap();
+        let vc = g.zeros::<u16>(g.kv_words_v(n)).unwrap();
         let zero = common::up(&g, &[0i32]);
         g.kv_store(k.addr(), v.addr(), kc.addr(), vc.addr(), nkv * hd, pos + t, zero.addr(), hd).unwrap();
         let q = common::up(&g, &vals(t * nh * hd, 23));

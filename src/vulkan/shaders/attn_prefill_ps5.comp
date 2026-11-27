@@ -47,10 +47,13 @@ void main() {
                 uint off = k * kvd + kvo + c;
                 if (KV_MODE == 0u) {
                     a = uint(p.kc.v[off]) | (uint(p.kc.v[off + 1u]) << 16u);
+                } else {
+                    a = ldkv2_k(p.kc, off, HD);
+                }
+                if (VKV_MODE == 0u) {
                     b = uint(p.vc.v[off]) | (uint(p.vc.v[off + 1u]) << 16u);
                 } else {
-                    a = ldkv2(p.kc, off, HD);
-                    b = ldkv2(p.vc, off, HD);
+                    b = ldkv2_v(p.vc, off, HD);
                 }
             }
             sk[i] = uint16BitsToHalf(uint16_t(a));

@@ -1,0 +1,29 @@
+{
+  "upstream_regular_files": 407,
+  "fork_regular_files": 434,
+  "r6_regular_files": 434,
+  "upstream_identical_in_merge": 389,
+  "upstream_spv_files_identical": 71,
+  "missing_files": 0,
+  "unresolved_conflicts": 0,
+  "upstream_files_modified_for_integration": [
+    "Cargo.toml",
+    "README.md",
+    "src/backend.rs",
+    "src/cpu_moe.rs",
+    "src/gguf.rs",
+    "src/gpu_model.rs",
+    "src/gpu_model/prefill.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/memory.rs",
+    "src/vision/projector.rs",
+    "src/vulkan/mod.rs",
+    "src/vulkan/preflight.rs",
+    "src/vulkan/shaders/gemmi.glsl",
+    "src/vulkan/shaders/gemv_q.comp",
+    "src/vulkan/shaders/moe_gemv_q.comp",
+    "src/weights.rs",
+    "tests/backend.rs"
+  ]
+}

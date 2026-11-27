@@ -3,6 +3,7 @@
 //! copied into a small staging area, a group of them at a time, each group's copy beside the previous group's GEMMs.
 
 use super::{Ffn, GpuModel, HcAt, Mixer};
+use crate::cpu_worker::TMAX;
 use crate::backend::{BATCHED, Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
@@ -24,6 +25,8 @@ pub(super) struct Scratch {
     feat: Option<Buf>,
     /// `[chunk, n_ids * n_embd]` post-layer hidden states captured for DFlash `target_layer_ids`.
     dflash_feat: Option<Buf>,
+    /// `[chunk, n_embd]` hc stream mean (hc targets), input to the DFlash capture.
+    dflash_mean: Option<Buf>,
     /// ids | xrow | inv, `chunk * k` each.
     ints: Buf,
     tiles: Buf,
@@ -85,6 +88,7 @@ impl Scratch {
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
             dflash_feat: c.dflash.as_ref().map(|dc| gpu.zeros::<f32>(dc.target_layer_ids.len() * ne * chunk)).transpose()?,
+            dflash_mean: if c.dflash.is_some() && c.hc_n > 0 { Some(gpu.zeros::<f32>(ne * chunk)?) } else { None },
             ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
@@ -137,6 +141,7 @@ impl GpuModel<'_> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return short(self) };
         if tokens.len() < self.short { return short(self); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        self.kv_need(self.cur, self.pos + tokens.len())?;
         // STRATA_PF_ADAPT=N: place the hot experts after every N-th chunk of a long prompt, not only after all of it,
         // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
         let every = std::env::var("STRATA_PF_ADAPT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
@@ -218,6 +223,8 @@ impl GpuModel<'_> {
     /// The start of `prefill_cached`: return to the longest state (saved, stashed or parked) that `tokens[..keep]`
     /// continues, and return its length.
     fn cache_begin(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<usize> {
+        // A text prompt: positions are KV rows again (after an image prompt they were offset).
+        self.rope_offset = 0;
         let (hit, own) = (self.saved_ids.len(), self.owner);
         let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
         let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
@@ -270,6 +277,7 @@ impl GpuModel<'_> {
         for &(sl, owner, tokens, sys, keep) in jobs {
             anyhow::ensure!(sys <= keep && keep < tokens.len() && tokens.len() <= self.ctx, "prefill_slots: sys {sys}, keep {keep} of {} tokens", tokens.len());
             self.use_slot(sl);
+            self.kv_need(sl, tokens.len())?;
             self.owner = owner;
             let n = self.cache_begin(tokens, keep)?;
             if dense {
@@ -422,6 +430,8 @@ impl GpuModel<'_> {
                 rope += 8;
             }
             // Hyper-connections / mHC: mixer and FFN outputs go to "mix" and "mo", then into the streams.
+            // A batched step (`rows`) may take the decode GEMM; one request keeps the prefill GEMM's bits.
+            let bf = if rows.is_some() { BATCHED } else { 0 };
             let (mx, mact) = if c.hc_n > 0 || ly.mhc.is_some() { (at(l.mix), 0) } else { (x, 2) };
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
             if let Some((mk, mhc_a, _)) = &ly.mhc {
@@ -449,46 +459,65 @@ impl GpuModel<'_> {
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
-                    g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
+                    // Rows mode: this layer's part of `Batch::kvt` holds each row's conv and scan state (`batch_rows`).
+                    // Rows of one slot scan in order, so a launch takes a run of rows with distinct slots.
+                    let tab = |r0: usize| self.bt.as_ref().map_or(0, |bt| bt.kvt.addr() + (8 * ((il - self.first) * bt.rows + r0) * 2) as u64);
+                    let runs = |sl: &[usize]| {
+                        let mut v = vec![];
+                        let mut r0 = 0;
+                        for r in 1..=sl.len() {
+                            if r == sl.len() || sl[r0..r].contains(&sl[r]) { v.push((r0, r)); r0 = r; }
+                        }
+                        v
+                    };
+                    g.gemm_dense(qkv, t, h, ne, at(l.a), channels, bf)?;
                     // The qkv GEMM above already quantized `h`; when it did not (IQ2_XS, or a shape the int8 GEMM
                     // skips), prepare it now so beta, alpha and the gate can all reuse one copy.
                     g.prequant_gemm_x(gate, t, h, ne)?;
                     match rows {
                         // A row a slot: each its own conv state, in row order.
-                        Some((sl, _)) => for (r, &s) in sl.iter().enumerate() {
-                            let o = (4 * r * channels) as u64;
-                            g.conv_silu(at(l.a) + o, conv[s].addr(), conv_w.ptr, at(l.c) + o, channels, c.ssm_conv, 0, eps)?;
+                        Some((sl, _)) => for (r0, r1) in runs(sl) {
+                            let (st, o) = (sl[r0..r1].iter().map(|&s| conv[s].addr()).collect::<Vec<_>>(), (4 * r0 * channels) as u64);
+                            g.conv_silu_rows(at(l.a) + o, tab(r0), &st, conv_w.ptr, at(l.c) + o, channels, c.ssm_conv, eps)?;
                         },
                         None => g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?,
                     }
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
-                        g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
+                        g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X | bf)?;
                         g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
-                        g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)
+                        g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X | bf)
                     })?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     probe(&mut tr, "qkv", &pf.slab, at(l.a), channels, t)?;
                     probe(&mut tr, "conv", &pf.slab, at(l.c), channels, t)?;
                     probe(&mut tr, "beta", &pf.slab, eb, nv, t)?;
                     probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
-                    // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
-                    g.batch(&mut || {
+                    let scan = || -> anyhow::Result<()> {
                         let scale = 1.0 / (dk as f32).sqrt();
                         match rows {
-                            Some((sl, _)) => for (r, &q) in sl.iter().enumerate() {
-                                g.deltanet(at(l.c) + (4 * r * channels) as u64, s[q].addr(), eb + (4 * r * nv) as u64, eg + (4 * r * nv) as u64, 0, 0,
-                                           at(l.d) + (4 * r * c.ssm_d_inner) as u64, nk, nv, c.k_interleave, dk, dv, scale, 1, channels, 0, 0)?;
+                            Some((sl, _)) => for (r0, r1) in runs(sl) {
+                                let st: Vec<u64> = sl[r0..r1].iter().map(|&q| s[q].addr()).collect();
+                                g.deltanet_rows(at(l.c) + (4 * r0 * channels) as u64, tab(r0), &st, eb + (4 * r0 * nv) as u64, eg + (4 * r0 * nv) as u64,
+                                                at(l.d) + (4 * r0 * c.ssm_d_inner) as u64, nk, nv, c.k_interleave, dk, dv, scale, channels)?;
                             },
                             None => g.deltanet(at(l.c), s[self.cur].addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, scale, t, channels, 0, 0)?,
                         }
-                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
-                    })?;
+                        Ok(())
+                    };
+                    // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle. Runs of rows of
+                    // one slot read each other's state, so those go in order, outside a batch.
+                    if rows.is_some_and(|(sl, _)| runs(sl).len() > 1) {
+                        scan()?;
+                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X | bf)?;
+                    } else {
+                        g.batch(&mut || { scan()?; g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X | bf) })?;
+                    }
                     probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
                     probe(&mut tr, "state", &s[self.cur], s[self.cur].addr(), s[self.cur].len() / 4, 1)?;
                     probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
-                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
+                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact | bf)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, sink, .. } if let Some((_, splits)) = rows => {
                     // As `batch_rows` on a dense model: each row reads and extends its own slot's KV.
@@ -540,7 +569,19 @@ impl GpuModel<'_> {
                     };
                     let sink_addr = sink.as_ref().map_or(0, |s| s.ptr);
                     let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
-                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw, sink_addr, win)?;
+                    let (kca, vca) = match &self.kv_stage {
+                        Some((sk, sv)) if crate::host_attn::on_host(il) => {
+                            let n = (self.pos + t) * kv;
+                            let kb = g.kv_words(n) * 2;
+                            let vb = g.kv_words_v(n) * 2;
+                            anyhow::ensure!(kb <= sk.len() && vb <= sv.len(), "host KV staging capacity exceeded");
+                            g.dtod(&kc[self.cur], 0, sk, 0, kb)?;
+                            g.dtod(&vc[self.cur], 0, sv, 0, vb)?;
+                            (sk.addr(), sv.addr())
+                        }
+                        _ => (kc[self.cur].addr(), vc[self.cur].addr()),
+                    };
+                    g.attn_prefill_m(at(l.b), kca, vca, if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw, sink_addr, win)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
@@ -574,8 +615,8 @@ impl GpuModel<'_> {
             }
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
-                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
+                    g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, bf)?;
+                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X | bf)?;
                     probe(&mut tr, "gate_up", &pf.slab, at(l.ge), c.n_ff, t)?;
                     if let Some((mk, _, mhc_f)) = &ly.mhc {
                         g.gemm_dense(down, t, at(l.ge), c.n_ff, at(l.mo), ne, 0)?;
@@ -586,7 +627,7 @@ impl GpuModel<'_> {
                             g.dtod(&pf.slab, 4 * l.mo, &pf.slab, 0, 4 * t * ne)?;
                         }
                     } else {
-                        g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                        g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2 | bf)?;
                     }
                 }
                 Ffn::Moe { router, shared } => {
@@ -601,8 +642,8 @@ impl GpuModel<'_> {
                     g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t, c.router_sigmoid)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
-                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X)?;
-                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X)?;
+                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X | bf)?;
+                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X | bf)?;
                             (at(l.shy), if s.gate_inp.is_some() { at(l.sg) } else { 0 })
                         }
                         None => (0, 0),
@@ -828,7 +869,7 @@ impl GpuModel<'_> {
                         }
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
-                    if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
+                    if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, bf)?; }
                     // Expert rows are slots (token, j) sorted by expert, not tokens.
                     probe(&mut tr, "experts_gate_up", &pf.slab, at(l.ge), c.n_ff_exp, t * k)?;
                     probe(&mut tr, "experts_down", &pf.slab, at(l.ye), ne, t * k)?;
@@ -849,8 +890,24 @@ impl GpuModel<'_> {
                 if let (Some(dff), Some(df)) = (&pf.dflash_feat, self.dflash.as_ref()) {
                     if let Some(idx) = df.cfg.target_layer_ids.iter().position(|&tl| tl == il) {
                         let n_ids = df.cfg.target_layer_ids.len();
-                        for r in 0..t {
-                            g.dtod(&pf.slab, 4 * r * ne, dff, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                        // hc targets (qwen4exp): collapse the hc streams to their plain mean first
+                        // (mirrors llama.cpp's hc_stream_mean); see the step-side note. hc_mix's gate
+                        // buffer holds TMAX rows, so tile over TMAX-position blocks.
+                        if c.hc_n > 0 {
+                            let dfm = pf.dflash_mean.as_ref().expect("dflash_mean with hc");
+                            let mut done = 0;
+                            while done < t {
+                                let rows = (t - done).min(TMAX);
+                                g.hc_mix(pf.slab.addr() + 4 * (done * c.hc_n * ne) as u64, df.dfg.addr(), dfm.addr() + 4 * (done * ne) as u64, ne, c.hc_n, rows)?;
+                                for r in 0..rows {
+                                    g.dtod(dfm, 4 * (done + r) * ne, dff, 4 * ((done + r) * n_ids + idx) * ne, 4 * ne)?;
+                                }
+                                done += rows;
+                            }
+                        } else {
+                            for r in 0..t {
+                                g.dtod(&pf.slab, 4 * r * ne, dff, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                            }
                         }
                     }
                 }
@@ -930,6 +987,7 @@ impl GpuModel<'_> {
         let t = rows.len();
         let pos: Vec<usize> = rows.iter().enumerate().map(|(r, &(s, ..))| *self.slot_pos(s) + rows[..r].iter().filter(|x| x.0 == s).count()).collect();
         let heads: Vec<usize> = (0..t).filter(|&r| all || rows[r].2).collect();
+        for (&(s, ..), &p) in rows.iter().zip(&pos) { self.kv_need(s, p + 1)?; }
         // Recurrent layers or experts: the layers of `prefill_chunk` in rows mode (`Batch::dense` is the forward below).
         if self.bt.as_ref().is_some_and(|b| !b.dense) {
             let bt = self.bt.as_ref().unwrap();
@@ -939,8 +997,8 @@ impl GpuModel<'_> {
             g.put(&pos.iter().flat_map(|&p| [p as i32, 0]).collect::<Vec<_>>(), &bt.step, 0)?;
             let mut table = vec![0u64; self.layers.len() * 2 * bt.rows];
             for (i, ly) in self.layers.iter().enumerate() {
-                let Mixer::Attn { kc, vc, .. } = &ly.mixer else { continue };
-                for (r, &(sl, ..)) in rows.iter().enumerate() { table[(i * bt.rows + r) * 2..][..2].copy_from_slice(&[kc[sl].addr(), vc[sl].addr()]); }
+                let (a, b) = match &ly.mixer { Mixer::Attn { kc, vc, .. } => (kc, vc), Mixer::Delta { conv, s, .. } => (conv, s) };
+                for (r, &(sl, ..)) in rows.iter().enumerate() { table[(i * bt.rows + r) * 2..][..2].copy_from_slice(&[a[sl].addr(), b[sl].addr()]); }
             }
             g.put(&table, &bt.kvt, 0)?;
             let splits = (pos.iter().max().unwrap() + 1).div_ceil(256).clamp(1, crate::backend::ATT_SPLITS);

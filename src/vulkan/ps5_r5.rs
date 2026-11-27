@@ -8,13 +8,14 @@ impl Attention {
             .context("STRATA_PS5_ATTN_WG must be 0, 256, 512 or 1024")?.unwrap_or(0);
         ensure!([0, 256, 512, 1024].contains(&wg), "STRATA_PS5_ATTN_WG must be 0, 256, 512 or 1024");
         if wg != 0 {
+            ensure!(crate::cuda::kv_k_mode() < 4 && crate::cuda::kv_v_mode() < 4, "R5 supports only legacy F16/Q8/Q4/Q2 K/V formats; TurboQuant is not validated");
             ensure!(cfg!(feature = "ps5-r2"), "R5 shaders require --features ps5-r2");
             ensure!(ps5 && !wave64 && !coop && !llama, "R5 requires PS5 AMD wave32, no cooperative matrices and default numerics");
             ensure!(std::env::var_os("STRATA_VK_DP_OLD").is_none(), "R5 conflicts with STRATA_VK_DP_OLD");
             ensure!(wg <= max_wg as usize, "R5 workgroup {wg} exceeds device limit {max_wg}");
             let (name, _) = Self { wg }.kernel();
             for hd in [64, 128, 256] {
-                super::spv_smem::check_shared_memory(name, &[0, hd], crate::cuda::kv_mode(), max_smem)?;
+                super::spv_smem::check_shared_memory(name, &[0, hd], crate::cuda::kv_k_mode(), crate::cuda::kv_v_mode(), max_smem)?;
             }
         }
         Ok(Self { wg })

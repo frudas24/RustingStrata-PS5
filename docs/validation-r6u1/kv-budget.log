@@ -1,0 +1,6 @@
+f16   8,589,934,592 bytes     8.000 GiB
+q8    4,563,402,752 bytes     4.250 GiB
+q4    2,415,919,104 bytes     2.250 GiB
+q2    1,610,612,736 bytes     1.500 GiB
+K=q8 V=q4: 3,489,660,928 bytes (3.250 GiB); K=2,281,701,376 V=1,207,959,552 bytes
+Excludes weights, activations, scratch, driver, alignment and OS. Hybrid/sliding layers require per-layer accounting; this engine may still allocate full-length caches.

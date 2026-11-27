@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
+use crate::backend::{BATCHED, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -53,7 +53,10 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
+    ("gemm_red", include_bytes!("spv/gemm_red.spv")),
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
+    ("gemmi_s2", include_bytes!("spv/gemmi_s2.spv")),
+    ("gemmi_s2_16", include_bytes!("spv/gemmi_s2_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     #[cfg(feature = "ps5-r2")]
@@ -74,6 +77,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("ink_attn_merge", include_bytes!("spv/ink_attn_merge.spv")),
     ("ink_attn_prefill", include_bytes!("spv/ink_attn_prefill.spv")),
     ("attn_sel", include_bytes!("spv/attn_sel.spv")),
+    ("vit_attn", include_bytes!("spv/vit_attn.spv")),
     ("ink_clip", include_bytes!("spv/ink_clip.spv")),
     ("ink_conv", include_bytes!("spv/ink_conv.spv")),
     ("ink_conv_batch", include_bytes!("spv/ink_conv_batch.spv")),
@@ -111,8 +115,14 @@ const SPV: &[(&str, &[u8])] = &[
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
-/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, and a fixed q8 buffer for `<= TMAX` graphed forwards.
-pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>);
+/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, a fixed q8 buffer for `<= TMAX` graphed forwards,
+/// and the split-K slices of batched-decode GEMMs (`SPLIT_SCR` bytes, made at first use).
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>, std::sync::OnceLock<Buf>);
+
+/// Split-K scratch of a batched GEMM: ks * nd * rows floats, ks chosen so ks * workgroups <= SPLIT_WG (so it fits:
+/// rows <= 64 g0 and nd <= 64 g1). 224, 448 and 896 measured alike at 16 rows; 448 was best at 64.
+const SPLIT_WG: usize = 448;
+const SPLIT_SCR: usize = SPLIT_WG * 64 * 64 * 4;
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -221,8 +231,10 @@ struct Inner {
     cr: Option<ash::ext::conditional_rendering::Device>,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
-    /// Specialization constant 15 of every kernel: KV cache mode (0 = f16, 1 = q8, 2 = q4).
-    kv_mode: u32,
+    /// Specialization constants 15 and 16 of every kernel: independent K and V cache modes
+    /// (0 = f16, 1 = q8, 2 = q4, 3 = q2, 4 = turbo4, 5 = turbo3, 6 = turbo2).
+    kv_k_mode: u32,
+    kv_v_mode: u32,
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
@@ -416,7 +428,12 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The usable GPU with index `device` (`backend::device_order`). Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
-        ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let (kv_k_mode, kv_v_mode) = (crate::cuda::kv_k_mode(), crate::cuda::kv_v_mode());
+        // ponytail: Vulkan turbo gave wrong text on Qwen3-4B (RTX 3060) and its hd 128 prefill needs 64000 B of shared
+        // memory; refused until fixed, `STRATA_VK_TURBO=1` opens it for tests.
+        ensure!((kv_k_mode < 4 && kv_v_mode < 4) || std::env::var_os("STRATA_VK_TURBO").is_some(),
+            "--kv turbo* is not ready on Vulkan yet; use the CUDA backend or --kv q8/q4");
+        ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4/turbo* does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.
         // Mesa reads the option from the environment when the device is created; other drivers ignore it.
@@ -477,6 +494,12 @@ impl Vk {
         let dev_props = unsafe { instance.get_physical_device_properties(pd) };
         let limits = dev_props.limits;
         let ps5 = dev_props.vendor_id == 0x1002 && std::env::var("STRATA_PS5").is_ok_and(|v| v == "1");
+        // Upstream 1.4.0 TurboQuant Vulkan is experimental (and its tiled prefill rotates uninitialized Q).
+        // The PS5 profile intentionally refuses it pending rebuilt shaders and numerical/driver validation.
+        ensure!(!ps5 || (kv_k_mode < 4 && kv_v_mode < 4), "PS5: TurboQuant Vulkan is not validated; use F16/Q8/Q4/Q2 K/V");
+        // Vulkan does not override Backend::alloc_host/attn_host; enabling this CUDA experiment here only adds staging.
+        ensure!(!ps5 || std::env::var("STRATA_KV_HOST").unwrap_or_default().is_empty(),
+            "PS5 Vulkan: STRATA_KV_HOST is a CUDA host-attention experiment; unset it");
         let mut dot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
         unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut dot)) };
         let r2 = ps5_r2::Kernels::read(ps5, wave64, dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE)?;
@@ -579,7 +602,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -597,6 +620,7 @@ impl Vk {
             Buf::new(0, 0, ()),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.1 = v.buf(XQ, DEVICE)?.0;
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
@@ -935,15 +959,16 @@ impl Inner {
         if let Some(&p) = st.pipes.get(&(name, spec.to_vec())) { return Ok(p); }
         let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
         // One choke point for Workgroup shared memory: the driver creates such a pipeline and faults at dispatch.
-        spv_smem::check_shared_memory(name, spec, self.kv_mode, self.smem_limit)?;
+        spv_smem::check_shared_memory(name, spec, self.kv_k_mode, self.kv_v_mode, self.smem_limit)?;
         let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
         let n = spec.len() as u32;
         let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
             .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
-                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4),
-                    vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 8).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&self.kv_mode, &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+                    vk::SpecializationMapEntry::default().constant_id(16).offset(4 * n + 4).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 8).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 12).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&self.kv_k_mode, &self.kv_v_mode, &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
@@ -992,20 +1017,29 @@ impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes())
 impl Vk {
     /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits (and
     /// writes out quantized into xq when not null).
-    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<()> {
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
         ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
-        let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
+        let (per, pz) = ((hd / 32) as u32, (nh * splits * (hd + 2)) as u32);  // splits: of attn_decode_gqa
         if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
             self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32), &(win as i32)])?;
             return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX, &0u64, &sink]);
         }
         let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
-        let args: [&dyn Arg; 14] = [&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32), &(win as i32)];
+        let args: [&dyn Arg; 15] = [&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32), &(win as i32), &kvt];
         // gq_min i32::MAX or 0 fixes the regime, so the dispatch that would exit at once is skipped.
         let wide = (nt >= 2) as u32;
         if gq_min != 0 { self.run("attn_decode", &[0, per, 1, 0, wide], [nh * nt, ATT_SPLITS_1, 1], &args)?; }
-        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1, wide], [nh / g * nt, ATT_SPLITS, 1], &args)?; }
-        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq, &sink])
+        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1, wide], [nh / g * nt, splits, 1], &args)?; }
+        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(splits as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq, &sink])
+    }
+    /// rms_norm with rope and (kc, or kvt with v) the K/V store; see rms_norm.comp.
+    fn rope_rows(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64, kvt: u64) -> anyhow::Result<()> {
+        if kc != 0 || (kvt != 0 && v != 0) {
+            let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
+            ensure!(!turbo || n % 128 == 0, "turbo KV cache: head_dim {n} is not a multiple of 128");
+        }
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc, &kvt])
     }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.
     fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
@@ -1125,7 +1159,7 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
-        let (same, act) = (act & SAME_X != 0, act & 3);  // BATCHED: the same kernels
+        let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;
@@ -1150,6 +1184,23 @@ impl Vk {
         // Only SAME_X promises that x still holds what was quantized (as on CUDA).
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
+        // A step of a batch of requests (at most 64 rows of x): gemmi_s, K split over ks workgroups so that the few
+        // weight-row tiles fill the device, each slice into the scratch, then gemm_red sums them (as gemmd on CUDA).
+        if batched && tiles == 0 && xrow == 0 && nd <= 64 && self.0.coop_i8 != 0 && !self.0.st().batch {
+            // More than 32 positions: gemmi_s2, one tile of 64, so each weight is decoded once.
+            let s2 = nd > 32;
+            let g = [rows.div_ceil(64), nd.div_ceil(if s2 { 64 } else { 32 }), 1];
+            let ks = (SPLIT_WG / (g[0] * g[1])).clamp(1, 8).min(nk as usize / 4).max(1);
+            let (sk, scr) = if ks > 1 { (ks, self.5.get_or_init(|| self.alloc(SPLIT_SCR).expect("split-K scratch")).addr()) } else { (1, y) };
+            let (ys, a) = if ks > 1 { (rows, 0) } else { (y_stride, act) };
+            let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &scr, &(nd as u32), &(ys as u32), tail[0], tail[1], &a, tail[3]];
+            self.run(match (s2, self.0.coop_i8 == 32) { (false, true) => "gemmi_s", (false, false) => "gemmi_s_16", (true, true) => "gemmi_s2", (true, false) => "gemmi_s2_16" }, &spec, [g[0], g[1], sk], &args)?;
+            if ks > 1 {
+                self.run("gemm_red", &[], [(rows * nd).div_ceil(256), 1, 1],
+                    &[&scr, &y, &(rows as u32), &(nd as u32), &(y_stride as u32), &(ks as u32), &act])?;
+            }
+            return Ok(());
+        }
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
         if self.0.r2.small_dense(self.0.coop_i8, tiles, nd) {
@@ -1184,6 +1235,7 @@ impl Backend for Vk {
             self.2.clone(),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
         Ok(Box::new(v))
@@ -1430,6 +1482,14 @@ impl Backend for Vk {
         unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
         Ok(())
     }
+    fn graph_clear(&self) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        if st.graphs.is_empty() { return Ok(()) }
+        self.0.flush(&mut st)?;
+        let cs: Vec<_> = st.graphs.drain().map(|(_, c)| c).collect();
+        unsafe { self.0.dev.free_command_buffers(st.gpool, &cs) };
+        Ok(())
+    }
 
     fn moe_mailbox_optional(&self) -> bool { true }
     fn verify_rows(&self) -> usize { crate::cpu_worker::TMAX }
@@ -1441,7 +1501,10 @@ impl Backend for Vk {
     }
     fn preflight(&self, types: &[GgmlType], verbose: bool) -> anyhow::Result<()> { Vk::preflight(self, types, verbose) }
     fn kv_words(&self, n: usize) -> usize {
-        match self.0.kv_mode { 0 => n, 1 => n * 17 / 32, 2 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.0.kv_k_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+    }
+    fn kv_words_v(&self, n: usize) -> usize {
+        match self.0.kv_v_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
     }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
@@ -1528,14 +1591,22 @@ impl Backend for Vk {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
     }
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64])
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64, &0u64])
     }
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
     }
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc])
+        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, v, kc, vc, 0)
+    }
+    fn kv_rows(&self) -> bool { self.0.llama == 0 }  // attn_decode_llama has no kvt
+    fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize, hd: usize, eps: f32, n_rot: usize,
+                             step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, base, 0, 0, 0, kvt)?;
+        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, base, v, 0, 0, kvt)
+    }
+    fn attn_rows(&self, q: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
+        self.attn(q, 0, 0, qg, out, part, step, nh, nkv, hd, scale, 0, nt, 0, 0, 0, sink, win, kvt, splits)
     }
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
         // One workgroup per row reads 1 MB (a 248320-token vocabulary) in ~25 us; 64 per row share it. The partials go
@@ -1587,12 +1658,13 @@ impl Backend for Vk {
         pos0: usize, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         ensure!(w <= 128, "ink_clip_n: w={w} > 128");
-        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let quant = |m: u32| m > 0;
+        ensure!(!(quant(self.0.kv_k_mode) || quant(self.0.kv_v_mode)) || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         self.run("ink_clip", &[], [rows, nt, 1], &[
             &x, &scale, &dst, &0u64, &(w as u32), &thr, &eps, &mul,
-            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl,
+            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl, &0u32,
         ])
     }
     fn ink_clip_pos(
@@ -1602,12 +1674,44 @@ impl Backend for Vk {
         pos_ptr: u64, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
-        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        ensure!(!(self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0) || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         self.run("ink_clip", &[], [rows, nt, 1], &[
             &x, &scale, &dst, &pos_ptr, &(w as u32), &thr, &eps, &mul,
-            &0u32, &(ring as u32), &0u32, &log_alpha, &fl,
+            &0u32, &(ring as u32), &0u32, &log_alpha, &fl, &0u32,
+        ])
+    }
+    fn ink_clip_n_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_at0: usize, dst_ring: usize,
+        pos0: usize, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_n: w={w} > 128");
+        let quant = self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0;
+        ensure!(!quant || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &0u64, &(w as u32), &thr, &eps, &mul,
+            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl, &1u32,
+        ])
+    }
+    fn ink_clip_pos_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        let quant = self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0;
+        ensure!(!quant || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &pos_ptr, &(w as u32), &thr, &eps, &mul,
+            &0u32, &(ring as u32), &0u32, &log_alpha, &fl, &1u32,
         ])
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
@@ -1635,6 +1739,10 @@ impl Backend for Vk {
         ensure!(hd % 32 == 0 && hd <= 256 && nkv > 0 && nh % nkv == 0 && (1..=8).contains(&per), "attn_sel: unsupported shape nh={nh} nkv={nkv} hd={hd}");
         self.run("attn_sel", &[0, hd as u32, per as u32, (32 * per) as u32], [nt, nkv, 1], &[&q, &kc, &vc, &idx, &cnt, &out, &(nh as u32), &(nkv as u32), &(ns as u32), &scale])
     }
+    fn vit_attn(&self, q: u64, k: u64, v: u64, out: u64, n: usize, nh: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        ensure!(hd > 0 && hd <= 128, "vit_attn: head dim {hd} not supported");
+        self.run("vit_attn", &[0, hd as u32], [n.div_ceil(32), nh, 1], &[&q, &k, &v, &out, &(n as u32), &(nh as u32), &scale])
+    }
     fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
         self.run("ink_ffn_sum", &[], [n.div_ceil(256), nt, 1], &[&acc, &d, &wts, &cpu, &(ne as u32), &(n as u32)])
     }
@@ -1652,7 +1760,16 @@ impl Backend for Vk {
         self.run("ssm_gates", &[], [n.div_ceil(256), 1, 1], &[&beta, &g, &dt_bias, &a, &(n as u32), &(nv as u32)])
     }
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()> {
-        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps])
+        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps, &0u64])
+    }
+    fn conv_silu_rows(&self, qkv: u64, tab: u64, states: &[u64], w: u64, y: u64, ch: usize, kw: usize, eps: f32) -> anyhow::Result<()> {
+        self.run("conv_silu", &[], [ch.div_ceil(128), states.len(), 1], &[&qkv, &0u64, &w, &y, &(ch as u32), &(kw as u32), &0u32, &eps, &tab])
+    }
+    fn deltanet_rows(&self, y: u64, tab: u64, states: &[u64], beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, ych: usize) -> anyhow::Result<()> {
+        let rows = 512 / dk.max(1);
+        ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
+        self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), states.len()], &[&y, &0u64, &beta, &g, &o, &0u64, &0u64, &0u64, &tab, &(nk as u32), &(nv as u32),
+            &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &1u32, &(ych as u32), &0u32])
     }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         self.deltanet_strided(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap, 1)
@@ -1662,7 +1779,7 @@ impl Backend for Vk {
         let rows = 512 / dk.max(1);  // state rows per subgroup
         ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
         let spec: &[u32] = if snap_stride > 1 { &[0, snap_stride as u32] } else { &[] };
-        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &(nk as u32), &(nv as u32),
+        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &0u64, &(nk as u32), &(nv as u32),
             &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
     }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
@@ -1760,15 +1877,17 @@ impl Backend for Vk {
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8/q4: each subgroup quantizes one 32-value block of one row.
-        ensure!(self.0.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        ensure!((self.0.kv_k_mode == 0 && self.0.kv_v_mode == 0) || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
+        ensure!(!turbo || hd % 128 == 0, "turbo KV cache: head_dim {hd} is not a multiple of 128");
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win)
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win, 0, ATT_SPLITS)
     }
     fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
         let xq = if self.0.llama != 0 { 0 } else { xq };
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win)?;
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win, 0, ATT_SPLITS)?;
         Ok(xq)
     }
     fn qsa_pool(&self, ik: u64, ring: u64, pool: u64, w: u64, step: u64, t: usize, n_rot: usize, base: f32, eps: f32) -> anyhow::Result<()> {

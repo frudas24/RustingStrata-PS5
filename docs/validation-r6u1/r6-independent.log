@@ -1,0 +1,11 @@
+test_cli_mock_end_to_end (__main__.Tests.test_cli_mock_end_to_end) ... ok
+test_dispatch_noop (__main__.Tests.test_dispatch_noop) ... ok
+test_metadata_and_fingerprint_rejections (__main__.Tests.test_metadata_and_fingerprint_rejections) ... ok
+test_metrics_guard (__main__.Tests.test_metrics_guard) ... ok
+test_numerics (__main__.Tests.test_numerics) ... ok
+test_random_metrics (__main__.Tests.test_random_metrics) ... ok
+test_record (__main__.Tests.test_record) ... ok
+test_settings_and_env (__main__.Tests.test_settings_and_env) ... ok
+test_shards_and_atomic (__main__.Tests.test_shards_and_atomic) ... ok
+test_timeout_and_child_failure (__main__.Tests.test_timeout_and_child_failure) ... 
+NOT_RUN_TO_COMPLETION: enclosing execution timeout interrupted final test.

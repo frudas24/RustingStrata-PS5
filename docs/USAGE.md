@@ -119,6 +119,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   differently from one-token decoding, so greedy output can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
+  Without `--chunk`, a GPU load that runs VRAM out with the default (4096) or calibrated chunk halves it down to
+  512 and loads again, saying which chunk it took; a `--chunk` given on the command line is kept and fails as before.
   `rustingstrata calibrate` measures the best chunk, draft count and short-prompt threshold and later runs read them
   from `~/.cache/rusting_strata/strata-<model>[-backend][-dev…].json` unless flags override. The suffix uses the
   backend that actually opened (so a CUDA to Vulkan fallback writes the Vulkan file). The models with their own
@@ -142,6 +144,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   contexts. Attention then reads rounded keys and values, so the output can differ from f16; q2 differs most.
   The head size must be a multiple of 32, and `--llama-numerics` needs the f16 cache. `calibrate` takes the
   same `--kv` value as the runs that will use it.
+- `--kv turbo4` (CUDA) uses TurboQuant: each 128-value K/V block is signed-Walsh rotated, quantized with
+  4-bit Lloyd-Max centroids, and stored in about 28% of the f16 cache size. Q is rotated by the same transform
+  when the K cache is TurboQuant, and the attention output is de-rotated when the V cache is TurboQuant.
+  `--kv turbo4-3`, `turbo4-2`, `turbo3`, `turbo2` and `turbo3-2` select narrower K/V centroids.
+- `--k TYPE` and `--v TYPE` set the two cache formats independently (CUDA). Either half may be `f16`, `q8`,
+  `q4`, `q2`, `turbo4`, `turbo3` or `turbo2`; for example `--k f16 --v q4` or `--k turbo4 --v turbo3`.
+  A mixed layout allocates each half with its own word width. The Vulkan backend only supports symmetric
+  legacy formats. Text can differ from f16 because attention reads rounded keys and values.
 - `calibrate --mtp-model PATH` or `--draft-model PATH` measures with that draft file loaded, so the chunk and the
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
@@ -197,12 +207,18 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `data: {"error": ...}` line.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (16 for a model with experts;
-  `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections on CUDA runs
-  them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
+  `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections (CUDA and
+  Vulkan) runs them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
   model each expert is read once for all requests of the step, and the CPU runs the experts that are not in VRAM.
-  Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. That forward
+  Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. For a model
+  without experts each slot's KV cache starts at 512 tokens and doubles when a request needs more, up to `--ctx`, so
+  short requests do not each hold a full context (Qwen3-4B Q4_K_M on the RTX 3060 at the default `--ctx 4096`: all 64
+  slots fit and 64 clients get 1725 tok/s in total, against 12 slots and 528 tok/s before); a request whose cache
+  cannot grow for lack of VRAM fails alone. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
-  request run alone.
+  request run alone. An image request (`--mmproj`) takes a slot too: its prompt runs a token at a time between the
+  other slots' steps, and its reply decodes beside the batched forward, one token a step. With `--gpu` the image encoder runs on the GPU too
+  (`STRATA_VISION_CPU=1` keeps it on the CPU; see docs/VISION.md).
 - `temperature`, `top_k`, `top_p`, `min_p` and `seed` are honored; decoding is greedy when they are left out.
   `min_p` (0 to 1, `--min-p`, default 0 = off) drops the tokens whose probability is below `min_p` times the
   best token's, as in llama.cpp.
@@ -216,6 +232,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   holds for the thinking text too. A grammar that does not parse is a `400` with the reason. With a grammar or a
   bias the GPU drafts (`--mtp`, `--spec-type`) are off for that request, and each token checks the whole vocabulary
   against the grammar (about 10 ms per token for a 150K vocabulary). `/v1/messages` takes neither field.
+- `response_format` (OpenAI) makes the reply JSON through the same grammar check: `{"type": "json_object"}` takes
+  any JSON object, and `{"type": "json_schema", "json_schema": {"schema": {...}}}` (or llama.cpp's
+  `{"type": "json_object", "schema": {...}}`) takes JSON that fits the schema. The schema may use `type` (one or a
+  list), `properties` and `required` (the properties come in the schema's order, the ones that are not required may
+  be left out), `items`, `enum`, `const`, `anyOf`/`oneOf`, `allOf` of one schema and local `$ref`s (`#/$defs/...`).
+  Lengths, counts, `pattern`, `format` and number bounds are not checked. `{"type": "text"}` is the default.
+  A request with both `grammar` and `response_format` is a `400`.
 - `presence_penalty` and `frequency_penalty` (OpenAI, -2 to 2) and `dry_multiplier`, `dry_base`, `dry_allowed_length`
   (the DRY sampler, llama.cpp server names) act against repetition loops. They count only the tokens of the reply,
   not the prompt, and do not apply inside a tool call. `--presence-penalty`, `--frequency-penalty`,
@@ -233,7 +256,18 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
   (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
-  "tool_calls"`. `tool_choice: "required"` does not force a call.
+  "tool_calls"`. `tool_choice: "required"` does not force a call. A streamed chat on `/v1/chat/completions` sends each
+  call's name as soon as the model writes it, and for a model with `<function=..>` calls (Qwen3.5, Qwen3.6, Qwen3
+  Coder) a string argument as it is written, so a client can show a long file write while it runs. Other call formats
+  send a call's arguments when the call is complete. This is the main engine; the Messages API and the separate
+  forwards (Inkling 2, DeepSeek, GLM and the others) still send calls at the end.
+- Each reply carries `usage` and llama-server's `timings` block (`prompt_n`, `prompt_ms`, `prompt_per_second`,
+  `predicted_n`, `predicted_ms`, `predicted_per_second`, `cache_n`), in the body or in the last chunk of a stream, on
+  every model, so llama-swap shows the prefill and decode speed.
+- The server adds each answered chat to `usage.json` next to the default models folder
+  (`~/.local/share/rusting_strata/usage.json` on Linux). `rustingstrata stats` prints the totals over all runs, by model
+  and by API key name (`open` without `--api-keys`): requests, prompt, cached and reply tokens, prefill and decode
+  speed, and the first and last day. Delete the file to start again. `--usage-log` still writes one line per request.
 - The prompt follows the model's own chat template, rendered like llama.cpp's `--jinja`.
 - `POST /tokenize` and `POST /detokenize` work as in llama.cpp's server: `{"content": "text", "add_special": false,
   "with_pieces": false}` gives `{"tokens": [...]}` (with pieces each entry is `{"id", "piece"}`, and a piece that is
@@ -283,6 +317,39 @@ its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the 
 AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
+
+### Inkling 2 on several GPUs
+
+Inkling 2 is the model this work targets, and `--device 0,1` is opt-in: the default is always one card, even on a
+machine with two. With two cards the 24 expert layers are placed as whole slabs (the load line says how many and
+where), a layer's FFN runs on the card that holds it, and the attention and tail stay on GPU 0.
+
+`STRATA_DS_FAST_KERNELS` selects the kernels:
+
+- `auto` (default): the tiled controllers, `ink_attn_128` and the 16-query prefill (`kp16`) only when the run has more
+  than one device. One card keeps the `main` kernels, so the greedy output does not change.
+- `1`: force them on one card (the one-card kernel numbers in the PR).
+- `0`: force the old kernels on two cards (the A/B).
+
+Per-kernel overrides: `STRATA_CTRL_TILE=0` (per-token controllers), `STRATA_DS_ATTN_OLD=1` (scalar decode and
+one-query-a-warp prefill), `STRATA_DS_ATTN_KP4=1` (four-query prefill).
+
+The two-card plan uses these knobs:
+
+| variable | default | effect |
+|---|---|---|
+| `STRATA_DS_FAST_KERNELS` | `auto` | as above; one card keeps the old kernels unless forced |
+| `STRATA_DS_PLAIN_FIRST` | unset; `chat`/`serve`/`bench` set `1` | keep the plain weights on GPU 0, where the decode state lives |
+| `STRATA_DS_PF_TOKENS` | 256 one card, 512 two | tokens of one prompt chunk (at most 2048) |
+| `STRATA_DS_KV_TOKENS` | `--ctx` | KV rows GPU 0 must still be able to take before it gives up a slab |
+| `STRATA_DS_PROF` | unset | print `inkling2: preloaded N/24 ...` and the per-chunk profile |
+| `STRATA_DS_NO_AFFINITY` | unset | pick the GPU per expert instead of per stacked tensor |
+| `STRATA_DS_NO_SEG_GRAPH` | unset | do not capture the segmented decode graph |
+| `STRATA_CTRL_TILE` | follows `FAST_KERNELS` | `0` forces the per-token controllers |
+| `STRATA_DS_ATTN_OLD` | off | `1` keeps the scalar decode and one-query-a-warp prefill |
+| `STRATA_DS_ATTN_KP4` | off | `1` selects the four-query 128-key prefill for the A/B |
+
+`STRATA_INKLING2_MODEL` (path to the GGUF) only selects the model for `tests/inkling2_forward.rs`.
 
 ## Page cache
 

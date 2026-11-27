@@ -133,6 +133,12 @@ pub trait Backend: Send {
     }
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
+    /// Zeroed buffer of `bytes` in host RAM the device reads over PCIe (CUDA: mapped pinned memory). Backends
+    /// without it fall back to device memory.
+    fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> { self.alloc(bytes) }
+    /// Decode attention of `nt` tokens over a host-RAM cache (`alloc_host`) computed on the CPU, written to `out`
+    /// with the output gate `qg` applied. Ok(false): not supported here, use `attn_decode_q`.
+    fn attn_host(&self, _q: u64, _kc: u64, _vc: u64, _qg: u64, _out: u64, _step: u64, _nh: usize, _nkv: usize, _hd: usize, _scale: f32, _nt: usize) -> anyhow::Result<bool> { Ok(false) }
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()>;
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()>;
@@ -148,6 +154,8 @@ pub trait Backend: Send {
     /// Free the graph recorded under `key`, if there is one. For a caller whose keys change as it runs (a graph holds
     /// device memory, and CUDA stops recording at a fixed number of them).
     fn graph_drop(&self, _key: u64) -> anyhow::Result<()> { Ok(()) }
+    /// Free every recorded graph, after buffers they use were replaced (a slot's KV cache grew).
+    fn graph_clear(&self) -> anyhow::Result<()> { Ok(()) }
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
@@ -232,8 +240,11 @@ pub trait Backend: Send {
         Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 
-    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
+    /// u16 words of a KV cache row for `n` values in the K format (and, separately, the V format).
+    /// `kv_row_words` is the size of one K row plus one V row.
     fn kv_words(&self, n: usize) -> usize;
+    fn kv_words_v(&self, n: usize) -> usize { self.kv_words(n) }
+    fn kv_row_words(&self, n: usize) -> usize { self.kv_words(n) + self.kv_words_v(n) }
     /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
     /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
     /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
@@ -372,6 +383,10 @@ pub trait Backend: Send {
     fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
         self.ink_clip_n(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
     }
+    /// Like `ink_clip`, for a V cache.
+    fn ink_clip_v(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.ink_clip_n_v(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
+    }
     /// Batched `ink_clip` over `nt` tokens of `rows` rows each (`x`: `[nt][rows][w]`, `scale`: `[rows][w]` or 0).
     /// When `dst != 0`, stores token `tok` at KV row `(dst_at0 + tok) % dst_ring`. When `log_alpha != 0.0`,
     /// scales `mul` by `1 + log_alpha * ln(max((pos0 + tok + 1) / log_floor, 1))`.
@@ -383,6 +398,15 @@ pub trait Backend: Send {
     ) -> anyhow::Result<()> {
         anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
     }
+    /// Like `ink_clip_n`, for a V cache. Backends with one format for both halves treat it identically.
+    fn ink_clip_n_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_at0: usize, dst_ring: usize,
+        pos0: usize, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        self.ink_clip_n(x, scale, w, rows, nt, thr, eps, mul, dst, dst_at0, dst_ring, pos0, log_alpha, log_floor)
+    }
     /// Graph-capturable `ink_clip_n`: reads `pos0` from device `i32` pointer `pos_ptr` (`dst_at0 = pos0 % dst_ring`).
     fn ink_clip_pos(
         &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
@@ -391,6 +415,15 @@ pub trait Backend: Send {
         _pos_ptr: u64, _log_alpha: f32, _log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Like `ink_clip_pos`, for a V cache.
+    fn ink_clip_pos_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        self.ink_clip_pos(x, scale, w, rows, nt, thr, eps, mul, dst, dst_ring, pos_ptr, log_alpha, log_floor)
     }
     /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
     /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
@@ -424,6 +457,9 @@ pub trait Backend: Send {
     /// valid) names the rows of the f16 caches `kc`/`vc` (`[(pos * nkv + g) * hd]`) that query t attends. `q` and
     /// `out` are f32 `[t][head][hd]`. Kolibri's sparse layers.
     fn attn_sel(&self, _q: u64, _kc: u64, _vc: u64, _idx: u64, _cnt: u64, _out: u64, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _ns: usize, _scale: f32) -> anyhow::Result<()> { anyhow::bail!("{}: attention over key lists not implemented", self.name()) }
+    /// Attention of a vision encoder: each of the `n` rows of `q` sees all `n` keys (no mask). `q`, `k`, `v` and `out`
+    /// are f32 `[n][nh][hd]`.
+    fn vit_attn(&self, _q: u64, _k: u64, _v: u64, _out: u64, _n: usize, _nh: usize, _hd: usize, _scale: f32) -> anyhow::Result<()> { anyhow::bail!("{}: vision attention not implemented", self.name()) }
     fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
@@ -444,6 +480,26 @@ pub trait Backend: Send {
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
     /// `dt_bias` not 0: beta and g are raw, and the kernel applies `ssm_gates` (with `dt_bias` and `a`) as it reads them.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// `conv_silu` (no norm) of rows r = 0..states.len(), `ch` floats apart in qkv and y, each with its conv state
+    /// states[r]; `tab` is a device table that holds states[r] at tab[2r], for a backend that does all rows in one launch.
+    fn conv_silu_rows(&self, qkv: u64, tab: u64, states: &[u64], w: u64, y: u64, ch: usize, kw: usize, eps: f32) -> anyhow::Result<()> {
+        let _ = tab;
+        for (r, &s) in states.iter().enumerate() {
+            let o = (4 * r * ch) as u64;
+            self.conv_silu(qkv + o, s, w, y + o, ch, kw, 0, eps)?;
+        }
+        Ok(())
+    }
+    /// `deltanet` of one token a row (gates applied), row r at token r's place in y, beta, g and o, with its state
+    /// states[r]; `tab` holds states[r] at tab[2r + 1] (as in `conv_silu_rows`).
+    fn deltanet_rows(&self, y: u64, tab: u64, states: &[u64], beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, ych: usize) -> anyhow::Result<()> {
+        let _ = tab;
+        for (r, &s) in states.iter().enumerate() {
+            self.deltanet(y + (4 * r * ych) as u64, s, beta + (4 * r * nv) as u64, g + (4 * r * nv) as u64, 0, 0, o + (4 * r * nv * dv) as u64,
+                          nk, nv, interleave, dk, dv, scale, 1, ych, 0, 0)?;
+        }
+        Ok(())
+    }
     /// Stride (in tokens) between saved DeltaNet checkpoints in `snap` (`1` saves every token, `4` saves every 4th token).
     fn delta_snap_stride(&self) -> usize { 1 }
     fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, _snap_stride: usize) -> anyhow::Result<()> {

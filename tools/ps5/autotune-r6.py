@@ -92,7 +92,7 @@ def child_env(k, trace=True):
     knobs_ok(k)
     env=clean_env()
     env.update(STRATA_PS5='1',STRATA_PS5_HOST_RESERVE_MB='1536',STRATA_VK_ATTN_BUDGET='16777216',
-        STRATA_VK_NO_COOP='1',STRATA_FIXED_EXPERTS='1',STRATA_PS5_ZERO_COPY_MB='512',
+        STRATA_VK_NO_COOP='1',STRATA_FIXED_EXPERTS='1',STRATA_PREFILL_PROTECT='0',STRATA_PS5_ZERO_COPY_MB='512',
         STRATA_PS5_SCHED_MAX_ROWS='4',STRATA_PS5_SCHED_SCRATCH_MB='64',RAYON_NUM_THREADS=str(k['threads']))
     env.update({name:str(k[key]) for key,name in ENV_KEYS.items()})
     if trace: env.update(STRATA_PS5_R6='1', STRATA_PS5_SCHED_LOG='0')

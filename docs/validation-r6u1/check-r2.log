@@ -1,0 +1,5 @@
+PASS: 4080 GEMV/MoE dispatch and split cases
+PASS: GEMM 32/128 tile bijections, 780 tail cases
+LDS PW=20: 40960 -> 20992 bytes; reduction 48.75%
+LDS PW=36: 49152 -> 29184 bytes; reduction 40.62%
+NOTE: CPU geometry only; GLSL/SPIR-V validation and GPU parity require target toolchain.

@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod host_attn;
 pub mod term;
 pub mod calibrate;
 
@@ -39,5 +40,7 @@ pub mod hy4;
 pub mod kolibri;
 pub mod inkling2;
 pub mod ngram;
+pub mod raon;
+pub mod kv_turbo;
 
 mod ps5_r4;
