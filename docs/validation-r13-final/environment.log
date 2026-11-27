@@ -1,0 +1,6 @@
+2c57ece0b4cd899b4f62bc7b89cf5ba3417e8615
+cargo: unavailable
+rustc: unavailable
+glslc: unavailable
+spirv-val: unavailable
+Bash syntax PASS; Python AST PASS

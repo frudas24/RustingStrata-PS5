@@ -1,0 +1,25 @@
+test_batch_gate_rejects_invalid_bytes_even_with_python_optimized (__main__.Launch.test_batch_gate_rejects_invalid_bytes_even_with_python_optimized) ... ok
+test_changed_corpus_rejected (__main__.Launch.test_changed_corpus_rejected) ... REJECT: corpus changed during quality arm
+ok
+test_changed_holdout_rejected (__main__.Launch.test_changed_holdout_rejected) ... prose-1-off
+REJECT: holdout changed during measurement
+ok
+test_child_cannot_finish_after_deadline (__main__.Launch.test_child_cannot_finish_after_deadline) ... ok
+test_mark_parser_rejects_malformed_extra_records (__main__.Launch.test_mark_parser_rejects_malformed_extra_records) ... ok
+test_noop_rejected (__main__.Launch.test_noop_rejected) ... REJECT: no experimental change: use a different --base-tile with --lut off
+ok
+test_tile_only_benchmark (__main__.Launch.test_tile_only_benchmark) ... prose-1-off
+prose-2-candidate-off
+prose-3-candidate-off
+prose-4-off
+holdout-1-off
+holdout-2-candidate-off
+holdout-3-candidate-off
+holdout-4-off
+ok
+test_tile_only_quality (__main__.Launch.test_tile_only_quality) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.174s
+
+OK

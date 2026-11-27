@@ -1,0 +1,13 @@
+test_alignment_counterexample (__main__.Gates.test_alignment_counterexample) ... ok
+test_each_format_and_fallback (__main__.Gates.test_each_format_and_fallback) ... ok
+test_lds_records (__main__.Gates.test_lds_records) ... ok
+test_pairwise_return_gate (__main__.Gates.test_pairwise_return_gate) ... ok
+test_r12_exact_route_markers (__main__.Gates.test_r12_exact_route_markers) ... ok
+test_swap_telemetry (__main__.Gates.test_swap_telemetry) ... ok
+test_zero_write_poison_wiring (__main__.Gates.test_zero_write_poison_wiring) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 1.436s
+
+OK
+R13 adversarial dispatch mutations rejected: 756

@@ -1,0 +1,15 @@
+test_changed_target_combine (__main__.Gates.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Gates.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Gates.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Gates.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Gates.test_missing_layer) ... ok
+test_no_write (__main__.Gates.test_no_write) ... ok
+test_replay_wrong_route (__main__.Gates.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Gates.test_replay_wrong_weight) ... ok
+test_sham (__main__.Gates.test_sham) ... ok
+test_valid (__main__.Gates.test_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.063s
+
+OK

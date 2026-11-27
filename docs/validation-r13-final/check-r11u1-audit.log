@@ -1,0 +1,10 @@
+test_dedup_coverage (__main__.Audit.test_dedup_coverage) ... ok
+test_old_overflow_counterexample (__main__.Audit.test_old_overflow_counterexample) ... ok
+test_quality_dump (__main__.Audit.test_quality_dump) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 12.339s
+
+OK
+20000 dedup coverage scenarios PASS (independent model)
+16 invalid quality evidence fixtures rejected

@@ -1,0 +1,6 @@
+test_bad_size (__main__.MockCampaign.test_bad_size) ... ok
+test_duplicate_lds (__main__.MockCampaign.test_duplicate_lds) ... ok
+test_missing_format (__main__.MockCampaign.test_missing_format) ... ok
+test_mixed_fallback (__main__.MockCampaign.test_mixed_fallback) ... ok
+test_valid_mock (__main__.MockCampaign.test_valid_mock) ...
+INCOMPLETE: execution environment timeout; not a completed suite.
