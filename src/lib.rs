@@ -46,3 +46,4 @@ pub mod kv_turbo;
 mod ps5_r4;
 
 mod venus_f16;
+mod venus_trace;

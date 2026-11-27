@@ -392,6 +392,13 @@ impl GpuModel<'_> {
         // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
+        let venus = crate::venus_trace::Target::from_env()?;
+        if let Some(v) = venus {
+            anyhow::ensure!(rows.is_none() && input.is_none() && self.ps5_r4.is_none() && c.hadamard.is_none()
+                && self.m.loras.is_empty() && g.name() == "vulkan", "Venus trace requires ordinary all-GPU Vulkan prefill, no R4/LoRA/Hadamard");
+            anyhow::ensure!(v.layer < c.n_layer && c.is_moe_layer(v.layer) && v.rank < c.n_expert_used
+                && c.n_embd <= 16384 && c.n_ff_exp <= 16384, "Venus trace target outside supported MoE shape");
+        }
         let mut tr = String::new();
         let probe = |tr: &mut String, what: &str, b: &Buf, o: u64, w: usize, rows: usize| -> anyhow::Result<()> {
             if !trace { return Ok(()); }
@@ -867,6 +874,19 @@ impl GpuModel<'_> {
                         if std::env::var("STRATA_PS5_SCHED_LOG").is_ok_and(|v| v == "1") {
                             crate::say!("PS5 R4 trial: layer={il} tokens={t} arm={arm} cpu_rows={cpu_rows} gpu_rows={} ns={ns}", ids.len() - cpu_rows);
                         }
+                    }
+                    if let Some(v) = venus.filter(|v| v.layer == il && v.pos >= self.pos && v.pos - self.pos < t) {
+                        let tok = v.pos - self.pos;
+                        let route = tok * k + v.rank;
+                        anyhow::ensure!(route < ids.len() && cpu.is_none(), "Venus trace did not reach an all-GPU route");
+                        let expert = ids[route] as usize;
+                        let slot = inv[route] as usize;
+                        anyhow::ensure!(slot < xrow.len() && xrow[slot] as usize == tok && slot >= off[expert] && slot < off[expert+1], "Venus trace route/slot mismatch");
+                        // Read only one row at each stage, after all expert dispatches complete, before combine.
+                        let h0 = g.get::<f32>(&pf.slab, l.h + tok * ne, ne)?;
+                        let a0 = g.get::<f32>(&pf.slab, l.ge + slot * c.n_ff_exp, c.n_ff_exp)?;
+                        let y0 = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
+                        crate::venus_trace::capture(self.m, v, expert, slot, h0, a0, y0)?;
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, bf)?; }
