@@ -5,9 +5,14 @@ Linux.** Original author Vasyl Trefilov, same [LICENSE.md](LICENSE.md), no endor
 docs and numbers further down are unchanged and still describe upstream; this fork keeps an opt-in PS5 path on top of
 them.
 
-Current tip: **R7** — evidence-driven delta over R6U1 (upstream 1.4.0). See [docs/PS5-R7.md](docs/PS5-R7.md)
-for the physical R6 findings, ported fixes, experimental dense64 GEMM and validation gates. The R7 build itself is
-not yet physically validated; R6 research results must not be attributed to R7.
+Current tip: **R9** — R6U1 (R1–R6 merged with upstream 1.4.0) plus five later deltas, all of them research or
+diagnostic work whose flags are off by default: R7 (two shader fixes ported from a physical R6 campaign, opt-in Vulkan
+counters, experimental dense64 GEMM), R7-V1 and R7-V2 ("Venus": opt-in CPU F16/BF16 kernels and a one-row GPU MoE
+trace), R8 (routed-arithmetic contract oracle) and R9 (matched single-expert causal replay). **None of them is a
+measured speedup and none changes a default**; the only tok/s this fork owns are still the R1 rows below. Upstream has
+not moved past 1.4.0 (`260a11c9`), so nothing of upstream is missing here. Details:
+[docs/PS5-R7.md](docs/PS5-R7.md), [docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md),
+[docs/PS5-R8.md](docs/PS5-R8.md), [docs/PS5-R9.md](docs/PS5-R9.md).
 
 ## This fork is meant for the PS5
 
@@ -32,10 +37,21 @@ What the fork adds, all of it in `main`:
   kernels (R2), immutable GGUF host-pointer import (R3), adaptive heterogeneous MoE prefill (R4), tiled long-context
   attention prefill with independent K/V pair loads (R5), and the bounded autotuner, dispatch telemetry and PGO
   toolchain (R6). Table below.
+- **Five later deltas, R7 to R9**, also default-off: the two shader fixes ported from a physical R6 campaign plus
+  optional Vulkan counters and an experimental dense64 GEMM (R7); opt-in F16C and BF16 CPU kernels with a one-row GPU
+  MoE trace (R7-V1, R7-V2); a deliberately slow routed-arithmetic oracle that tests what Vulkan actually computes (R8);
+  and a matched single-expert causal replay (R9). None of them promotes anything: R4's hybrid scheduler and the
+  file-backed import stay quarantined behind an explicit research switch, and every number they report comes from their
+  authors' environment, not from this console.
 - **Tooling** (`tools/ps5/`): `build.sh` (explicit `znver2`, fat LTO, one codegen unit, target-feature check),
-  `env.sh`, the `run.sh` preset, `diagnose.sh`, `test.sh`, `test-merge.sh`, `test-r2.sh`–`test-r6.sh`, `bench.sh`,
+  `env.sh`, the `run.sh` preset, `diagnose.sh`, `test.sh`, `test-merge.sh`, `test-r2.sh`–`test-r7.sh`, `bench.sh`,
   `bench-r2.sh`–`bench-r5.sh`, `check-r2.py`–`check-r6.py`, `summarize*.py`, `kv-budget.py`, `parity-r4.py`,
-  `pgo-r6.sh`, `autotune-r6.py` and `probe-r6.sh`. None of it modifies the console or the system.
+  `pgo-r6.sh`, `autotune-r6.py` and `probe-r6.sh`, plus the later gates: `test-r7-gemm.sh`, `check-r7-gemm.py` and
+  `bench-r7-gemm.py` (dense64 fingerprint and A/B); `test-venus.sh` with `check-venus-cpu.py`,
+  `check-venus-trace.py`, `venus-f16-check.c`, `venus-real-model.py` and `venus-real-weights.c` (F16/BF16 parity);
+  `test-r8-contract.sh` with `r8-run-guarded.py`, `check-r8.py` and `compare-r8.py` (four-arm contract campaign); and
+  `test-r9.sh` with `check-r9.py` and `compare-r9.py` (single-expert replay). None of it modifies the console or the
+  system.
 
 ### Measured on one console (R1, historical)
 
@@ -57,10 +73,13 @@ The model behind every number here is the GGUF `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`
 head `mtp-Qwen3.6-35B-A3B-Q8_0.gguf`. A BF16 (~70 GB) or FP8 (~35 GB) checkpoint neither fits the 13.09 GiB ceiling
 nor is a format this engine loads, which reads GGUF.
 
-**Those three rows belong to R1 and to the pre-merge prefill-protect build.** A subsequent physical R6 research campaign is summarized separately in [docs/PS5-R7.md](docs/PS5-R7.md).
-No R6U1 or R7 benchmark is claimed here. Building a tree is not a measurement, and the per-version documents state
-themselves that their authors had no console, no toolchain and no weights when they were written. Treat R2–R6 and R6U1
-as candidates until a benchmark says otherwise.
+**Those three rows belong to R1 and to the pre-merge prefill-protect build.** Later evidence lives in the documents,
+not in this table: [docs/PS5-R7.md](docs/PS5-R7.md) summarizes the supplied physical R6 campaign (one exploratory run per
+depth, 65024 prompt tokens at 139.5 prefill / 53.0 decode) and [docs/PS5-R8.md](docs/PS5-R8.md) a single-run R7
+comparison whose own text says the 8K decode delta comes from a slow baseline arm and is not a causal gain. No R6U1,
+R7, R8 or R9 benchmark is claimed here. Building a tree is not a measurement, and the per-version documents state
+themselves that their authors had no console, no toolchain and no weights when they were written. Treat R2–R9 as
+candidates until a benchmark says otherwise.
 
 ### Build and run on the console
 
@@ -73,6 +92,9 @@ bash tools/ps5/test-merge.sh      # compile every test target, CPU-only gate
 bash tools/ps5/test.sh --gpu      # Vulkan tests on the console
 bash tools/ps5/test-r2.sh         # per-version gates; R5 also runs symmetric and mixed K/V pairs
 bash tools/ps5/test-r5.sh
+bash tools/ps5/test-r7.sh         # R7: empty attention and MoE mailbox gates
+bash tools/ps5/test-r7-gemm.sh    # R7: dense128/dense64 fingerprint comparison
+bash tools/ps5/test-venus.sh --cpu   # R7-V1/V2 CPU kernels; no GPU and no shader compiler needed
 bash tools/ps5/run.sh chat  --model "$MODEL" --ctx 8192 --k q8 --v q4   # mixed KV (R6U1)
 bash tools/ps5/run.sh serve --model "$MODEL" --ctx 65536 --kv q8
 ```
@@ -81,7 +103,11 @@ bash tools/ps5/run.sh serve --model "$MODEL" --ctx 65536 --kv q8
 `PS5_TARGET` of `x86_64-unknown-linux-gnu`; it verifies that avx2/fma/f16c really are in the target before compiling.
 The `ps5-r2` Cargo feature (five extra shader variants built with `glslc` and checked with `spirv-val`) is on by
 default in that script; `PS5_R2_BUILD=0` falls back to the R1 shaders on a console without the shader tools.
-`PS5_R5_ALL_PAIRS=1` widens the R5 test from 8 to 16 K/V pairs.
+`PS5_R5_ALL_PAIRS=1` widens the R5 test from 8 to 16 K/V pairs. R7's repaired shaders need a recent shader
+toolchain: the campaign used Shaderc 2026.4 and SPIRV-Tools 2025.1, and glslc 2023.8 fails the packed-dot compile.
+The R8 and R9 research campaigns are run separately, with the MoE model and a directory that must not exist yet:
+`bash tools/ps5/test-r8-contract.sh "$MODEL_MOE" results/r8-contract` and
+`bash tools/ps5/test-r9.sh "$MODEL_MOE" results/r9-layer0`.
 
 ### Rollback
 
@@ -94,20 +120,24 @@ STRATA_PS5_DIRECT=0              # only the direct upload path
 STRATA_PREFILL_PROTECT=1|strict  # opt back into the fork's old prompt handling (now OFF by default, see R6U1)
 ```
 
-Every R2–R6 switch is off by default, so a plain build is R1 behaviour plus upstream. The tags below rebuild any
-earlier point (`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure).
+Every R2–R9 switch is off by default — the later ones are read only as the literal `1`, except `STRATA_PS5_R9_MODE`,
+which takes `shadow`, `legacy` or `contract` and is off when empty — so a plain build is R1 behaviour plus upstream.
+`STRATA_SCALAR` overrides the new F16/BF16 CPU kernels, and `STRATA_PS5_R4_RESEARCH=1` is still required to touch the
+quarantined R4 hybrid scheduler and the file-backed import. The tags below rebuild any earlier point
+(`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure).
 
 ### Branches and tags
 
 | ref | what it is |
 |---|---|
-| `main` | the tip: R6U1 = R1–R6 + upstream 1.4.0 + this README |
+| `main` | the tip: R9 = R1–R6 + upstream 1.4.0 (R6U1) + the R7, R7-V1, R7-V2, R8 and R9 deltas + this README |
 | `ps5-r1` … `ps5-r6` | one tag per PS5 version; each checkpoint stays reconstructible without being re-derived |
 | `ps5-r6u1` | the R6U1 merge |
+| `ps5-r7`, `ps5-r7-venus`, `ps5-r7-venus-v2`, `ps5-r8`, `ps5-r9` | one tag per later delta, each with its own branch (`ps5/r7` … `ps5/r9`) and its own document; they arrived as git bundles and were merged fast-forward, so their commit hashes are the authors' |
 | `feat/expert-cache-prefill-protect` | `b7b832b`, the prefill-protect change alone (the upstream PR branch, pushed as `upstream/pr-108`), kept free of the PS5 port so the PR does not carry it |
-| `upstream/main` | `8df1c22`, upstream 1.3.7 — the base R1–R6 were cut from |
+| `upstream/main` | `260a11c9`, upstream 1.4.0 — the merge base R6U1 was built on; R1–R6 were cut from `8df1c22` (1.3.7) |
 
-### PS5 versions R1–R6, and R6U1
+### PS5 versions R1–R9
 
 | version | tag | what it adds | opt-in switches |
 |---|---|---|---|
@@ -118,16 +148,24 @@ earlier point (`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure)
 | R5 | `ps5-r5` | tiled long-context attention prefill (`attn_prefill_ps5.comp`, 1/2/4 KiB K/V tiles, sliding-window start bound) and paired KV loads | `STRATA_PS5_ATTN_WG`, `STRATA_R5_WG` |
 | R6 | `ps5-r6` | bounded autotuner (`autotune-r6.py`), dispatch telemetry and the PGO/probe toolchain | `STRATA_PS5_R6` |
 | R6U1 | `ps5-r6u1` | 1.4.0 merged onto R6: upstream's independent K/V formats, split-K GEMM, dynamic KV growth, new architectures; PS5 path kept and gated | same as R1–R6; `STRATA_PREFILL_PROTECT` now off |
+| R7 | `ps5-r7` | evidence-driven delta from a physical R6 campaign: merge guard for empty attention and an atomic OR on the MoE miss flag in the mixed-KV shaders, R4 hybrid and the file import forced behind an explicit research switch, optional Vulkan counters and token timing, experimental dense64 GEMM (dense128 stays the default) | `STRATA_PS5_R4_RESEARCH`, `STRATA_PS5_R7_GEMM_TILE`, `STRATA_R7_VK_TRACE`, `STRATA_VK_PROF`, `STRATA_R7_TOKEN_TIMING` |
+| R7-V1 | `ps5-r7-venus` | "Venus" CPU kernels: F16C+FMA 3x4 GEMM and single-token matvec, plus a diagnostic trace of exactly one real GPU-routed MoE row with a CPU cross-feed | `STRATA_PS5_VENUS_F16`, `STRATA_PS5_VENUS_MATVEC`, `STRATA_PS5_VENUS_LOG`, `STRATA_PS5_VENUS_TRACE=layer:position:rank`, `STRATA_PS5_VENUS_TRACE_VALUES` |
+| R7-V2 | `ps5-r7-venus-v2` | native BF16 CPU GEMV for exact 2-byte rows, and an independent BF16/F16 parity harness over real Qwen3-0.6B weights; needs a GGUF converted with `--outtype bf16` | `STRATA_PS5_VENUS_BF16` |
+| R8 | `ps5-r8` | routed-arithmetic contract investigation: a deliberately slow CPU oracle that follows Vulkan's own type/column selection, route-aware gate/up/down probes, and a guarded four-arm campaign; an accuracy experiment, never a production path | `STRATA_PS5_R8_CONTRACT`, `STRATA_R7_R4_STAGE_PROBE`, `PS5_R8_TIMEOUT` |
+| R9 | `ps5-r9` | matched single-expert causal replay: replaces exactly one GPU-routed expert row just before the Vulkan combine, reads the combined row back, and fails closed on a missing target or a mismatch | `STRATA_PS5_R9_MODE` (`shadow`, `legacy`, `contract`), `PS5_R9_LAYER`, `PS5_R9_POS`, `PS5_R9_TOKEN`, `PS5_R9_RANK` |
 
-**The last one is enough**, with one nuance. The line is cumulative: R6 contains R1–R5, R6U1 contains R6 plus upstream
-1.4.0, so `main` is the version to run. The earlier tags are kept because R6U1's own rollout compares **R6 against
-R6U1** A/B/B/A before adoption, and because each checkpoint stays reconstructible without being re-derived. No version
-removes a file of the one before it; across R1→R6 and R6→R6U1 the count of deleted files is zero.
+**`main` is the version to run**, with two nuances. The code line is cumulative: R6 contains R1–R5, R6U1 adds upstream
+1.4.0, and R7–R9 keep every earlier file and every earlier switch, so moving forward drops nothing — across R1→R6,
+R6→R6U1 and R6U1→R9 the count of deleted files is zero. But cumulative in code is not cumulative in evidence: R7–R9 are
+research deltas whose flags default to off and whose own documents report no console and no toolchain, so the tags are
+kept to compare each successor against its predecessor A/B/B/A and to keep every checkpoint reconstructible without
+being re-derived.
 
 Per-version documentation: [docs/PS5.md](docs/PS5.md) (R1), [docs/PS5-R2.md](docs/PS5-R2.md),
 [docs/PS5-R3.md](docs/PS5-R3.md), [docs/PS5-R4.md](docs/PS5-R4.md), [docs/PS5-R5.md](docs/PS5-R5.md),
-[docs/PS5-R6.md](docs/PS5-R6.md) and [docs/PS5-R6U1.md](docs/PS5-R6U1.md), each with its contracts, its flags and its
-own limits.
+[docs/PS5-R6.md](docs/PS5-R6.md), [docs/PS5-R6U1.md](docs/PS5-R6U1.md), [docs/PS5-R7.md](docs/PS5-R7.md),
+[docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md), [docs/PS5-R8.md](docs/PS5-R8.md)
+and [docs/PS5-R9.md](docs/PS5-R9.md), each with its contracts, its flags and its own limits.
 
 ### R6U1: what the upstream merge changed
 
@@ -163,11 +201,22 @@ Honest summary, because the distinction matters:
 - **R6 (the tree before this merge) was compiled on the console** with `tools/ps5/build.sh`, shader variants included,
   in 3m11s. That is compilation only.
 - **R1 was compiled and measured** on the console; those are the numbers in the table. **R2–R6 were never
-  benchmarked**, and R6U1 inherits none of the R1 figures as a measurement of its own.
+  benchmarked**, and neither were R6U1 or R7–R9; none of them inherits the R1 figures as a measurement of its own.
+- **R7–R9 were prepared without a toolchain and without a console**, as their own documents state: the Rust build, the
+  new shader build, GPU parity and any tok/s are pending for all five deltas. What they do ship is evidence from their
+  authors' environment — `docs/validation-r8/` copies the R6/R7 campaign tables (four-arm parity, dense64 retries,
+  revision comparison) and `docs/validation-venus-v2/` an independent BF16/F16 run on an EPYC host with real
+  Qwen3-0.6B weights (maximum causal logit drift 3.3e-5, identical top-1 and identical six greedy tokens). None of it
+  was produced on this console, and R9's own document says outright that R9 has no physical parity and that R8's
+  physical results are not R9 results.
 
 What is still open is written down rather than implied: the A/B/B/A plan, the acceptance criteria, the mixed-KV
 quality question and the unresolved `attn_merge` / TurboQuant / MoE shared-flag risks are in
-[docs/PS5-R6U1.md](docs/PS5-R6U1.md). The historical fork report is preserved verbatim in
+[docs/PS5-R6U1.md](docs/PS5-R6U1.md); the physical build of R7 and R7's dense64 gate are in
+[docs/PS5-R7.md](docs/PS5-R7.md); the Rust/parity gates of the Venus kernels are in
+[docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md) and [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md); the R4 hybrid failure and the
+four-arm race are in [docs/PS5-R8.md](docs/PS5-R8.md), and the replay is in [docs/PS5-R9.md](docs/PS5-R9.md). Those
+documents, not this README, are the acceptance criteria. The historical fork report is preserved verbatim in
 [docs/archive/PS5-fork-612c3c9-README.md](docs/archive/PS5-fork-612c3c9-README.md), with its R1 measurements, and its
 own report in `docs/archive/PS5-fork-612c3c9-R1-report.md`.
 
@@ -303,8 +352,10 @@ Inkling 2 open the GPU by themselves.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
 - [PS5.md](docs/PS5.md), [PS5-R2.md](docs/PS5-R2.md), [PS5-R3.md](docs/PS5-R3.md), [PS5-R4.md](docs/PS5-R4.md),
-  [PS5-R5.md](docs/PS5-R5.md), [PS5-R6.md](docs/PS5-R6.md) and [PS5-R6U1.md](docs/PS5-R6U1.md): this fork's PS5
-  port, one version per document, with its contracts, its switches and its limits.
+  [PS5-R5.md](docs/PS5-R5.md), [PS5-R6.md](docs/PS5-R6.md), [PS5-R6U1.md](docs/PS5-R6U1.md), [PS5-R7.md](docs/PS5-R7.md),
+  [PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [PS5-R7-V2.md](docs/PS5-R7-V2.md), [PS5-R8.md](docs/PS5-R8.md) and
+  [PS5-R9.md](docs/PS5-R9.md): this fork's PS5 port, one version per document, with its contracts, its switches and its
+  limits.
 - [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
