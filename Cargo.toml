@@ -8,6 +8,9 @@ license-file = "LICENSE.md"
 name = "rustingstrata"
 path = "src/main.rs"
 
+[features]
+ps5-r2 = []
+
 [dependencies]
 anyhow = "1"
 memmap2 = "0.9"

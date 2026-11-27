@@ -169,12 +169,18 @@ void main() {
             float da[2][2], sa[2][2], db[2][4], mb[2][4];
             if (nv) {
                 [[unroll]] for (uint mt = 0; mt < 2; mt++)
+#ifdef STRATA_PS5_SMALL
+                    if (!sm || mt == 0)
+#endif
                     [[unroll]] for (uint e = 0; e < 2; e++) {
                         uint r = bm + 16 * mt + g + 8 * e;
                         da[mt][e] = xd[xb][r][h * KS / 32];
                         if (MIN) sa[mt][e] = KS == 32 ? xsum[xb][r][2 * h] + xsum[xb][r][2 * h + 1] : xsum[xb][r][h];
                     }
                 [[unroll]] for (uint nt = 0; nt < 2; nt++)
+#ifdef STRATA_PS5_SMALL
+                    if (!sm || nt == 0)
+#endif
                     [[unroll]] for (uint e = 0; e < 4; e++) {
                         uint n = bn + 16 * nt + 2 * t + (e & 1) + 8 * (e >> 1);
                         db[nt][e] = wsc[xb][n][h * KS / 16];

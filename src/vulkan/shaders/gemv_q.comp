@@ -4,7 +4,13 @@
 // cols % 256 != 0 the lanes whose 8 values lie inside the partial last super-block also read it.
 // Supports dual-matrix gemvq2 (rows..rows+rows2 read from w2 into y2) and indexed gemv_rows (I32 ids).
 // nt is specialization constant 5, as CUDA's template NT: a runtime count leaves acc indexed dynamically.
+#ifdef STRATA_GEMV_WG
+layout(local_size_x = STRATA_GEMV_WG) in;
+#define ROW_WARPS (STRATA_GEMV_WG / 32u)
+#else
 layout(local_size_x = 256) in;
+#define ROW_WARPS 8
+#endif
 #include "common.glsl"
 #define SHARED_TABLES
 #include "deq.glsl"
@@ -28,7 +34,7 @@ void sb_step(F32 xd, U8 w, uint row, uint lane, uint s, bool full, inout precise
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x * 8 + WARP, lane = LANE, tot = p.rows + p.rows2;
+    uint row = gl_WorkGroupID.x * ROW_WARPS + WARP, lane = LANE, tot = p.rows + p.rows2;
     load_tables();
     if (row >= tot) return;
     bool sec = row >= p.rows;

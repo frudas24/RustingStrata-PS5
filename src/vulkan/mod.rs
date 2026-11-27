@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod preflight;
 pub mod spv_smem;
+mod ps5_r2;
 
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
@@ -47,6 +48,16 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("gemv_q_ps5_64", include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q_ps5_64.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemv_q_ps5_128", include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q_ps5_128.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("moe_gemv_q_ps5_64", include_bytes!(concat!(env!("OUT_DIR"), "/moe_gemv_q_ps5_64.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("moe_gemv_q_ps5_128", include_bytes!(concat!(env!("OUT_DIR"), "/moe_gemv_q_ps5_128.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_32", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_32.spv"))),
     ("hadamard", include_bytes!("spv/hadamard.spv")),
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
     ("hc_silu", include_bytes!("spv/hc_silu.spv")),
@@ -169,6 +180,7 @@ struct Inner {
     /// Integrated GPU (APU sharing unified system LPDDR memory between device and host heaps).
     igpu: bool,
     ps5: bool,
+    r2: ps5_r2::Kernels,
     ps5_gtt: bool,
     ps5_direct: bool,
     ps5_host_reserve: u64,
@@ -438,6 +450,11 @@ impl Vk {
         let dev_props = unsafe { instance.get_physical_device_properties(pd) };
         let limits = dev_props.limits;
         let ps5 = dev_props.vendor_id == 0x1002 && std::env::var("STRATA_PS5").is_ok_and(|v| v == "1");
+        let mut dot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut dot)) };
+        let r2 = ps5_r2::Kernels::read(ps5, wave64, dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE)?;
+        if ps5 { crate::say!("PS5 R2: GEMV workgroup {}, small GEMM {}, packed signed dot accelerated {}", r2.wg, r2.small,
+            dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE); }
         let ps5_gtt = ps5 && budget && std::env::var("STRATA_PS5_GTT").is_ok_and(|v| v == "1");
         let ps5_direct = ps5 && std::env::var("STRATA_PS5_DIRECT").is_ok_and(|v| v == "1");
         let ps5_host_reserve = if ps5 {
@@ -526,7 +543,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1076,6 +1093,9 @@ impl Vk {
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
+        if self.0.r2.small_dense(self.0.coop_i8, tiles, nd) {
+            return self.run("gemmi_dp_ps5_32", &spec, [grid[0], nd.div_ceil(32), 1], &args);
+        }
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
         if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
         Ok(())
@@ -1385,7 +1405,8 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc, &w.scale, &1.0f32])
+        let (kernel, wpb) = self.0.r2.gemv(nt, false);
+        self.run(kernel, &spec, [w.rows.div_ceil(wpb), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc, &w.scale, &1.0f32])
     }
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
         if a.ty != b.ty || a.cols != b.cols || a.ty.float_x() {
@@ -1399,7 +1420,8 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, a.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [(a.rows + b.rows).div_ceil(8), 1, 1],
+        let (kernel, wpb) = self.0.r2.gemv(nt, false);
+        self.run(kernel, &spec, [(a.rows + b.rows).div_ceil(wpb), 1, 1],
             &[&a.ptr, &xq, &ya, &b.ptr, &yb, &0u64, &(a.rows as u32), &(a.rows as u32), &(b.rows as u32), &nc, &a.scale, &b.scale])
     }
     fn supports_gemv_rows(&self) -> bool { true }
@@ -1415,7 +1437,8 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [n_rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &ids, &(n_rows as u32), &(n_rows as u32), &0u32, &nc, &w.scale, &1.0f32])
+        let (kernel, wpb) = self.0.r2.gemv(nt, false);
+        self.run(kernel, &spec, [n_rows.div_ceil(wpb), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &ids, &(n_rows as u32), &(n_rows as u32), &0u32, &nc, &w.scale, &1.0f32])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         self.moe_gemv_nm(ty, rows, cols, w, stride, ids, k, x, x_stride, xg, y, pair, xq, k / xg.max(1))
@@ -1736,7 +1759,8 @@ impl Vk {
         let spec = [&ws[..], &[max_nm]].concat();
         let rpw = if max_nm > 1 { 1 } else { (4096 / cols).max(1) };
         let z = if pair.is_some() { 2 } else { 1 };
-        self.run("moe_gemv_q", &spec, [rows.div_ceil(8 * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+        let (kernel, wpb) = self.0.r2.gemv(if max_nm == 1 && ntok == 1 { 1 } else { 2 }, true);
+        self.run(kernel, &spec, [rows.div_ceil(wpb * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
             &(rows as u32), &nc, &(xg as u32), &(ntok as u32), &(rpw as u32)])
     }
 }

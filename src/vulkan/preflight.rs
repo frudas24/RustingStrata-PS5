@@ -43,10 +43,12 @@ impl Vk {
                 let ws = self.wspec(ty);
                 if !ty.float_x() {
                     for nt in [1u32, 3, 5, 9, 17] {
-                        let _ = self.0.pipeline(&mut st, "gemv_q", &[&ws[..], &[nt]].concat());
+                        let (kernel, _) = self.0.r2.gemv(nt as usize, false);
+                        let _ = self.0.pipeline(&mut st, kernel, &[&ws[..], &[nt]].concat());
                     }
                     for nm in [1u32, 4, 8, 17] {
                         let _ = self.0.pipeline(&mut st, "moe_gemv_q", &[&ws[..], &[nm]].concat());
+                        if nm == 1 { let (kernel, _) = self.0.r2.gemv(1, true); let _ = self.0.pipeline(&mut st, kernel, &[&ws[..], &[nm]].concat()); }
                     }
                     let _ = self.0.pipeline(&mut st, "moe_down_combine", &ws);
                 } else {
@@ -96,9 +98,10 @@ impl Vk {
             if !float {
                 if self.0.coop_i8 == 32 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); }
                 else if self.0.coop_i8 == 16 { push("gemmi_16", ws.clone()); push("gemmi_s_16", ws.clone()); }
-                else { push("gemmi_dp", ws.clone()); }
-                for nt in 1..=4 { push("gemv_q", [&ws[..], &[nt]].concat()); }
+                else { push("gemmi_dp", ws.clone()); if self.0.r2.small { push("gemmi_dp_ps5_32", ws.clone()); } }
+                for nt in 1..=crate::cpu_worker::TMAX as u32 { let (kernel, _) = self.0.r2.gemv(nt as usize, false); push(kernel, [&ws[..], &[nt]].concat()); }
                 for nm in [1u32, 4, 8, 17] { push("moe_gemv_q", [&ws[..], &[nm]].concat()); }
+                let (kernel, _) = self.0.r2.gemv(1, true); push(kernel, [&ws[..], &[1]].concat());
                 push("dequant", ws.clone());
             } else {
                 for nt in 1..=4 { for wpb in [1u32, 8] { push("gemv_f", [&ws[..], &[nt, 32 * wpb]].concat()); } }

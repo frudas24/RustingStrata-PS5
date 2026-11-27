@@ -3,7 +3,13 @@
 // bytes). Slot k multiplies expert ids[k] (skipped when negative; its weights at w + ids[k] * stride) by token k / xg
 // of x pre-quantized by quant_xq at xq (ntok rows), into y + k * rows. Subgroup w of a workgroup covers rows w, w + 8, ..
 // (rpw of them; kernels.cu's rows per warp), so a workgroup covers 8 * rpw rows.
+#ifdef STRATA_GEMV_WG
+layout(local_size_x = STRATA_GEMV_WG) in;
+#define ROW_WARPS (STRATA_GEMV_WG / 32u)
+#else
 layout(local_size_x = 256) in;
+#define ROW_WARPS 8
+#endif
 #include "common.glsl"
 #define SHARED_TABLES
 #include "deq.glsl"
@@ -65,7 +71,12 @@ void main() {
     int e = p.ids.v[k];
     if (e < 0) return;  // the whole workgroup
     uint nm = 1;
-    if (MAX_NM > 1u && nslots > 8 && nslots <= 256) {
+    #ifdef STRATA_GEMV_WG
+    if (false)  // R2 variants are only dispatched with MAX_NM=1.
+#else
+    if (MAX_NM > 1u && nslots > 8 && nslots <= 256)
+#endif
+    {
         uint tid = gl_LocalInvocationID.x;
         if (tid == 0) { s_nm = 0; s_dup = false; }
         barrier();
@@ -85,9 +96,9 @@ void main() {
     U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride + gl_WorkGroupID.z * p.w2);
     F32 y = F32(uint64_t(p.y) + gl_WorkGroupID.z * p.y2);
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.cols);
-    uint t = k / p.xg, nsb = p.cols >> 8, r0 = gl_WorkGroupID.x * 8 * p.rpw, r1 = min(p.rows, r0 + 8 * p.rpw);
+    uint t = k / p.xg, nsb = p.cols >> 8, r0 = gl_WorkGroupID.x * ROW_WARPS * p.rpw, r1 = min(p.rows, r0 + ROW_WARPS * p.rpw);
     if (MAX_NM <= 1u || nm <= 1) {
-        for (uint row = r0 + WARP; row < r1; row += 8) {
+        for (uint row = r0 + WARP; row < r1; row += ROW_WARPS) {
             precise float acc = 0.0;
             // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
             uint s = 0;
@@ -105,7 +116,7 @@ void main() {
             slot_reg[u] = (u < nm) ? s_slots[u] : 0u;
             t_reg[u] = (u < nm) ? (slot_reg[u] / p.xg) : 0u;
         }
-        for (uint row = r0 + WARP; row < r1; row += 8) {
+        for (uint row = r0 + WARP; row < r1; row += ROW_WARPS) {
             precise float acc[4];
             [[unroll]] for (uint u = 0; u < 4; u++) acc[u] = 0.0;
             uint s = 0;
@@ -126,7 +137,7 @@ void main() {
             slot_reg[u] = (u < nm) ? s_slots[u] : 0u;
             t_reg[u] = (u < nm) ? (slot_reg[u] / p.xg) : 0u;
         }
-        for (uint row = r0 + WARP; row < r1; row += 8) {
+        for (uint row = r0 + WARP; row < r1; row += ROW_WARPS) {
             precise float acc[MAX_NM];
             [[unroll]] for (uint u = 0; u < MAX_NM; u++) acc[u] = 0.0;
             uint s = 0;

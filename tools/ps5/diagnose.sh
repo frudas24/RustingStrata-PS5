@@ -12,5 +12,5 @@ done
 printf '\n=== Vulkan ===\n'
 if command -v vulkaninfo >/dev/null; then
   vulkaninfo --summary
-  vulkaninfo 2>/dev/null | grep -E 'heap(Budget|Usage)|memoryHeap|memoryType|DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|shaderFloat64|shaderInt(8|16|64)|shaderFloat16|shaderIntegerDotProduct|integerDotProduct8Bit.*Accelerated|subgroupSize|deviceCoherentMemory|vulkanMemoryModel|bufferDeviceAddress|maxComputeSharedMemorySize|VK_EXT_memory_budget|VK_AMD_device_coherent_memory' || true
+  vulkaninfo 2>/dev/null | grep -E 'heap(Budget|Usage)|memoryHeap|memoryType|DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|shaderFloat64|shaderInt(8|16|64)|shaderFloat16|shaderIntegerDotProduct|integerDotProduct(8Bit|4x8BitPacked).*Accelerated|subgroupSize|deviceCoherentMemory|vulkanMemoryModel|bufferDeviceAddress|maxComputeSharedMemorySize|VK_EXT_memory_budget|VK_AMD_device_coherent_memory' || true
 else echo 'vulkaninfo missing (install your distro vulkan-tools package).'; fi
