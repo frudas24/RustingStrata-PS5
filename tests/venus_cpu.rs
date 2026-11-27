@@ -14,9 +14,9 @@ fn venus_cpu_model() {
         let ids=tok.encode(prompt).unwrap(); assert!(!ids.is_empty() && ids.len()<=128);
         let mut st=State::new(&m.cfg); let mut last=Vec::new();
         for id in ids { last=m.step(&mut st,id); assert!(!last.is_empty() && last.iter().all(|v|v.is_finite())); traces.push(last.clone()); }
-        let mut gen=Vec::new();
-        for _ in 0..8 { let id=ops::argmax(&last) as u32; gen.push(id); last=m.step(&mut st,id); assert!(last.iter().all(|v|v.is_finite())); }
-        generations.push(gen);
+        let mut generated=Vec::new();
+        for _ in 0..8 { let id=ops::argmax(&last) as u32; generated.push(id); last=m.step(&mut st,id); assert!(last.iter().all(|v|v.is_finite())); }
+        generations.push(generated);
     }
     std::fs::write(out,serde_json::to_vec(&serde_json::json!({"logits":traces,"greedy":generations})).unwrap()).unwrap();
 }
