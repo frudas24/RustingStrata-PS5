@@ -255,6 +255,7 @@ struct Inner {
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
+    max_dispatch: [u32; 3],
     /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     ts_period: f32,
     r7_trace: bool,
@@ -636,7 +637,7 @@ impl Vk {
         let mut drv = vk::PhysicalDeviceDriverProperties::default();
         unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut drv)) };
         if drv.driver_id == vk::DriverId::AMD_PROPRIETARY && coop && smem_limit == 32768 { smem_limit = 49152; }
-        if let Ok(v) = std::env::var("STRATA_VK_SMEM_LIMIT") { smem_limit = v.parse().context("STRATA_VK_SMEM_LIMIT")?; }
+        if let Ok(v) = std::env::var("STRATA_VK_SMEM_LIMIT") { smem_limit = smem_limit.min(v.parse().context("STRATA_VK_SMEM_LIMIT")?); }
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
         let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
         let gpool = unsafe { dev.create_command_pool(&pool_info, None) }?;
@@ -651,7 +652,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), r7_commands: Default::default(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, max_dispatch: limits.max_compute_work_group_count, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), r7_commands: Default::default(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1106,6 +1107,8 @@ impl Vk {
     }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.
     fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
+        ensure!(groups.iter().zip(self.0.max_dispatch).all(|(&n, max)| n <= max as usize),
+            "{name}: dispatch {groups:?} exceeds device limits {:?}", self.0.max_dispatch);
         let mut pc = Vec::with_capacity(128);
         for a in args { a.put(&mut pc) }
         assert!(pc.len() <= 128, "{name}: {} bytes of push constants", pc.len());
@@ -1190,7 +1193,7 @@ impl State {
     /// The buffer holding `bytes` from device address `addr`, and the offset of `addr` in it.
     fn find(&self, addr: u64, bytes: usize) -> anyhow::Result<(vk::Buffer, u64)> {
         let (&a, &(b, len)) = self.bufs.range(..=addr).next_back().with_context(|| format!("{addr:#x} is not a device buffer"))?;
-        ensure!(addr - a + bytes as u64 <= len as u64, "{bytes} bytes at {addr:#x} pass the end of its buffer");
+        ensure!((addr - a).checked_add(bytes as u64).is_some_and(|end| end <= len as u64), "{bytes} bytes at {addr:#x} pass the end of its buffer");
         Ok((b, addr - a))
     }
 }
@@ -1237,7 +1240,7 @@ impl Vk {
     }
 
     fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
-        let need = n_x * (cols + cols / 8 + cols / 4);
+        let need = n_x.saturating_mul(cols.saturating_add(cols / 8).saturating_add(cols / 4));
         if n_x <= crate::cpu_worker::TMAX && need <= (1 << 20) { &self.4 } else { &self.3 }
     }
 
@@ -1245,9 +1248,9 @@ impl Vk {
     /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
     fn q8_x(&self, q8: &mut (Buf, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
         if !crate::cuda::Gpu::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        let need = q8_gemm_bytes(n_x, cols, x_stride)?;
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         if q8.1 == key { return Ok(Some(q8.0.addr())); }
-        let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.0.addr();
         self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
@@ -1259,8 +1262,16 @@ impl Vk {
     /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32, w_scale: f32) -> anyhow::Result<()> {
         // Partial super-blocks (Q2_0's 640 columns, BF16's 320) are fine: K steps are 64 deep.
-        ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
+        ensure!(rows > 0 && cols > 0 && cols % 64 == 0 && cols % ty.block_elems() == 0,
+            "{} matrix {rows}x{cols}: GEMM needs nonempty complete blocks and a multiple of 64 columns", ty.name());
+        ensure!(n_x > 0 && x_stride >= cols && y_stride >= rows && [rows, cols, n_x, nd, x_stride, y_stride].iter().all(|&v| u32::try_from(v).is_ok()),
+            "GEMM invalid dimensions or strides");
+        ensure!(rows.checked_mul(ty.row_bytes(cols as u64)).is_some_and(|v| v <= u32::MAX as usize),
+            "GEMM weight offsets exceed shader uint range");
+        ensure!(n_x.checked_mul(x_stride).is_some_and(|v| v <= u32::MAX as usize), "GEMM input offsets exceed shader uint range");
+        // Routed output rows are indexed by the tile list, not n_x. Only dense output is bounded by nd here.
+        ensure!(tiles != 0 || nd.checked_mul(y_stride).is_some_and(|v| v <= u32::MAX as usize), "GEMM output offsets exceed shader uint range");
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
@@ -1344,6 +1355,24 @@ impl Vk {
     }
 }
 
+// quant_q8 and gemmi use uint products before dividing by four; reject truncation before allocating or dispatching.
+fn q8_gemm_bytes(n: usize, cols: usize, stride: usize) -> anyhow::Result<usize> {
+    ensure!(n > 0 && cols > 0 && cols % 128 == 0 && stride >= cols, "invalid Q8 GEMM geometry");
+    let limit = u32::MAX as usize;
+    ensure!(n.checked_mul(stride).is_some_and(|v| v <= limit), "Q8 input offsets exceed shader uint range");
+    let bytes = cols.checked_add(cols / 8).and_then(|v| v.checked_add(cols / 4)).and_then(|v| v.checked_mul(n))
+        .filter(|&v| v <= limit).context("Q8 GEMM byte offsets exceed shader uint range")?;
+    Ok(bytes)
+}
+
+#[test]
+fn r12_audit_q8_geometry() {
+    assert_eq!(q8_gemm_bytes(512, 2048, 2048).unwrap(), 1441792);
+    for (n, c, s) in [(0,128,128),(1,0,0),(1,64,64),(1,128,127),(usize::MAX,128,128), (1<<24,256,256), (1<<24,128,512)] {
+        assert!(q8_gemm_bytes(n,c,s).is_err());
+    }
+}
+
 /// GEMV column count: a multiple of 32 and of the type's block (a partial last super-block is read by the lanes
 /// inside it). llama numerics take one x scale per 256 values, so they need whole super-blocks.
 fn gemv_cols(llama: u32, ty: GgmlType, cols: usize) -> anyhow::Result<u32> {
@@ -1415,7 +1444,7 @@ impl Backend for Vk {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         if self.0.r7_trace { self.0.r7_commands.upload_bytes.fetch_add(src.len() as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
-        ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
+        ensure!(off.checked_add(src.len()).is_some_and(|end| end <= dst.len()), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
         if st.step_pos.is_some_and(|(a, _)| dst.addr() + off as u64 == a) { st.step_pos = None; }
         // A small copy goes inline into the open command buffer, with no staging round trip and no wait: the next
@@ -1475,7 +1504,7 @@ impl Backend for Vk {
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         if self.0.r7_trace { self.0.r7_commands.download_bytes.fetch_add(dst.len() as u64, std::sync::atomic::Ordering::Relaxed); }
-        ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
+        ensure!(off.checked_add(dst.len()).is_some_and(|end| end <= src.len()), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         let mut st = self.0.st();
         for (i, c) in dst.chunks_mut(STAGING).enumerate() {
             let (b, o) = st.find(src.addr() + (off + i * STAGING) as u64, c.len())?;
@@ -1493,7 +1522,8 @@ impl Backend for Vk {
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()> {
         if self.0.r7_trace { self.0.r7_commands.device_copy_bytes.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
-        ensure!(src_off + bytes <= src.len() && dst_off + bytes <= dst.len(), "dtod: {bytes} bytes out of range");
+        ensure!(src_off.checked_add(bytes).is_some_and(|end| end <= src.len())
+            && dst_off.checked_add(bytes).is_some_and(|end| end <= dst.len()), "dtod: {bytes} bytes out of range");
         if bytes == 0 { return Ok(()); }
         let mut st = self.0.st();
         let (s, so) = st.find(src.addr() + src_off as u64, bytes)?;

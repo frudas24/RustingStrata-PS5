@@ -618,22 +618,42 @@ pub trait Backend: Send {
     }
 }
 
+// Check before allocation (get) or conversion to a byte offset (put).
+fn typed_range<T: Plain>(bytes: usize, at: usize, n: usize) -> anyhow::Result<usize> {
+    let size = size_of::<T>();
+    let off = at.checked_mul(size).ok_or_else(|| anyhow::anyhow!("typed offset overflow"))?;
+    let end = n.checked_mul(size).and_then(|n| off.checked_add(n)).ok_or_else(|| anyhow::anyhow!("typed range overflow"))?;
+    anyhow::ensure!(end <= bytes, "typed range exceeds buffer");
+    Ok(off)
+}
+
+#[test]
+fn r12_audit_typed_ranges() {
+    assert_eq!(typed_range::<f32>(16, 1, 3).unwrap(), 4);
+    assert_eq!(typed_range::<u64>(16, 2, 0).unwrap(), 16);
+    assert!(typed_range::<f32>(16, usize::MAX, 1).is_err());
+    assert!(typed_range::<f32>(16, 0, usize::MAX).is_err());
+    assert!(typed_range::<f32>(16, 3, 2).is_err());
+}
+
 /// Typed copies. Positions and counts are in elements of `T`.
 impl<'a> dyn Backend + 'a {
     /// Zeroed buffer of `n` values of `T`.
-    pub fn zeros<T: Plain>(&self, n: usize) -> anyhow::Result<Buf> { self.alloc(n * size_of::<T>()) }
+    pub fn zeros<T: Plain>(&self, n: usize) -> anyhow::Result<Buf> { self.alloc(n.checked_mul(size_of::<T>()).ok_or_else(|| anyhow::anyhow!("typed allocation size overflow"))?) }
 
     /// Copy `src` into `dst` from element `at` on.
     pub fn put<T: Plain>(&self, src: &[T], dst: &Buf, at: usize) -> anyhow::Result<()> {
         let b = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), size_of_val(src)) };
-        self.htod(b, dst, at * size_of::<T>())
+        let off = typed_range::<T>(dst.len(), at, src.len())?;
+        self.htod(b, dst, off)
     }
 
     /// `n` values of `T` from `src`, starting at element `at`.
     pub fn get<T: Plain>(&self, src: &Buf, at: usize, n: usize) -> anyhow::Result<Vec<T>> {
+        let off = typed_range::<T>(src.len(), at, n)?;
         let mut v = vec![T::default(); n];
         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * size_of::<T>()) };
-        self.dtoh(src, at * size_of::<T>(), b)?;
+        self.dtoh(src, off, b)?;
         Ok(v)
     }
 }
