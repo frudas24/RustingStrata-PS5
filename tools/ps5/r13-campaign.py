@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """R13 physical A/B/B/A and quality campaign, with exact dispatch gates.
-No profile promotion; all measurements use R11 IQ32 and a fixed R12 tile.
+No profile promotion; all measurements use R11 IQ32 and explicit R12 tiles.
 """
 import argparse
 import importlib.util
@@ -84,48 +84,51 @@ def run_campaign(a):
     ident = r6.identity(a.model, a.bin)
     r6.atomic_json(session.out/'identity.json', ident)
     reports = {}
+    base_tile = a.tile if a.base_tile is None else a.base_tile
     try:
         if a.corpus:
             r6.require(128 <= a.ctx_len <= a.ctx and a.chunks > 0, 'invalid quality settings')
             corpus = r6.file_id(a.corpus)
             hashes = []
             for lut in ('off', a.lut):
-                env = r6.child_env(k); env.update(flags(a.tile, lut))
+                tile = base_tile if lut == 'off' else a.tile
+                env = r6.child_env(k); env.update(flags(tile, lut))
                 dump, log = session.out/f'{lut}.bin', session.out/f'{lut}.log'
                 cmd = [str(session.binary), 'perplexity', *r6.engine_args(a.model,k,s),'--file',str(a.corpus.resolve()),'--ctx-len',str(a.ctx_len),'--chunks',str(a.chunks),'--kld-base',str(dump)]
-                r6.atomic_json(session.out/f'{lut}-request.json',dict(cmd=cmd,flags=flags(a.tile,lut)))
+                r6.atomic_json(session.out/f'{lut}-request.json',dict(cmd=cmd,flags=flags(tile,lut)))
                 memory=r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
-                text=log.read_text(errors='replace'); r6.evidence(text,k); check_marks(text,a.tile,lut)
+                text=log.read_text(errors='replace'); r6.evidence(text,k); check_marks(text,tile,lut)
                 quality.check_dump(dump,text,a.ctx_len,a.chunks)
                 hashes.append(r6.digest(dump))
                 r6.atomic_json(session.out/f'{lut}-memory.json',memory)
             r6.require(ident==r6.identity(a.model,a.bin) and corpus==r6.file_id(a.corpus),'identity changed')
             same=hashes[0]==hashes[1]
-            r6.atomic_json(session.out/'summary.json',dict(encoded_identity=same,hashes=hashes,identity=ident,corpus=corpus,tile=a.tile,lut=a.lut,production_promotion=False))
+            r6.atomic_json(session.out/'summary.json',dict(encoded_identity=same,hashes=hashes,identity=ident,corpus=corpus,base_tile=base_tile,tile=a.tile,lut=a.lut,production_promotion=False))
             return 0 if same else 1
         for task in ('prose','holdout'):
             runs=[]
             for i,lut in enumerate(('off',a.lut) if a.profile_only else ('off',a.lut,a.lut,'off'),1):
                 stem=f'{task}-{i}-{lut}'
                 log,result=(session.out/(stem+ext) for ext in ('.log','.json'))
-                env=r6.child_env(k);env.update(flags(a.tile,lut))
+                tile=base_tile if lut=='off' else a.tile
+                env=r6.child_env(k);env.update(flags(tile,lut))
                 if a.profile_only:
                     env.update(STRATA_VK_PROF='1',STRATA_VK_STATS='1',STRATA_PS5_R11_PROFILE='1',STRATA_PS5_R13_MEM_TRACE='1',STRATA_PS5_R13_QUANT_TRACE='1')
                 cmd=[str(session.binary),'bench',*r6.engine_args(a.model,k,s),'--pp',a.pp,'--tg',str(s['tg']),'--reps',str(s['reps']),'--json-out',str(result)]
                 if task=='holdout': cmd+=['--prompt-file',str(session.holdout)]
-                r6.atomic_json(session.out/(stem+'-request.json'),dict(cmd=cmd,knobs=k,flags=flags(a.tile,lut),profile_only=a.profile_only))
+                r6.atomic_json(session.out/(stem+'-request.json'),dict(cmd=cmd,knobs=k,flags=flags(tile,lut),profile_only=a.profile_only))
                 print(stem,flush=True)
                 memory=r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
                 rates,signatures=r6.checked_rates(json.loads(result.read_text()),k,s,a.model)
                 r6.match_signatures(signatures,signatures)
-                text=log.read_text(errors='replace');evidence=r6.evidence(text,k);check_marks(text,a.tile,lut)
+                text=log.read_text(errors='replace');evidence=r6.evidence(text,k);check_marks(text,tile,lut)
                 run=dict(rates=rates,signatures=signatures,evidence=evidence,memory=memory)
                 if a.profile_only: run['diagnostics']=profile_summary(text)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run);runs.append(run)
             reports[task]=dict(profile_only=True,accepted=False) if a.profile_only else compare(runs)
         r6.require(r6.identity(a.model,a.bin)==ident,'identity changed')
         accepted=not a.profile_only and all(x['accepted'] for x in reports.values())
-        r6.atomic_json(session.out/'summary.json',dict(accepted=accepted,profile_only=a.profile_only,tile=a.tile,lut=a.lut,reports=reports,production_promotion=False))
+        r6.atomic_json(session.out/'summary.json',dict(accepted=accepted,profile_only=a.profile_only,base_tile=base_tile,tile=a.tile,lut=a.lut,reports=reports,production_promotion=False))
         return 0 if accepted or a.profile_only else 1
     except (r6.Reject, quality.r6.Reject, KeyError,TypeError,ValueError,OSError,IndexError) as exc:
         r6.atomic_json(session.out/'summary.json',dict(accepted=False,error=str(exc),reports=reports,production_promotion=False))
@@ -139,6 +142,7 @@ def main():
     b=sub.add_parser('run');b.add_argument('--model',type=Path,required=True);b.add_argument('--bin',type=Path,default=r6.DEFAULT_BIN);b.add_argument('--out',type=Path,required=True)
     for x in (m,b):
         x.add_argument('--tile',type=int,choices=(0,32,64),default=0);x.add_argument('--lut',choices=('off','iq2','int','all') if x is m else ('iq2','int','all'),required=True)
+    b.add_argument('--base-tile',type=int,choices=(0,32,64),help='default: same as candidate tile; set 0 for final combined vs R11')
     b.add_argument('--ctx',type=int,default=8192);b.add_argument('--pp',default='128,512,2048,4096');b.add_argument('--tg',type=int,default=32);b.add_argument('--reps',type=int,default=3)
     b.add_argument('--threads',type=int,choices=(4,6,8,16),default=6);b.add_argument('--chunk',type=int,choices=(128,256,512,1024),default=512);b.add_argument('--kv',choices=('f16','q8','q4','q2'),default='q8')
     b.add_argument('--timeout',type=int,default=5400);b.add_argument('--min-ram-mb',type=int,default=1024)
