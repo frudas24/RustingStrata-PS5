@@ -1,0 +1,83 @@
+test_empty_proc_fields (__main__.Guard.test_empty_proc_fields) ... ok
+test_missing_memory_fails_closed (__main__.Guard.test_missing_memory_fails_closed) ... ok
+test_leaked_candidate (__main__.ParityScript.test_leaked_candidate) ... ok
+test_truncated_fingerprint (__main__.ParityScript.test_truncated_fingerprint) ... ok
+test_valid_mock (__main__.ParityScript.test_valid_mock) ... ok
+test_wrong_tile (__main__.ParityScript.test_wrong_tile) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.975s
+
+OK
+test_changed_target_combine (__main__.Boundaries.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Boundaries.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Boundaries.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Boundaries.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Boundaries.test_missing_layer) ... ok
+test_no_write (__main__.Boundaries.test_no_write) ... ok
+test_r12_all_controls_same_but_wrong_stage (__main__.Boundaries.test_r12_all_controls_same_but_wrong_stage) ... ok
+test_r12_changed_replay (__main__.Boundaries.test_r12_changed_replay) ... ok
+test_r12_missing_stage (__main__.Boundaries.test_r12_missing_stage) ... ok
+test_r12_nonfinite (__main__.Boundaries.test_r12_nonfinite) ... ok
+test_r12_sham_changed (__main__.Boundaries.test_r12_sham_changed) ... ok
+test_r12_signed_zero_change (__main__.Boundaries.test_r12_signed_zero_change) ... ok
+test_r12_valid (__main__.Boundaries.test_r12_valid) ... ok
+test_replay_wrong_route (__main__.Boundaries.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Boundaries.test_replay_wrong_weight) ... ok
+test_sham (__main__.Boundaries.test_sham) ... ok
+test_valid (__main__.Boundaries.test_valid) ... ok
+test_lds (__main__.Geometry.test_lds) ... ok
+test_routed_subtile_coverage (__main__.Geometry.test_routed_subtile_coverage) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 4.057s
+
+OK
+R12 routed integer geometries: 2322
+test_dedup_coverage (__main__.Audit.test_dedup_coverage) ... ok
+test_old_overflow_counterexample (__main__.Audit.test_old_overflow_counterexample) ... ok
+test_quality_dump (__main__.Audit.test_quality_dump) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 14.512s
+
+OK
+20000 dedup coverage scenarios PASS (independent model)
+16 invalid quality evidence fixtures rejected
+test_good (__main__.Gates.test_good) ... ok
+test_input_change (__main__.Gates.test_input_change) ... ok
+test_missing_stage (__main__.Gates.test_missing_stage) ... ok
+test_missing_write (__main__.Gates.test_missing_write) ... ok
+test_nonfinite (__main__.Gates.test_nonfinite) ... ok
+test_route_change (__main__.Gates.test_route_change) ... ok
+test_shadow_changed (__main__.Gates.test_shadow_changed) ... ok
+test_wrong_slot (__main__.Gates.test_wrong_slot) ... ok
+test_wrong_stage_identity (__main__.Gates.test_wrong_stage_identity) ... ok
+test_wrong_stage_width (__main__.Gates.test_wrong_stage_width) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.037s
+
+OK
+test_changed_target_combine (__main__.Gates.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Gates.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Gates.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Gates.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Gates.test_missing_layer) ... ok
+test_no_write (__main__.Gates.test_no_write) ... ok
+test_replay_wrong_route (__main__.Gates.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Gates.test_replay_wrong_weight) ... ok
+test_sham (__main__.Gates.test_sham) ... ok
+test_valid (__main__.Gates.test_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.194s
+
+OK
+test_benchmark_gate (__main__.Test.test_benchmark_gate) ... ok
+test_decode_geometry (__main__.Test.test_decode_geometry) ... ok
+test_fp16_fixture_fma (__main__.Test.test_fp16_fixture_fma) ... 8000 IQ2 fixture FP16 row FMA results PASS\nok
+test_iq_codes (__main__.Test.test_iq_codes) ... ok
+test_signed_dot (__main__.Test.test_signed_dot) ... 100036 signed dot cases PASS
+ok
+test_tile_geometry (__main__.Test.test_tile_geometry) ... 
