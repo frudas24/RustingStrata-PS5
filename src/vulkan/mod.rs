@@ -1225,7 +1225,8 @@ impl Vk {
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
         let f = !int8 || (!reuse && self.0.st().batch);
         // The R8 oracle selects a contract from type and columns. Reject any routed fallback caused by batching.
-        if tiles != 0 && (std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1")
+        static R8_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if tiles != 0 && *R8_PROBE.get_or_init(|| std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1")
             || std::env::var("STRATA_R7_R4_STAGE_PROBE").as_deref() == Ok("1")) {
             ensure!(!self.0.st().batch, "R8 routed numerical probe excludes batched GEMM");
         }

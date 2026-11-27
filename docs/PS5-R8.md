@@ -1,0 +1,27 @@
+# R8 — routed arithmetic contract investigation
+
+Base: `3fa00a7293b4062530433144474097e5475306a7` (R7-V2). Physical evidence was collected on R7 `044674ba93af6eef93a38b9c4cede42c846a06ef`, without V1/V2. No new physical performance measurements are claimed. Original evidence SHA-256 is recorded in validation-r8; copied tables and reports are from that archive, not generated measurements. The original 110 MB archive remains external. All evidence manifest entries were verified.
+
+## Decisions
+
+- Retain R7 fixes: physical build, empty attention, mailbox, R5 KV mixtures and GEMM-64 gates pass. R2 accelerated packed INT8 unavailable. GEMM-64 stays opt-in: 0.6B retry +3.83/+3.86%, first campaign rejected; 4B +2.07/+1.83% below threshold. No promotion.
+- R7 8K decode average +10.82% is affected by a slow baseline run; maximums near 102 tokens/s in both. 32K/64K single run per arm. No causal speedup conclusion. R7 at 65024 prompt tokens measured 67.3 t/s decode, 140.5 t/s prefill. Retain V1/V2 but their native compilation/parity still needs physical validation.
+- R4 hybrid still fails: worst 39.75% of logit range; 3/12 range gate; 9/12 argmax, with three repetitions of the same four vectors (not 12 distinct workloads). Scatter sampled 960/960 identical. Do not re-enable R4 in production.
+- Imported agent patch `04e1b44ba1fa5edb26a2962e3b8ba2b6862f0e8c`, resolving overlap with Venus trace; mutually exclusive trace modes. Reproduction uses non-cooperative Vulkan and ordinary prompt prefill. The probe adds GPU dispatches/readbacks, so its data cannot be used for latency. It must also reproduce uninstrumented GPU logits bit for bit.
+
+## New hypothesis
+
+The original R4 probe compared Q8-32 vs Q8K-256 using a common dequantized f64 reference. Q8-32 was closer in 927/960 GPU-only and 924/960 half samples. However, IQ2_XS gate/up dominated the sample (936/960). In `cuda::Gpu::mmq`, IQ2_XS defaults to false in normal numerics; `vulkan::gemm_raw` therefore normally selects `gemm_f_dp` for that type on non-cooperative PS5. That shader rounds BOTH decoded weights and activations to FP16, accumulates FP32 with FMA. IQ3_XXS and IQ4_XS generally select the integer path for aligned columns; normal `quant_q8.comp` uses positive scales over 32 activations. The old observation does not establish Q8-32 as the actual arithmetic of every GPU projection. A route-aware comparison is needed before tuning.
+
+`STRATA_PS5_R8_CONTRACT=1` selects a deliberately slow CPU reference for only the research-selected R4 prefill misses. It applies the Vulkan type/column selection, refuses unsupported types/scales, LoRA, Hadamard, batched routed GEMM, llama numerics and cooperative mode. It leaves the regular decode and all non-R4 CPU paths unchanged. F16 uses half-rounded operands and sequential f32 FMA; Q8-32 uses dequantized weights and f64 reduction. Neither is guaranteed bit-exact to GPU: shader dequant rounding, scale_add grouping, SiLU and denormal behavior may differ. Only one row of weights is expanded per Rayon task. The reference is an accuracy experiment, not a performance candidate. No production promotion is implemented. `STRATA_R7_R4_STAGE_PROBE=1` adds the new route-aware gate/up/down oracles on top of the original sampled stages. All flags are process-level, immutable after launch.
+
+## Physical next steps
+
+1. `bash tools/ps5/build.sh`, `bash tools/ps5/test-r7.sh`, `bash tools/ps5/test-r5.sh`, `PS5_R5_ALL_PAIRS=1 bash tools/ps5/test-r5.sh`, `bash tools/ps5/test-r7-gemm.sh results/r8-gemm-parity`.
+2. Validate V1/V2 independently with `bash tools/ps5/test-venus.sh --cpu MODEL.gguf` and `bash tools/ps5/test-venus.sh --model F16.gguf OUTPUT` for F16 or `bash tools/ps5/test-venus.sh --bf16-model BF16.gguf OUTPUT` for BF16.
+3. `bash tools/ps5/test-r8-contract.sh /path/to/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf results/r8-contract` (new directory). Four processes: GPU, legacy half, contract half, instrumented GPU. The test uses the same inputs, 0 resident experts, max 32 eligible rows, no cooperative matrices, fixed routing budget, and retains logs and telemetry. `PS5_R8_TIMEOUT` can increase the guarded per-arm timeout. A nonzero exit is a valid failed experiment: preserve all files. Comparison requires actual CPU work, candidate marker, complete finite logits, all sampled probe stages and bit-identical GPU probe control. Diagnostic pass: <=5% range drift for all vectors, same argmax and ordered top5, KL <=0.01. These are engineering thresholds, not production equivalence or permission to enable R4. Report repeated inputs separately from distinct vectors.
+4. If contract improves the errors, implement fast per-format kernels matching the demonstrated route: F16 row/tile path from Venus, Q8-32 integer group scales and accumulation. If not, use per-stage traces and exact shader dequantization to isolate the first residual error. No further performance work on R4 until parity is recovered.
+
+## Local validation
+
+Manifest verification, Git reconstruction and patch checks; controller synthetic tests and script syntax. Independently recomputed the 960 pairs per arm from original CSV. No native Rust toolchain or PS5 in this environment: Rust unit tests, full model inference, Vulkan gates and candidate accuracy not executed locally. The dense BF16 Qwen0.6B checkpoint cannot exercise the actual IQ expert route. Do not attribute R7 physical results to R8/Venus.

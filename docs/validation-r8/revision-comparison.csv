@@ -1,0 +1,4 @@
+ctx,pp,reps,r6u1_prefill,r7_prefill,prefill_change_pct,r6u1_decode,r7_decode,decode_change_pct,greedy_equal_count,top5_order_equal_count,max_shared_logp_delta
+8192,8160,3,313.5,317.0,1.1164274322169154,91.5,101.4,10.81967213114754,3,3,0.0
+32768,32736,1,205.2,205.2,0.0,82.9,81.8,-1.326899879372745,1,1,0.0
+65536,65024,1,140.4,140.5,0.07122507122505617,67.4,67.3,-0.14836795252226587,1,1,0.0
