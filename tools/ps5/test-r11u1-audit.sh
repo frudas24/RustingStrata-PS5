@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run independent audit checks, then the actual Rust/Vulkan tests when explicitly requested.
+set -euo pipefail
+source "$(dirname -- "$0")/env.sh"
+cd "$PS5_ROOT"
+export PYTHONDONTWRITEBYTECODE=1
+args=(--locked --release --target "$PS5_TARGET" --features ps5-r2)
+case "${1:---offline}" in
+  --offline)
+    python3 tools/ps5/check-r11u1-audit.py
+    for n in 9 10 11; do python3 "tools/ps5/check-r$n.py"; done
+    python3 tools/test_kld_compare.py
+    ;;
+  --cpu)
+    cargo test "${args[@]}" --test gguf audit_rejects_inconsistent_tensor_layouts -- --exact --nocapture
+    cargo test "${args[@]}" --test gguf audit_rejects_deep_metadata -- --exact --nocapture
+    cargo test "${args[@]}" --bin rustingstrata audit_log_probs_rejects_invalid_input -- --exact --nocapture
+    ;;
+  --gpu)
+    while IFS= read -r name; do unset "$name"; done < <(compgen -e | grep -E '^(STRATA_|PS5_)' || true)
+    export STRATA_PS5=1 STRATA_VK_NO_COOP=1 STRATA_TEST_BACKENDS=vulkan
+    log=$(mktemp); trap 'rm -f "$log"' EXIT
+    cargo test "${args[@]}" --test ps5_audit moe_duplicate_slots_complete -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+    grep -Fq 'AUDIT_MOE_DUPLICATES PASS: 5 shapes, including overflow' "$log"
+    ;;
+  *) echo 'usage: test-r11u1-audit.sh [--offline|--cpu|--gpu]' >&2; exit 2;;
+esac
