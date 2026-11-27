@@ -146,18 +146,28 @@ impl Gguf {
         for _ in 0..nt {
             let name = c.str()?;
             let nd = c.u32()?;
+            anyhow::ensure!((1..=4).contains(&nd), "GGUF invalid tensor rank {nd} for {name}");
             let dims = (0..nd).map(|_| c.u64()).collect::<anyhow::Result<Vec<_>>>()?;
             let (ty, offset) = (c.u32()?, c.u64()?);
+            anyhow::ensure!(dims.iter().all(|&d| d != 0), "GGUF zero tensor dimension for {name}");
+            anyhow::ensure!(!tensors.contains_key(&name), "GGUF duplicate tensor {name}");
             tensors.insert(name.clone(), TensorInfo { name, dims, ty, offset, file });
         }
         let align = usize::try_from(meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32))
             .context("GGUF alignment out of range")?;
         let data_offset = c.p.checked_next_multiple_of(align).context("invalid GGUF alignment")?;
-        // A cut-off download keeps a valid header; catch it here, not as a slice panic in `bytes`.
+        // Reject inconsistent layouts before row_bytes (which assumes a validated shape) or a slice.
+        // Keep the auxiliary-tensor path for unsupported GGML types, but validate their starting offsets too.
+        let available = (mmap.0.len() as u64).checked_sub(data_offset as u64);
         for t in tensors.values() {
-            let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // Weights::validate reports it
-            let n = t.dims.iter().skip(1).try_fold(ty.row_bytes(t.dims.first().copied().unwrap_or(0)) as u64, |a, &d| a.checked_mul(d));
-            if n.and_then(|n| n.checked_add(t.offset)).is_none_or(|e| e > (mmap.0.len() as u64).saturating_sub(data_offset as u64)) {
+            let n = if let Ok(ty) = GgmlType::from_u32(t.ty) {
+                let block = ty.block_elems() as u64;
+                anyhow::ensure!(t.dims[0] % block == 0, "GGUF incomplete quantization block in {}", t.name);
+                let rows = t.dims[1..].iter().try_fold(1u64, |a, &d| a.checked_mul(d));
+                (t.dims[0] / block).checked_mul(ty.block_bytes() as u64)
+                    .and_then(|rb| rows.and_then(|r| rb.checked_mul(r)))
+            } else { Some(0) };  // raw_bytes checks the requested range for auxiliary tensors
+            if n.and_then(|n| n.checked_add(t.offset)).zip(available).is_none_or(|(end, len)| end > len) {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
@@ -189,9 +199,10 @@ impl Gguf {
 
     /// Raw bytes for auxiliary metadata tensors whose GGML type is not in `GgmlType` (e.g. EAGLE3 `d2t` I32/I64).
     pub fn raw_bytes(&self, t: &TensorInfo, byte_len: usize) -> anyhow::Result<&[u8]> {
-        let (mmap, data_offset) = &self.files[t.file];
-        let o = data_offset + t.offset as usize;
-        mmap.0.get(o..o + byte_len).context("GGUF tensor bytes out of range")
+        let (mmap, data_offset) = self.files.get(t.file).context("GGUF tensor shard out of range")?;
+        let o = data_offset.checked_add(usize::try_from(t.offset)?).context("GGUF tensor offset overflow")?;
+        let end = o.checked_add(byte_len).context("GGUF tensor size overflow")?;
+        mmap.0.get(o..end).context("GGUF tensor bytes out of range")
     }
 }
 

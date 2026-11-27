@@ -313,3 +313,42 @@ fn flint_config() {
     assert!(c.attn_sinks && c.router_sigmoid && !c.q_gate && !c.k_interleave);
     assert!(!c.is_moe_layer(0) && c.is_moe_layer(1) && c.is_moe());
 }
+
+#[test]
+fn audit_rejects_inconsistent_tensor_layouts() {
+    fn file(tensors: &[(&str, &[u64], u32, u64)]) -> Vec<u8> {
+        let mut b=b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes()); b.extend((tensors.len() as u64).to_le_bytes()); b.extend(0u64.to_le_bytes());
+        for &(name,dims,ty,off) in tensors {
+            w_str(&mut b,name); b.extend((dims.len() as u32).to_le_bytes());
+            for d in dims {b.extend(d.to_le_bytes());}
+            b.extend(ty.to_le_bytes()); b.extend(off.to_le_bytes());
+        }
+        b.resize(b.len().next_multiple_of(32)+64,0); b
+    }
+    let fixtures = [
+        ("rank0",file(&[("t",&[],0,0)])),
+        ("rank5",file(&[("t",&[1,1,1,1,1],0,0)])),
+        ("zero",file(&[("t",&[1,0],0,0)])),
+        ("partial-iq",file(&[("t",&[255],17,0)])),
+        ("row-overflow",file(&[("t",&[1u64<<62],0,0)])),
+        ("rows-overflow",file(&[("t",&[1,1u64<<63,2],0,0)])),
+        ("aux-offset",file(&[("t",&[1],26,u64::MAX)])),
+        ("duplicate",file(&[("t",&[1],0,0),("t",&[1],0,32)])),
+    ];
+    for (name,b) in fixtures {
+        let p=std::env::temp_dir().join(format!("strata-audit-{}-{name}.gguf",std::process::id()));
+        std::fs::write(&p,b).unwrap();
+        let r=std::panic::catch_unwind(||Gguf::open(&p));
+        std::fs::remove_file(&p).ok();
+        assert!(matches!(r,Ok(Err(_))),"malformed {name} must return an error, not panic or load");
+    }
+    let p=std::env::temp_dir().join(format!("strata-audit-{}-valid.gguf",std::process::id()));
+    std::fs::write(&p,file(&[("t",&[1],0,0)])).unwrap();
+    let g=Gguf::open(&p).unwrap(); std::fs::remove_file(&p).ok();
+    let t=&g.tensors["t"];
+    assert_eq!(g.bytes(t).len(),4);
+    assert!(g.raw_bytes(t,usize::MAX).is_err());
+    let mut t=t.clone(); t.offset=u64::MAX; assert!(g.raw_bytes(&t,4).is_err());
+    t.file=usize::MAX; assert!(g.raw_bytes(&t,4).is_err());
+}
