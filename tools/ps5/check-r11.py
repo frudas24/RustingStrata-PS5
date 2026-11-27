@@ -48,6 +48,30 @@ class Test(unittest.TestCase):
         self.assertFalse(bench.compare([a,bad,bad,a],mark)['accepted'])
         bad=copy.deepcopy(b);bad['signatures'][128][0]['tokens']=[1,3]
         with self.assertRaises(bench.r6.Reject):bench.compare([a,bad,bad,a],mark)
+    def test_decode_geometry(self):
+        for rows,rpw in itertools.product([1,7,15,19,64,65,512,2048,2049],[1,2,4,8]):
+            # moe_gemv single-token path uses 8 logical waves per group, down-combine one wave per slot.
+            for waves in [1,8]:
+                got=[r for group in range((rows+rpw*waves-1)//(rpw*waves)) for wave in range(waves) for r in range(group*rpw*waves+wave,min(rows,(group+1)*rpw*waves),waves)]
+                self.assertEqual(sorted(got),list(range(rows)))
+    def test_fp16_fixture_fma(self):
+        # Use actual checked-in IQ2_XS dequantized fixture values as weights, not the 35B GGUF.
+        raw=(ROOT/'tests/fixtures/IQ2_XS.f32').read_bytes()
+        c=r'''#include <immintrin.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc,char**argv){float fixture[2048];FILE*f=fopen(argv[1],"rb");if(!f||fread(fixture,4,2048,f)!=2048)return 2;fclose(f);
+float w[8][256],x[256],out[8];int n=0;
+for(int trial=0;trial<1000;trial++) {__m256 a=_mm256_setzero_ps();float ref[8]={0};
+ for(int k=0;k<256;k++){x[k]=_cvtsh_ss(_cvtss_sh((float)((k*37+trial*11)%251-125)/127.0f,0));for(int j=0;j<8;j++)w[j][k]=fixture[(trial*13+j*256+k)%2048];}
+ for(int k=0;k<256;k++){__m256 z=_mm256_setr_ps(w[0][k],w[1][k],w[2][k],w[3][k],w[4][k],w[5][k],w[6][k],w[7][k]);z=_mm256_cvtph_ps(_mm256_cvtps_ph(z,0));a=_mm256_fmadd_ps(z,_mm256_set1_ps(x[k]),a);for(int j=0;j<8;j++)ref[j]=fmaf(_cvtsh_ss(_cvtss_sh(w[j][k],0)),x[k],ref[j]);}
+ _mm256_storeu_ps(out,a);if(memcmp(out,ref,sizeof(out)))return 1;n+=8;}printf("%d IQ2 fixture FP16 row FMA results PASS\\n",n);}'''
+        with tempfile.TemporaryDirectory() as d:
+            p=pathlib.Path(d);(p/'test.c').write_text(c);(p/'weights').write_bytes(raw)
+            subprocess.run(['cc','-O3','-march=znver2',str(p/'test.c'),'-lm','-o',str(p/'test')],check=True)
+            subprocess.run([str(p/'test'),str(p/'weights')],check=True)
     def test_signed_dot(self):
         # Actual independent C AVX2 primitive equivalent to Rust. Extreme mixed signs and random codes.
         c=r'''#include <immintrin.h>

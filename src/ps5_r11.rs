@@ -173,7 +173,7 @@ mod tests {
             if mode{b.push(dt)}else{a.push(dt)};
             let now=std::time::Instant::now();crate::cpu_moe::matvec(t,x,&mut legacy);z.push(now.elapsed().as_secs_f64());std::hint::black_box(&legacy);
         }
-        eprintln!("R11_IQ_BENCH {}",serde_json::json!({"layer":il,"expert":expert,"tensor":name,"source":source,"type":t.ty.name(),"rows":t.rows,"cols":t.cols,"bytes":t.data.len(),"reference_seconds":a,"candidate_seconds":b,"legacy_q8k_seconds":z}));
+        eprintln!("\nR11_IQ_BENCH {}",serde_json::json!({"layer":il,"expert":expert,"tensor":name,"source":source,"type":t.ty.name(),"rows":t.rows,"cols":t.cols,"bytes":t.data.len(),"reference_seconds":a,"candidate_seconds":b,"legacy_q8k_seconds":z}));
     }
     #[test]
     #[ignore="requires real Qwen MoE GGUF"]
