@@ -1,0 +1,59 @@
+test_dedup_coverage (__main__.Audit.test_dedup_coverage) ... ok
+test_old_overflow_counterexample (__main__.Audit.test_old_overflow_counterexample) ... ok
+test_quality_dump (__main__.Audit.test_quality_dump) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 7.320s
+
+OK
+20000 dedup coverage scenarios PASS (independent model)
+11 invalid quality evidence fixtures rejected
+test_good (__main__.Gates.test_good) ... ok
+test_input_change (__main__.Gates.test_input_change) ... ok
+test_missing_stage (__main__.Gates.test_missing_stage) ... ok
+test_missing_write (__main__.Gates.test_missing_write) ... ok
+test_nonfinite (__main__.Gates.test_nonfinite) ... ok
+test_route_change (__main__.Gates.test_route_change) ... ok
+test_shadow_changed (__main__.Gates.test_shadow_changed) ... ok
+test_wrong_slot (__main__.Gates.test_wrong_slot) ... ok
+test_wrong_stage_identity (__main__.Gates.test_wrong_stage_identity) ... ok
+test_wrong_stage_width (__main__.Gates.test_wrong_stage_width) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.015s
+
+OK
+test_changed_target_combine (__main__.Gates.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Gates.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Gates.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Gates.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Gates.test_missing_layer) ... ok
+test_no_write (__main__.Gates.test_no_write) ... ok
+test_replay_wrong_route (__main__.Gates.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Gates.test_replay_wrong_weight) ... ok
+test_sham (__main__.Gates.test_sham) ... ok
+test_valid (__main__.Gates.test_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.023s
+
+OK
+test_benchmark_gate (__main__.Test.test_benchmark_gate) ... ok
+test_decode_geometry (__main__.Test.test_decode_geometry) ... ok
+test_fp16_fixture_fma (__main__.Test.test_fp16_fixture_fma) ... 8000 IQ2 fixture FP16 row FMA results PASS\nok
+test_iq_codes (__main__.Test.test_iq_codes) ... ok
+test_signed_dot (__main__.Test.test_signed_dot) ... 100036 signed dot cases PASS
+ok
+test_tile_geometry (__main__.Test.test_tile_geometry) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 1.847s
+
+OK
+R11 IQ fixture values: 1024
+R11 tile coverage: 1152
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.020s
+
+OK

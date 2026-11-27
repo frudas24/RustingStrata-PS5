@@ -1,0 +1,5 @@
+Physical archive manifest: 585/585 verified.
+Quality recheck: 0.bin and 1.bin in r11-iq32-quality: (512,248320,4), valid.
+Quality recheck: 0.bin and 1.bin in r11-iq32-quality-extended: (512,248320,8), valid.
+Causal latest comparator: r10-base prompt-0 PASS; rest of full sweep not completed (host timeout).
+Rust and shader compilation, PS5 R12: not executed.

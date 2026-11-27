@@ -1,0 +1,23 @@
+test_changed_target_combine (__main__.Boundaries.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Boundaries.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Boundaries.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Boundaries.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Boundaries.test_missing_layer) ... ok
+test_no_write (__main__.Boundaries.test_no_write) ... ok
+test_r12_changed_replay (__main__.Boundaries.test_r12_changed_replay) ... ok
+test_r12_missing_stage (__main__.Boundaries.test_r12_missing_stage) ... ok
+test_r12_nonfinite (__main__.Boundaries.test_r12_nonfinite) ... ok
+test_r12_sham_changed (__main__.Boundaries.test_r12_sham_changed) ... ok
+test_r12_valid (__main__.Boundaries.test_r12_valid) ... ok
+test_replay_wrong_route (__main__.Boundaries.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Boundaries.test_replay_wrong_weight) ... ok
+test_sham (__main__.Boundaries.test_sham) ... ok
+test_valid (__main__.Boundaries.test_valid) ... ok
+test_lds (__main__.Geometry.test_lds) ... ok
+test_routed_subtile_coverage (__main__.Geometry.test_routed_subtile_coverage) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 1.901s
+
+OK
+R12 routed integer geometries: 2322
