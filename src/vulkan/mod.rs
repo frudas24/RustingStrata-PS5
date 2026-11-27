@@ -1691,6 +1691,9 @@ impl Backend for Vk {
         if self.0.r7_trace { self.0.r7_commands.download_bytes.fetch_add(dst.len() as u64, std::sync::atomic::Ordering::Relaxed); }
         ensure!(off.checked_add(dst.len()).is_some_and(|end| end <= src.len()), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         let mut st = self.0.st();
+        // Reject before recording any copy into a reusable graph. flush() alone
+        // is too late: the closure may handle the error and publish the graph.
+        ensure!(st.rec.is_none() && !st.batch, "host readback inside a graph or batch");
         for (i, c) in dst.chunks_mut(STAGING).enumerate() {
             let (b, o) = st.find(src.addr() + (off + i * STAGING) as u64, c.len())?;
             self.0.ring_wait(&mut st, 0, c.len())?;  // transfer-queue copies may still read staging
@@ -1713,6 +1716,12 @@ impl Backend for Vk {
         let mut st = self.0.st();
         let (s, so) = st.find(src.addr() + src_off as u64, bytes)?;
         let (d, d_o) = st.find(dst.addr() + dst_off as u64, bytes)?;
+        // Vulkan copies are not memmove. Identical ranges need no command;
+        // partially overlapping regions of the same buffer are invalid.
+        if s == d {
+            if so == d_o { return Ok(()); }
+            ensure!(so.abs_diff(d_o) >= bytes as u64, "overlapping Vulkan device copy");
+        }
         let cb = self.0.cb(&mut st)?;
         unsafe { self.0.dev.cmd_copy_buffer(cb, s, d, &[vk::BufferCopy::default().src_offset(so).dst_offset(d_o).size(bytes as u64)]) };
         if !st.batch { self.0.barrier(cb, false); }
@@ -1762,7 +1771,11 @@ impl Backend for Vk {
 
     /// A reusable command buffer per key, submitted without waiting. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
-        self.0.st().batch = true;
+        {
+            let mut st = self.0.st();
+            ensure!(!st.batch, "nested Vulkan batch");
+            st.batch = true;
+        }
         let r = f();
         let mut st = self.0.st();
         st.batch = false;
@@ -1805,10 +1818,15 @@ impl Backend for Vk {
         Ok(())
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        // Reject nesting before changing keys in the enclosing recording.
+        {
+            let st = self.0.st();
+            ensure!(st.rec.is_none() && !st.batch && !st.beside, "nested graph or graph inside batch or beside");
+        }
         // Lock Q8 before State, matching gemm_raw's lock order.
         self.invalidate_q8_keys();
         let mut st = self.0.st();
-        ensure!(st.rec.is_none() && !st.batch, "nested graph or graph inside batch");
+        ensure!(st.rec.is_none() && !st.batch && !st.beside, "nested graph or graph inside batch or beside");
         if let Some(&g) = st.graphs.get(&key) {
             if self.0.r7_trace { self.0.r7_commands.graph_reuse.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             return self.0.enqueue_cb(&mut st, Some(g));
@@ -1821,8 +1839,11 @@ impl Backend for Vk {
         }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
-        unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) }?;
+        if let Err(e) = unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) } {
+            unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
+            return Err(e.into());
+        }
         st.rec = Some(c);
         if st.need_cond { self.0.cond_on(&mut st, c); }
         drop(st);
@@ -1831,22 +1852,29 @@ impl Backend for Vk {
         let mut st = self.0.st();
         st.rec = None;
         self.0.end_cond(&mut st, c);
-        unsafe { self.0.dev.end_command_buffer(c) }?;
+        // Failed recordings are not submitted. Free even if ending failed.
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
+        if let Err(e) = unsafe { self.0.dev.end_command_buffer(c) } {
+            unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
+            return Err(e.into());
+        }
         st.graphs.insert(key, c);
         if self.0.r7_trace { self.0.r7_commands.graph_create.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         self.0.enqueue_cb(&mut st, Some(c))
     }
     fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        let Some(c) = st.graphs.remove(&key) else { return Ok(()) };
-        // The buffer may still be queued or running.
+        ensure!(st.rec.is_none() && !st.batch, "graph drop inside graph or batch");
+        let Some(&c) = st.graphs.get(&key) else { return Ok(()) };
+        // Do not remove the only handle until the wait succeeds.
         self.0.flush(&mut st)?;
+        st.graphs.remove(&key);
         unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
         Ok(())
     }
     fn graph_clear(&self) -> anyhow::Result<()> {
         let mut st = self.0.st();
+        ensure!(st.rec.is_none() && !st.batch, "graph clear inside graph or batch");
         if st.graphs.is_empty() { return Ok(()) }
         self.0.flush(&mut st)?;
         let cs: Vec<_> = st.graphs.drain().map(|(_, c)| c).collect();

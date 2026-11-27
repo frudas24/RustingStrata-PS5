@@ -30,6 +30,14 @@ fn q8_graph_cache_lifetime() {
     assert!(g.graph(103,&mut || {run(b.addr(),0)?; anyhow::bail!("intentional discard")}).is_err());
     g.prequant_gemm_x(&w,n,b.addr(),cols).unwrap();
     run(b.addr(),SAME_X).unwrap(); assert_eq!(bits(),b_ref);
+    // Rejecting a nested recording must not invalidate a Q8 preparation that
+    // the enclosing graph still needs inside a batch (FP16 fallback differs).
+    g.graph(106,&mut || {
+        g.prequant_gemm_x(&w,n,b.addr(),cols)?;
+        assert!(g.graph(107,&mut || panic!("nested graph executed")).is_err());
+        g.batch(&mut || run(b.addr(),SAME_X))
+    }).unwrap();
+    assert_eq!(bits(),b_ref);
     g.graph_clear().unwrap();
 
     // More than TMAX rows select the growable scratch, not the fixed small one.
@@ -46,4 +54,36 @@ fn q8_graph_cache_lifetime() {
     g.sync().unwrap();
     g.graph_clear().unwrap();
     eprintln!("R13 LAUNCH Q8 GRAPH PASS: replay, discard and scratch growth");
+}
+
+/// Rejected operations must not mutate an enclosing recording or evict a live graph.
+#[test]
+#[ignore="requires Vulkan"]
+fn rejected_graph_operations_are_inert() {
+    let g=Vk::new(0).unwrap();
+    let a=common::up(&g,&[0.0f32;4]);
+    let b=common::up(&g,&[1.0f32;4]);
+    g.graph(201,&mut || g.add(a.addr(),b.addr(),4)).unwrap();
+    g.sync().unwrap();
+    let mut host=[0xa5u8;16];
+    g.graph(202,&mut || {
+        assert!(g.graph_drop(201).is_err());
+        assert!(g.graph_clear().is_err());
+        assert!(g.dtoh(&a,0,&mut host).is_err());
+        assert_eq!(host,[0xa5u8;16]);
+        assert!(g.graph(203,&mut || panic!("nested graph executed")).is_err());
+        g.batch(&mut || {
+            assert!(g.batch(&mut || panic!("nested batch executed")).is_err());
+            g.add(a.addr(),b.addr(),4)
+        })
+    }).unwrap();
+    g.graph(201,&mut || panic!("rejected graph_drop evicted graph")).unwrap();
+    assert_eq!(common::down::<f32>(&g,&a),vec![3.0;4]);
+    g.graph_clear().unwrap();
+    let c=common::up(&g,&[1u32,2,3,4,5,6]);
+    assert!(g.dtod(&c,0,&c,4,8).is_err());
+    g.dtod(&c,0,&c,0,8).unwrap();
+    g.dtod(&c,0,&c,16,8).unwrap();
+    assert_eq!(common::down::<u32>(&g,&c),vec![1,2,3,4,1,2]);
+    eprintln!("R13 FINAL GRAPH PASS: rejected operations inert, device copy disjoint");
 }
