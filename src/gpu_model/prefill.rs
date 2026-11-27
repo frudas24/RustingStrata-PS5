@@ -874,6 +874,7 @@ impl GpuModel<'_> {
                                         let kinds = r8_kinds.unwrap();
                                         let reference = crate::ps5_r8::projection(&gate, hidden, kinds[0], 16.min(gpu_gate.len()))?;
                                         compare_stage("gate_contract_oracle", &reference, &gpu_gate[..reference.len()]);
+                                        compare_stage("gate_legacy_paired", &cg[..reference.len()], &gpu_gate[..reference.len()]);
                                         eprintln!("r8_contract_stage,{il},{expert},gate,{:?}", kinds[0]);
                                         // Dequantized f64 reference for the first 16 rows. Both arms use the
                                         // same decoded weight and reduction order, changing only the input Q8 grouping.
@@ -899,6 +900,7 @@ impl GpuModel<'_> {
                                         compare_stage("up", &cu, &gpu_up);
                                         let reference = crate::ps5_r8::projection(&up, hidden, kinds[1], 16.min(gpu_up.len()))?;
                                         compare_stage("up_contract_oracle", &reference, &gpu_up[..reference.len()]);
+                                        compare_stage("up_legacy_paired", &cu[..reference.len()], &gpu_up[..reference.len()]);
                                         eprintln!("r8_contract_stage,{il},{expert},up,{:?}", kinds[1]);
                                         g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
                                         cpu_activation = cg.iter().zip(&cu).map(|(&a, &b)| crate::ops::silu(a) * b).collect();
@@ -1006,6 +1008,7 @@ impl GpuModel<'_> {
                         let kind = r8_kinds.unwrap()[2];
                         let reference = crate::ps5_r8::projection(&down, &activation, kind, 16.min(gpu_down.len()))?;
                         compare_stage("down_contract_oracle", &reference, &gpu_down[..reference.len()]);
+                        compare_stage("down_legacy_paired", &cpu_down[..reference.len()], &gpu_down[..reference.len()]);
                         eprintln!("r8_contract_stage,{il},{expert},down,{kind:?}");
                         let hs = vec![hidden.clone()];
                         let cpu_pipeline = crate::cpu_moe::expert_rows(self.m, il, &hs, &[(0, *expert, 0.0)]);
