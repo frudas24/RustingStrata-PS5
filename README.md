@@ -1,16 +1,178 @@
-# RustingStrata — PS5 R6U1
+# RustingStrata — PS5 fork
 
-**Experimental PS5 Linux fork of RustingStrata 1.4.0 by Vasyl Trefilov.** Uses RustingStrata by Vasyl Trefilov. Original license unchanged; no endorsement implied.
+**Experimental fork of [RustingStrata](https://github.com/RustingStudio/RustingStrata) for the PlayStation 5 under
+Linux.** Original author Vasyl Trefilov, same [LICENSE.md](LICENSE.md), no endorsement implied. The upstream text,
+docs and numbers further down are unchanged and still describe upstream; this fork keeps an opt-in PS5 path on top of
+them.
 
-This integration reconciles upstream snapshot `260a11c9187dbfddf778108fe24e91ee0fc6edcb` with the cumulative PS5 fork `612c3c93d69200b82fd6cf71137a2f76be55b45e` (R1–R6 plus expert-cache changes). R6U1 is a **separate candidate**, not R7 and not a replacement for the baseline currently being measured.
+Current tip: **R6U1** — the cumulative PS5 line R1–R6 merged with upstream 1.4.0 (`Cargo.toml` 1.4.0). R6U1 is not
+R7 and not a replacement for the R6 baseline: the rollout in [docs/PS5-R6U1.md](docs/PS5-R6U1.md) compares the two
+A/B/B/A before anything is promoted.
 
-- [Integration report, decisions, validation and rollout](docs/PS5-R6U1.md).
-- [Historical PS5 fork report](docs/archive/PS5-fork-612c3c9-README.md): R1 physical measurements reported by the fork, not remeasured in R6U1.
-- [R1](docs/PS5.md) · [R2](docs/PS5-R2.md) · [R3](docs/PS5-R3.md) · [R4](docs/PS5-R4.md) · [R5](docs/PS5-R5.md) · [R6](docs/PS5-R6.md).
+## This fork is meant for the PS5
 
-Build in a separate directory with `bash tools/ps5/build.sh`; compile-only gate: `bash tools/ps5/test-merge.sh`. Use `bash tools/ps5/test-r5.sh` for legacy symmetric/mixed K/V parity. `STRATA_PREFILL_PROTECT` now defaults to off (upstream policy); set `1` or `strict` to investigate. PS5 Vulkan refuses TurboQuant and the CUDA-only host-attention experiment until validated. R6 calibration remains symmetric and rejects stale binary identities.
+One purpose: running the engine on a console under Linux — Zen 2 x86-64 with AVX2/FMA/F16C, AMD GFX1013 through the
+RADV Vulkan driver, and **one pool of shared GDDR6** instead of separate RAM and VRAM. Nothing here targets a desktop:
+the desktop paths are upstream's, and the PS5 behaviour is opt-in (`STRATA_PS5`), so a build without it behaves as
+upstream.
 
-**No full Rust compilation, GLSL compilation, Vulkan validation, or PS5 inference was performed for this merge in the preparation environment.** See the validation logs. Below is upstream's original project documentation; its measurements describe upstream, not this PS5 integration.
+What the fork adds, all of it in `main`:
+
+- **`STRATA_PS5` Vulkan profile** (`src/vulkan/mod.rs`): the device is treated as sharing memory, with separate
+  local-device and GTT (host-visible) heap budgets, a per-allocation budget check, and a reserve borrowed from Linux
+  `MemAvailable` (`src/memory.rs`, `STRATA_PS5_HOST_RESERVE_MB`), so expert pools are sized from what the console
+  actually has instead of from a desktop's assumptions.
+- **Direct uploads** (`src/vulkan/mod.rs`, `src/backend.rs`): fresh uploads above 64 KiB go straight into
+  `HOST_VISIBLE` + `HOST_COHERENT` device-local memory, without a staging copy and without a pre-clear, and F16 weights
+  stream to F32 through a bounded 4 MiB scratch buffer (`upload_bytes`) instead of a whole-tensor F32 host allocation.
+- **CPU side** (`src/cpu_moe.rs`): Q8_K block sums fused into the existing AVX2 packing, and per-batch deduplication of
+  activation quantization; upstream's own CPU changes from 1.4.0 are kept next to them. These apply to every build,
+  not only to the PS5 one.
+- **PS5 versions R2–R6**, each one behind its own default-off switch and with its own document: wave32 quantized
+  kernels (R2), immutable GGUF host-pointer import (R3), adaptive heterogeneous MoE prefill (R4), tiled long-context
+  attention prefill with independent K/V pair loads (R5), and the bounded autotuner, dispatch telemetry and PGO
+  toolchain (R6). Table below.
+- **Tooling** (`tools/ps5/`): `build.sh` (explicit `znver2`, fat LTO, one codegen unit, target-feature check),
+  `env.sh`, the `run.sh` preset, `diagnose.sh`, `test.sh`, `test-merge.sh`, `test-r2.sh`–`test-r6.sh`, `bench.sh`,
+  `bench-r2.sh`–`bench-r5.sh`, `check-r2.py`–`check-r6.py`, `summarize*.py`, `kv-budget.py`, `parity-r4.py`,
+  `pgo-r6.sh`, `autotune-r6.py` and `probe-r6.sh`. None of it modifies the console or the system.
+
+### Measured on one console (R1, historical)
+
+PS5 under Linux 7.3.3 with `amdgpu.gttsize=12888` (13.09 GiB combined GTT+VRAM ceiling), `Qwen3.6-35B-A3B-UD-Q2_K_XL`
+Vulkan, `--ctx 8192 --chunk 512 --kv q8 --threads 6 --vram-margin 2048 --ram-margin 1536 --cache-ram 256 --mtp 0`,
+`STRATA_FIXED_EXPERTS=1`, 3 repetitions, one session, serial:
+
+| run | pp512 prefill / decode tok/s | pp4096 prefill / decode | experts resident |
+|---|---:|---:|---:|
+| this fork, PS5 profile on (`STRATA_PS5=1`) | **294.5 / 86.8** | **347.0 / 83.5** | **9703/10240** (94.2% hit) |
+| same binary, profile off (`STRATA_PS5=0`) | 144.9 / 33.2 | 300.1 / 41.5 | 5344/10240 (51.4%) |
+| 1.3.7 + prefill-protect only (`b7b832b`), for reference | 185.7 / 41.1 | 278.0 / 42.0 | — |
+
+That run reported `PS5 fresh weights: mapped 1 401 266 176 bytes, staged 1 034 752 bytes` (0.07% still through the
+staging path) and `worker busy` falling from 13 706 to 1 833 µs/token. It is one session in one order with 3 samples
+per cell, so order and thermals can bias small deltas; the method and its limits are in [docs/PS5.md](docs/PS5.md).
+
+The model behind every number here is the GGUF `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (~11.7 GiB) with the optional MTP
+head `mtp-Qwen3.6-35B-A3B-Q8_0.gguf`. A BF16 (~70 GB) or FP8 (~35 GB) checkpoint neither fits the 13.09 GiB ceiling
+nor is a format this engine loads, which reads GGUF.
+
+**Those three rows belong to R1 and to the pre-merge prefill-protect build.** No tok/s has been taken from R2, R3,
+R4, R5, R6 or R6U1 on this console. Building a tree is not a measurement, and the per-version documents state
+themselves that their authors had no console, no toolchain and no weights when they were written. Treat R2–R6 and R6U1
+as candidates until a benchmark says otherwise.
+
+### Build and run on the console
+
+No sudo, and nothing installed outside the source tree:
+
+```sh
+bash tools/ps5/diagnose.sh        # what the console gives the engine (GTT, VRAM, kernel, weights)
+bash tools/ps5/build.sh           # needs cargo/rustc; glslc + spirv-val for the R2 shader variants
+bash tools/ps5/test-merge.sh      # compile every test target, CPU-only gate
+bash tools/ps5/test.sh --gpu      # Vulkan tests on the console
+bash tools/ps5/test-r2.sh         # per-version gates; R5 also runs symmetric and mixed K/V pairs
+bash tools/ps5/test-r5.sh
+bash tools/ps5/run.sh chat  --model "$MODEL" --ctx 8192 --k q8 --v q4   # mixed KV (R6U1)
+bash tools/ps5/run.sh serve --model "$MODEL" --ctx 65536 --kv q8
+```
+
+`build.sh` sources `env.sh`, so the build always gets `-C target-cpu=znver2`, fat LTO, one codegen unit and a
+`PS5_TARGET` of `x86_64-unknown-linux-gnu`; it verifies that avx2/fma/f16c really are in the target before compiling.
+The `ps5-r2` Cargo feature (five extra shader variants built with `glslc` and checked with `spirv-val`) is on by
+default in that script; `PS5_R2_BUILD=0` falls back to the R1 shaders on a console without the shader tools.
+`PS5_R5_ALL_PAIRS=1` widens the R5 test from 8 to 16 K/V pairs.
+
+### Rollback
+
+One variable at a time, no rebuild:
+
+```sh
+STRATA_PS5=0                     # the whole Vulkan profile; the CPU and F16 changes stay
+STRATA_PS5_GTT=0                 # only the GTT budget split
+STRATA_PS5_DIRECT=0              # only the direct upload path
+STRATA_PREFILL_PROTECT=1|strict  # opt back into the fork's old prompt handling (now OFF by default, see R6U1)
+```
+
+Every R2–R6 switch is off by default, so a plain build is R1 behaviour plus upstream. The tags below rebuild any
+earlier point (`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure).
+
+### Branches and tags
+
+| ref | what it is |
+|---|---|
+| `main` | the tip: R6U1 = R1–R6 + upstream 1.4.0 + this README |
+| `ps5-r1` … `ps5-r6` | one tag per PS5 version; each checkpoint stays reconstructible without being re-derived |
+| `ps5-r6u1` | the R6U1 merge |
+| `feat/expert-cache-prefill-protect` | `b7b832b`, the prefill-protect change alone (the upstream PR branch, pushed as `upstream/pr-108`), kept free of the PS5 port so the PR does not carry it |
+| `upstream/main` | `8df1c22`, upstream 1.3.7 — the base R1–R6 were cut from |
+
+### PS5 versions R1–R6, and R6U1
+
+| version | tag | what it adds | opt-in switches |
+|---|---|---|---|
+| R1 | `ps5-r1` | the base port: opt-in Vulkan PS5 profile with separate local/GTT budgets and a `MemAvailable` reserve, direct `HOST_VISIBLE`/`HOST_COHERENT` uploads, F16→F32 streaming through 4 MiB scratch, AVX2 Q8_K fusion, `tools/ps5/` | `STRATA_PS5`, `STRATA_PS5_GTT`, `STRATA_PS5_DIRECT`, `STRATA_PS5_HOST_RESERVE_MB` |
+| R2 | `ps5-r2` | wave32 quantized kernels: optional 64/128-thread `gemv_q` and `moe_gemv_q` workgroups, 32×64 `gemmi_dp_ps5_32` small INT8 GEMM tile; Cargo feature `ps5-r2` builds five extra shader variants with `glslc` and validates them with `spirv-val` | `STRATA_PS5_GEMV_WG`, `STRATA_PS5_SMALL`, `STRATA_PS5_SMALL_GEMM`, `PS5_R2_BUILD` |
+| R3 | `ps5-r3` | experimental immutable GGUF host-pointer import over `VK_EXT_external_memory_host`, with `weights::cold` skipping imported ranges | `STRATA_PS5_ZERO_COPY`, `STRATA_PS5_ZERO_COPY_MB` (512) |
+| R4 | `ps5-r4` | adaptive heterogeneous MoE prefill: each layer's missed experts split between GPU, half and CPU arms by a bounded EWMA policy instead of staging every miss | `STRATA_PS5_SCHED`, `_SCHED_LOG`, `_SCHED_MAX_ROWS`, `_SCHED_SCRATCH_MB` |
+| R5 | `ps5-r5` | tiled long-context attention prefill (`attn_prefill_ps5.comp`, 1/2/4 KiB K/V tiles, sliding-window start bound) and paired KV loads | `STRATA_PS5_ATTN_WG`, `STRATA_R5_WG` |
+| R6 | `ps5-r6` | bounded autotuner (`autotune-r6.py`), dispatch telemetry and the PGO/probe toolchain | `STRATA_PS5_R6` |
+| R6U1 | `ps5-r6u1` | 1.4.0 merged onto R6: upstream's independent K/V formats, split-K GEMM, dynamic KV growth, new architectures; PS5 path kept and gated | same as R1–R6; `STRATA_PREFILL_PROTECT` now off |
+
+**The last one is enough**, with one nuance. The line is cumulative: R6 contains R1–R5, R6U1 contains R6 plus upstream
+1.4.0, so `main` is the version to run. The earlier tags are kept because R6U1's own rollout compares **R6 against
+R6U1** A/B/B/A before adoption, and because each checkpoint stays reconstructible without being re-derived. No version
+removes a file of the one before it; across R1→R6 and R6→R6U1 the count of deleted files is zero.
+
+Per-version documentation: [docs/PS5.md](docs/PS5.md) (R1), [docs/PS5-R2.md](docs/PS5-R2.md),
+[docs/PS5-R3.md](docs/PS5-R3.md), [docs/PS5-R4.md](docs/PS5-R4.md), [docs/PS5-R5.md](docs/PS5-R5.md),
+[docs/PS5-R6.md](docs/PS5-R6.md) and [docs/PS5-R6U1.md](docs/PS5-R6U1.md), each with its contracts, its flags and its
+own limits.
+
+### R6U1: what the upstream merge changed
+
+R6U1 is a three-way **content** merge of upstream `260a11c9` (1.4.0) onto the fork `612c3c9`, not another round of
+hardware optimisation: 171 files changed, no source file removed, and the seven conflicts (`expert_cache`,
+`gpu_model`, `lib`, `main`, `vulkan/mod`, `gemmi.glsl`, `tests/backend`) resolved in source. What it changes in
+behaviour:
+
+- **`STRATA_PREFILL_PROTECT` now defaults to OFF** (upstream policy; the fork had it on). Upstream reports that with
+  protection on, the reply's expert hit rate on Qwen3.6-35B-A3B fell from 83% to 76% on an 8k prompt with a 128-token
+  reply. `1` and the stricter `strict` remain available, R6's autotuner pins `0`, and the next-layer read-ahead and
+  cold-expert release stay on regardless. The binary measured in the R1 table above was the pre-merge, protection-on
+  one: reproduce it with `STRATA_PREFILL_PROTECT=1`.
+- **Independent K/V formats adopted**: `--k`/`--v` override each half of `--kv`, with Vulkan specialization IDs 15/16
+  and R5's pair loads harmonised. R6's calibration profile is still symmetric and now rejects a stale binary
+  identity, so old profiles must be recalibrated rather than reused.
+- **Two experiments are refused on the PS5 rather than mis-run**: TurboQuant Vulkan
+  (`src/vulkan/mod.rs`, "PS5: TurboQuant Vulkan is not validated") and `STRATA_KV_HOST`, which is a CUDA
+  host-attention experiment. Upstream's code for both is kept byte-for-byte; keeping it is not a claim that it works
+  on the console.
+- **Upstream's new architectures are adopted as upstream** (Raon and the Inkling 2, Gemma, DeepSeek and GLM changes,
+  plus tokenizer, grammar, vision and serving work). Carrying them is not evidence that they run on the PS5.
+
+### Validation status
+
+Honest summary, because the distinction matters:
+
+- **R6U1 was not compiled, not GLSL/SPIR-V validated, not run and not benchmarked** in the environment that prepared
+  it. Its own logs (`docs/validation-r6u1/`) record PASS for the independent C SIMD check, the R2–R5 Python
+  geometry/model checks, three upstream KLD tests, syntax checks, the mixed-KV budget smoke and the first nine R6
+  controller tests, and **NOT_RUN_TO_COMPLETION** for the tenth (child timeout/failure). The Rust build, the new
+  shader build, GPU parity and any tok/s were BLOCKED there.
+- **R6 (the tree before this merge) was compiled on the console** with `tools/ps5/build.sh`, shader variants included,
+  in 3m11s. That is compilation only.
+- **R1 was compiled and measured** on the console; those are the numbers in the table. **R2–R6 were never
+  benchmarked**, and R6U1 inherits none of the R1 figures as a measurement of its own.
+
+What is still open is written down rather than implied: the A/B/B/A plan, the acceptance criteria, the mixed-KV
+quality question and the unresolved `attn_merge` / TurboQuant / MoE shared-flag risks are in
+[docs/PS5-R6U1.md](docs/PS5-R6U1.md). The historical fork report is preserved verbatim in
+[docs/archive/PS5-fork-612c3c9-README.md](docs/archive/PS5-fork-612c3c9-README.md), with its R1 measurements, and its
+own report in `docs/archive/PS5-fork-612c3c9-R1-report.md`.
+
+The licence and the credit are unchanged: original RustingStrata by Vasyl Trefilov, distributed under the same
+[LICENSE.md](LICENSE.md), no endorsement implied. **Upstream's own README follows, verbatim.**
 
 ---
 
@@ -140,6 +302,9 @@ Inkling 2 open the GPU by themselves.
 - [HOSTING.md](docs/HOSTING.md): running a server for other people.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
+- [PS5.md](docs/PS5.md), [PS5-R2.md](docs/PS5-R2.md), [PS5-R3.md](docs/PS5-R3.md), [PS5-R4.md](docs/PS5-R4.md),
+  [PS5-R5.md](docs/PS5-R5.md), [PS5-R6.md](docs/PS5-R6.md) and [PS5-R6U1.md](docs/PS5-R6U1.md): this fork's PS5
+  port, one version per document, with its contracts, its switches and its limits.
 - [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
