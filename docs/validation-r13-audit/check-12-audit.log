@@ -1,0 +1,11 @@
+test_empty_proc_fields (__main__.Guard.test_empty_proc_fields) ... ok
+test_missing_memory_fails_closed (__main__.Guard.test_missing_memory_fails_closed) ... ok
+test_leaked_candidate (__main__.ParityScript.test_leaked_candidate) ... ok
+test_truncated_fingerprint (__main__.ParityScript.test_truncated_fingerprint) ... ok
+test_valid_mock (__main__.ParityScript.test_valid_mock) ... ok
+test_wrong_tile (__main__.ParityScript.test_wrong_tile) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 7.184s
+
+OK

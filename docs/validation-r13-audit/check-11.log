@@ -1,0 +1,14 @@
+test_benchmark_gate (__main__.Test.test_benchmark_gate) ... ok
+test_decode_geometry (__main__.Test.test_decode_geometry) ... ok
+test_fp16_fixture_fma (__main__.Test.test_fp16_fixture_fma) ... 8000 IQ2 fixture FP16 row FMA results PASS\nok
+test_iq_codes (__main__.Test.test_iq_codes) ... ok
+test_signed_dot (__main__.Test.test_signed_dot) ... 100036 signed dot cases PASS
+ok
+test_tile_geometry (__main__.Test.test_tile_geometry) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 3.073s
+
+OK
+R11 IQ fixture values: 1024
+R11 tile coverage: 1152

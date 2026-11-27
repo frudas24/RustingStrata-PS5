@@ -1,0 +1,15 @@
+test_good (__main__.Gates.test_good) ... ok
+test_input_change (__main__.Gates.test_input_change) ... ok
+test_missing_stage (__main__.Gates.test_missing_stage) ... ok
+test_missing_write (__main__.Gates.test_missing_write) ... ok
+test_nonfinite (__main__.Gates.test_nonfinite) ... ok
+test_route_change (__main__.Gates.test_route_change) ... ok
+test_shadow_changed (__main__.Gates.test_shadow_changed) ... ok
+test_wrong_slot (__main__.Gates.test_wrong_slot) ... ok
+test_wrong_stage_identity (__main__.Gates.test_wrong_stage_identity) ... ok
+test_wrong_stage_width (__main__.Gates.test_wrong_stage_width) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.028s
+
+OK

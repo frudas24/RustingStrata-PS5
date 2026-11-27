@@ -1,0 +1,8 @@
+test_duplicate_lds (__main__.MockCampaign.test_duplicate_lds) ... ok
+test_bad_size (__main__.MockCampaign.test_bad_size) ... ok
+test_zero_tests (__main__.MockCampaign.test_zero_tests) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 11.736s
+
+OK
