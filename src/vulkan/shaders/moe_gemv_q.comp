@@ -21,7 +21,7 @@ layout(constant_id = 5) const uint MAX_NM = 1;
 
 shared uint s_slots[18];
 shared uint s_nm;
-shared bool s_dup;
+shared uint s_first;
 
 void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, bool full, inout precise float acc) {
     uint lo, hi; float d, m;
@@ -78,19 +78,20 @@ void main() {
 #endif
     {
         uint tid = gl_LocalInvocationID.x;
-        if (tid == 0) { s_nm = 0; s_dup = false; }
+        if (tid == 0) { s_nm = 0; s_first = nslots; }
         barrier();
         if (tid < nslots && p.ids.v[tid] == e) {
-            if (tid < k) {
-                s_dup = true;
-            } else {
-                uint idx = atomicAdd(s_nm, 1u);
-                if (idx < MAX_NM) s_slots[idx] = tid;
-            }
+            atomicMin(s_first, tid);
+            uint idx = atomicAdd(s_nm, 1u);
+            if (idx < MAX_NM) s_slots[idx] = tid;
         }
         barrier();
-        if (s_dup) return;
-        nm = min(s_nm, MAX_NM);
+        // Every matching workgroup sees the same count. If the list cannot hold all
+        // matches, ALL of them execute their own slot; never truncate the output.
+        if (s_nm <= MAX_NM) {
+            if (k != s_first) return;
+            nm = s_nm;
+        }
     }
     load_tables();
     U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride + gl_WorkGroupID.z * p.w2);

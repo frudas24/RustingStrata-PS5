@@ -99,6 +99,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("moe_down_combine", include_bytes!("spv/moe_down_combine.spv")),
     ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("moe_gemv_q", include_bytes!(concat!(env!("OUT_DIR"), "/moe_gemv_q_audit.spv"))),
+    #[cfg(not(feature = "ps5-r2"))]
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
     #[cfg(feature = "ps5-r2")]
     ("moe_route", include_bytes!(concat!(env!("OUT_DIR"), "/moe_route_r7.spv"))),

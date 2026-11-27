@@ -16,6 +16,7 @@ fn main() {
         ("attn_prefill_ps5_1024", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=1024"][..]),
         ("gemv_q_ps5_64", "gemv_q.comp", & ["-DSTRATA_GEMV_WG=64"][..]),
         ("gemv_q_ps5_128", "gemv_q.comp", &["-DSTRATA_GEMV_WG=128"][..]),
+        ("moe_gemv_q_audit", "moe_gemv_q.comp", &[][..]),
         ("moe_gemv_q_ps5_64", "moe_gemv_q.comp", &["-DSTRATA_GEMV_WG=64"][..]),
         ("moe_gemv_q_ps5_128", "moe_gemv_q.comp", &["-DSTRATA_GEMV_WG=128"][..]),
         ("gemm_f_dp_ps5_iq32", "gemm_f_dp.comp", &["-DSM=1", "-DSTRATA_R11_SHORT=1"][..]),
