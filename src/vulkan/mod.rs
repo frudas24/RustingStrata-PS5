@@ -1137,6 +1137,12 @@ impl Vk {
                 ("gemv_q", Some(14)) => "gemv_q:Q6_K",
                 ("gemv_q", Some(8)) => "gemv_q:Q8_0",
                 ("gemv_q", Some(18)) => "gemv_q:IQ3_XXS",
+                ("gemm_f_dp", Some(17)) => "gemm_f_dp:IQ2_XS",
+                ("gemmi_dp", Some(18)) => "gemmi_dp:IQ3_XXS",
+                ("gemmi_dp", Some(23)) => "gemmi_dp:IQ4_XS",
+                ("moe_gemv_q", Some(17)) => "moe_gemv_q:IQ2_XS",
+                ("moe_gemv_q", Some(23)) => "moe_gemv_q:IQ4_XS",
+                ("moe_down_combine", Some(23)) => "moe_down_combine:IQ4_XS",
                 ("moe_gemv_q", Some(18)) => "moe_gemv_q:IQ3_XXS",
                 ("moe_gemv_q", Some(11)) => "moe_gemv_q:Q3_K",
                 ("moe_down_combine", Some(18)) => "moe_down_combine:IQ3_XXS",
@@ -1193,6 +1199,15 @@ impl Vk {
 }
 
 impl Vk {
+    // Shape-only tuning; the shader's per-row reduction and combine order do not change.
+    fn r11_rpw(&self, ty: GgmlType, key: &str, baseline: usize) -> anyhow::Result<usize> {
+        if !self.0.ps5 || self.0.wave64 || !matches!(ty, GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ4XS) { return Ok(baseline); }
+        match std::env::var(key).as_deref().unwrap_or("0") {
+            "0" => Ok(baseline), "1" => Ok(1), "2" => Ok(2), "4" => Ok(4), "8" => Ok(8),
+            v => anyhow::bail!("{key}: expected 0, 1, 2, 4 or 8, got {v}"),
+        }
+    }
+
     fn r11_iq32(&self, ty: GgmlType) -> bool {
         cfg!(feature = "ps5-r2") && self.0.ps5 && !self.0.coop && ty == GgmlType::IQ2XS
             && std::env::var("STRATA_PS5_R11_IQ32").as_deref() == Ok("1")
@@ -2007,7 +2022,9 @@ impl Backend for Vk {
             return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
         }
         // Rows per workgroup as moe_gemv's rows per subgroup: each subgroup takes a slot.
-        let (rpw, err) = ((2048 / cols).clamp(1, 8), self.0.st().err.3);
+        let original = (2048 / cols).clamp(1, 8);
+        let (rpw, err) = (self.r11_rpw(ty, "STRATA_PS5_R11_DOWN_RPW", original)?, self.0.st().err.3);
+        if rpw != original { self.0.r6_mark(1 << 10, "r11_down_rpw"); }
         self.run("moe_down_combine", &self.wspec(ty), [rows.div_ceil(rpw), t, 1], &[&w, &slots, &xq, &(stride as u64), &x, &wh, &sh, &sg, &mb, &step,
             &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])?;
         if mb != 0 { self.0.skip_rest(&mut self.0.st())?; }
@@ -2037,7 +2054,9 @@ impl Vk {
             _ => 17,
         };
         let spec = [&ws[..], &[max_nm]].concat();
-        let rpw = if max_nm > 1 { 1 } else { (4096 / cols).max(1) };
+        let original = if max_nm > 1 { 1 } else { (4096 / cols).max(1) };
+        let rpw = if max_nm == 1 && ntok == 1 { self.r11_rpw(ty, "STRATA_PS5_R11_GEMV_RPW", original)? } else { original };
+        if rpw != original { self.0.r6_mark(1 << 11, "r11_gemv_rpw"); }
         let z = if pair.is_some() { 2 } else { 1 };
         let (kernel, wpb) = self.0.r2.gemv(if max_nm == 1 && ntok == 1 { 1 } else { 2 }, true);
         self.run(kernel, &spec, [rows.div_ceil(wpb * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),

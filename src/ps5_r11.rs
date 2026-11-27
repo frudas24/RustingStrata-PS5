@@ -95,7 +95,7 @@ unsafe fn iq2_rows(t:&Tensor,x:&[f32],rb:usize,r0:usize,y:&mut[f32]) {unsafe{
         }
         for (k,&v) in xx.iter().enumerate(){
             let w=_mm256_setr_ps(block[0][k],block[1][k],block[2][k],block[3][k],block[4][k],block[5][k],block[6][k],block[7][k]);
-            let w=_mm256_cvtph_ps(_mm256_cvtps_ph::<{_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC}>(w));
+            let w=_mm256_cvtph_ps(_mm256_cvtps_ph::<0>(w));
             a=_mm256_fmadd_ps(w,_mm256_set1_ps(v),a);
         }
     }
