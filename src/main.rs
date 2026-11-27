@@ -760,16 +760,31 @@ fn build_image_prompt(tok: &Tokenizer, input: &ImageInput, images: &[String], pr
 /// The negative log-likelihood of `tok` under `logits`, and in `row` the log-probabilities as llama-perplexity stores
 /// them: scale and minimum as two f32, then each logit as a u16 step over the 16 nats below the largest (0 below
 /// that), padded to an even count. Same arithmetic as its `log_softmax`.
-fn log_probs(logits: &[f32], tok: u32, row: &mut Vec<u16>) -> f64 {
+fn log_probs(logits: &[f32], tok: u32, row: &mut Vec<u16>) -> anyhow::Result<f64> {
+    anyhow::ensure!((tok as usize) < logits.len(), "target token outside vocabulary: {tok}");
+    anyhow::ensure!(logits.iter().all(|x| x.is_finite()), "non-finite logits in perplexity");
     let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let min = logits.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(max - 16.0);
     let lse = logits.iter().map(|&x| (x - max).exp() as f64).sum::<f64>().ln() as f32;
     let scale = (max - min) / 65535.0;
+    let offset = min - max - lse;
+    let loss = (max + lse - logits[tok as usize]) as f64;
+    anyhow::ensure!(scale.is_finite() && offset.is_finite() && loss.is_finite(), "non-finite log probability encoding");
     row.clear();
-    for f in [scale, min - max - lse] { let b = f.to_bits(); row.extend([b as u16, (b >> 16) as u16]); }
+    for f in [scale, offset] { let b = f.to_bits(); row.extend([b as u16, (b >> 16) as u16]); }
     row.extend(logits.iter().map(|&x| if scale != 0.0 && x > min { ((x - min) * (1.0 / scale)).round_ties_even() as u16 } else { 0 }));
     if logits.len() % 2 == 1 { row.push(0); }
-    (max + lse - logits[tok as usize]) as f64
+    Ok(loss)
+}
+
+#[test]
+fn audit_log_probs_rejects_invalid_input() {
+    let mut row = Vec::new();
+    for (xs, tok) in [(vec![], 0), (vec![1.0], 1), (vec![f32::NAN], 0), (vec![f32::INFINITY], 0)] {
+        assert!(log_probs(&xs, tok, &mut row).is_err());
+    }
+    assert!(log_probs(&[1.0, 0.0], 0, &mut row).unwrap() > 0.0);
+    assert_eq!(row.len(), 6);
 }
 
 /// A nonzero xorshift state from `s`, or from the clock.
@@ -1509,6 +1524,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
+            anyhow::ensure!(n >= 4, "--ctx-len must be >= 4");
             let g = Gguf::open(&model)?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
@@ -1529,6 +1545,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let m = if ink.is_none() { Some(Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?) } else { None };
             let mut r = match &m { Some(m) => Some(engine.runner(m, &model)?), None => None };
             let nv = match (&ink, &m) { (Some(im), _) => im.cfg.n_vocab, (_, Some(m)) => m.cfg.n_vocab, _ => unreachable!() };
+            anyhow::ensure!(nv > 0 && ids[..n_chunk * n].iter().all(|&t| (t as usize) < nv), "corpus token outside vocabulary");
+            if kld_base.is_some() { anyhow::ensure!([n, nv, n_chunk].iter().all(|&v| u32::try_from(v).is_ok()), "KLD header dimensions exceed u32"); }
             let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
             if let Some(o) = &mut out {
                 o.write_all(b"_logits_")?;
@@ -1552,14 +1570,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         };
                     }
                     anyhow::ensure!(logits.len() == nv, "{} logits, vocabulary {nv}", logits.len());
-                    nll += log_probs(&logits, c[i + 1], &mut row);
+                    nll += log_probs(&logits, c[i + 1], &mut row)?;
                     if let Some(o) = &mut out { for v in &row { o.write_all(&v.to_le_bytes())?; } }
                     count += 1;
                 }
                 eprint!("[{}]{:.4},", count / (n - 1 - first), (nll / count as f64).exp());
             }
             if let Some(o) = &mut out { o.flush()?; }
-            println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
+            let ppl = (nll / count as f64).exp();
+            anyhow::ensure!(ppl.is_finite() && ppl > 0.0, "invalid perplexity");
+            println!("\nPPL = {ppl:.4} over {n_chunk} chunks of {n} tokens ({count} scored)");
             if let Some(run) = &mut r { run.finish()?; }
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {

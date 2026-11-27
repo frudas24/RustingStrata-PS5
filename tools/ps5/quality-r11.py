@@ -2,8 +2,31 @@
 """Independent full-vocabulary quality gate for a single R11 GPU candidate.
 Strict identity of encoded KLD dumps; not a proof of unquantized logits identity.
 """
-import argparse, importlib.util, json, pathlib, sys
+import argparse, importlib.util, json, pathlib, sys, struct, re, math
 spec=importlib.util.spec_from_file_location('r6',pathlib.Path(__file__).with_name('autotune-r6.py'));r6=importlib.util.module_from_spec(spec);spec.loader.exec_module(r6)
+def check_dump(dump, log_text, ctx_len, chunks):
+    with dump.open('rb') as f:
+        r6.require(f.read(8)==b'_logits_', 'invalid KLD dump')
+        header=f.read(12)
+        r6.require(len(header)==12, 'truncated KLD header')
+        n,nv,nc=struct.unpack('<III',header)
+        r6.require(n==ctx_len and n>=4 and nv>0 and nc==chunks and nc>0, 'incomplete corpus coverage')
+        scored=(n-1-n//2)*nc
+        row_bytes=2*(4+nv+(nv&1))
+        r6.require(dump.stat().st_size==20+4*n*nc+row_bytes*scored, 'truncated or oversized KLD dump')
+        for _ in range(nc):
+            tokens=f.read(4*n)
+            r6.require(all(t<nv for (t,) in struct.iter_unpack('<I',tokens)), 'KLD token outside vocabulary')
+        for _ in range(scored):
+            scale,offset=struct.unpack('<ff',f.read(8))
+            r6.require(math.isfinite(scale) and scale>=0 and math.isfinite(offset) and offset<=0, 'invalid KLD row encoding')
+            f.seek(row_bytes-8,1)
+    matches=re.findall(r'^PPL = (\S+) over (\d+) chunks of (\d+) tokens \((\d+) scored\)$',log_text,re.M)
+    r6.require(len(matches)==1,'missing or ambiguous PPL summary')
+    ppl,nc_log,n_log,scored_log=matches[0]
+    r6.require(math.isfinite(float(ppl)) and float(ppl)>0 and (int(nc_log),int(n_log),int(scored_log))==(nc,n,scored),'invalid PPL or coverage')
+    return n,nv,nc
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',required=True,type=pathlib.Path);p.add_argument('--bin',type=pathlib.Path,default=r6.DEFAULT_BIN)
@@ -30,15 +53,7 @@ def main():
             r6.run_child(cmd,env,log,a.timeout,1024)
             evidence=r6.evidence(log.read_text(errors='replace'),k)
             r6.require((mark in evidence['marks'])==bool(flag),'missing dispatch or leaked into control')
-            import struct
-            with dump.open('rb') as f:
-                r6.require(f.read(8)==b'_logits_','invalid KLD dump');n,nv,nc=struct.unpack('<III',f.read(12))
-            r6.require(n==a.ctx_len and nv>0 and nc==a.chunks,'incomplete corpus coverage')
-            expected=20+4*n*nc+2*(4+nv+(nv&1))*(n-1-n//2)*nc
-            r6.require(dump.stat().st_size==expected,'truncated or oversized KLD dump')
-            import re, math
-            ppl=re.search(r'PPL = ([0-9.]+) over',log.read_text(errors='replace'))
-            r6.require(ppl is not None and math.isfinite(float(ppl[1])) and float(ppl[1])>0,'invalid PPL')
+            check_dump(dump,log.read_text(errors='replace'),a.ctx_len,a.chunks)
             hashes.append(r6.digest(dump))
         r6.require(ident==r6.identity(a.model,a.bin) and corpus==r6.file_id(a.corpus),'identity changed')
         same=hashes[0]==hashes[1];r6.atomic_json(a.out/'summary.json',dict(encoded_identity=same,hashes=hashes,identity=ident,corpus=corpus,production_promotion=False))
