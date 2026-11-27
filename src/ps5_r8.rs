@@ -33,6 +33,7 @@ pub(crate) fn projection(t: &Tensor<'_>, x: &[f32], kind: Contract, rows: usize)
     anyhow::ensure!(t.scale == 1. && x.len() == t.cols && rows <= t.rows && t.cols > 0
         && t.cols % t.ty.block_elems() == 0 && t.ty.row_bytes(t.cols as u64).checked_mul(t.rows) == Some(t.data.len()),
         "R8 unsupported tensor layout or scale");
+    if let Some(y) = crate::ps5_r11::candidate(t,x,kind,rows)? { return Ok(y); }
     let x = activation(x, kind)?;
     let mut y = vec![0.; rows];
     y.par_chunks_mut(16).enumerate().for_each_init(|| vec![0.;t.cols], |buf,(i,ys)| {
