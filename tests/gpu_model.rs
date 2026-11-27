@@ -943,28 +943,25 @@ fn u1_ps5_batch_quarantine() {
     let mut gm = GpuModel::load_slots(&model, gpu, 256, 16, 768 << 20, 6).unwrap();
     assert!(gm.is_moe() && gm.slots() >= 6 && gm.batch_cap() >= 6, "batch path not supported");
     gm.adapt_every = 0;
-    let run = |gm: &mut GpuModel| {
-        for s in 0..6 { gm.use_slot(s); gm.reset().unwrap(); }
-        let cache = gm.cache.as_ref().expect("MoE cache not configured");
-        assert!(cache.total_experts() > 0);
-        assert_eq!(cache.resident_count(), 0, "test must force cache misses");
-        let rows: Vec<_> = (0..6).map(|s| (s, 11u32 + s as u32, true)).collect();
-        let got = gm.step_batch(&rows).unwrap();
-        assert_eq!(got.len(), rows.len());
-        assert!(got.iter().all(|(_, l)| !l.is_empty() && l.iter().all(|x| x.is_finite())));
-        got
-    };
-    // SAFETY: this ignored test must be run alone, as in the wrapper; the GPU lock
-    // also serializes model-loading tests. Neither arm runs CPU batch experts.
-    unsafe { std::env::set_var("STRATA_CPU_FRAC", "0"); }
-    let a = run(&mut gm);
-    unsafe { std::env::set_var("STRATA_CPU_FRAC", "1"); }
-    let b = run(&mut gm);
-    unsafe { std::env::remove_var("STRATA_CPU_FRAC"); }
-    for ((ta, a), (tb, b)) in a.iter().zip(&b) {
-        assert_eq!(ta, tb);
-        assert_eq!(a.len(), b.len());
-        assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    let frac = std::env::var("STRATA_CPU_FRAC").expect("fixed share arm required");
+    assert!(frac == "0" || frac == "1");
+    for slot in 0..6 { gm.use_slot(slot); gm.reset().unwrap(); }
+    let cache = gm.cache.as_ref().expect("MoE cache not configured");
+    assert!(cache.total_experts() > 0);
+    assert_eq!(cache.resident_count(), 0, "test must force cache misses");
+    let rows: Vec<_> = (0..6).map(|slot| (slot, 11u32 + slot as u32, true)).collect();
+    let got = gm.step_batch(&rows).unwrap();
+    assert_eq!(got.len(), rows.len());
+    assert!(got.iter().all(|(_, l)| l.len() == model.cfg.n_vocab && l.iter().all(|x| x.is_finite())));
+    // One fresh process per arm; do not mutate the environment around live Rayon/driver threads.
+    // Store all bits (including signed zero), not just argmax or a rounded digest.
+    use std::io::Write;
+    let out = std::env::var_os("STRATA_PS5_U1_BATCH_OUT").expect("output path required");
+    let mut out = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(out).unwrap());
+    for (token, logits) in got {
+        out.write_all(&token.to_le_bytes()).unwrap();
+        for v in logits { out.write_all(&v.to_bits().to_le_bytes()).unwrap(); }
     }
-    eprintln!("R11U1_BATCH_GUARD PASS: 6 finite, bit-identical full-logit rows");
+    out.flush().unwrap();
+    eprintln!("R11U1_BATCH_GUARD ARM PASS: frac={frac} 6 finite full-logit rows");
 }
