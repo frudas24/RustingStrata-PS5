@@ -812,6 +812,9 @@ impl GpuModel<'_> {
                         let (count, adaptive) = batch_cpu_count(g.ps5_preset(), missed.len(), fixed.as_deref(), self.cpu_frac)?;
                         batch_adaptive = adaptive;
                         selected = missed.split_off(missed.len() - count);
+                        if g.ps5_preset() && std::env::var("STRATA_PS5_U1_BATCH_LOG").as_deref() == Ok("1") {
+                            eprintln!("R11U1_BATCH layer={il} rows={t} staged={} cpu={}", missed.len(), selected.len());
+                        }
                     }
                     let cpu = if !selected.is_empty() {
                         let hv = g.get::<f32>(&pf.slab, l.h, t * ne)?;
