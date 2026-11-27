@@ -1564,6 +1564,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
             let (kv_k, kv_v) = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            let r7_timing = std::env::var("STRATA_R7_TOKEN_TIMING").is_ok_and(|v| v == "1");
+            let load_start = r7_timing.then(Instant::now);
             let r6 = std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1");
             if r6 {
                 anyhow::ensure!(json_out.is_some() && reps > 0 && tg > 0, "R6 requires JSON output and positive reps/tg");
@@ -1608,6 +1610,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
+            if let Some(start) = load_start {
+                eprintln!("r7_load {}", json!({"load_ns": start.elapsed().as_nanos()}));
+            }
             let mut results = Vec::with_capacity(pp.len());
             let mut r6_rows = Vec::new();
             if r6 {
@@ -1618,7 +1623,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let ids = prose(&tok, n)?;
                 let (mut p, mut d) = (Vec::new(), Vec::new());
                 let mut fingerprints = Vec::new();
-                for _ in 0..reps {
+                for rep in 0..reps {
                     r.reset()?;
                     let t = Instant::now();
                     let l = r.prefill(&ids)?;
@@ -1630,9 +1635,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         let lse = max + l.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
                         Some(top.into_iter().map(|j| (j, l[j] as f64 - lse)).collect::<Vec<_>>())
                     } else { None };
+                    let prefill_start = t;
                     let t = Instant::now();
-                    let (tokens, stopped) = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false))?;
+                    let mut token_times = Vec::new();
+                    let mut token_event = || token_times.push(prefill_start.elapsed().as_nanos());
+                    let observer = r7_timing.then_some(&mut token_event as &mut dyn FnMut());
+                    let (tokens, stopped) = decode_observed(&mut r, &tok, engine.mtp() > 0,
+                        &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false), observer)?;
                     d.push(tokens.len() as f64 / t.elapsed().as_secs_f64());
+                    if r7_timing {
+                        eprintln!("r7_tokens {}", json!({"pp": n, "rep": rep, "observed_ns": token_times}));
+                    }
                     if let Some(top5) = prefill_fp {
                         fingerprints.push(json!({"top5":top5, "tokens":tokens, "stopped":stopped}));
                     }
@@ -3134,9 +3147,16 @@ fn dry_breakers(tok: &Tokenizer, model: &str) -> std::sync::Arc<Vec<bool>> {
 /// When `think_cap` is `Some((start_open, budget))` with `budget > 0`, forces `</think>\n\n` once `out.len() >= budget`
 /// while still inside a `<think>` block so the model proceeds directly to the answer.
 /// Returns the tokens and whether an end-of-turn token or `emit` stopped it.
-fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
+fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, logits: Vec<f32>, n: usize,
           think_cap: Option<(bool, usize)>,
           emit: &mut dyn FnMut(&str) -> anyhow::Result<bool>) -> anyhow::Result<(Vec<u32>, bool)> {
+    decode_observed(r, tok, mtp, smp, logits, n, think_cap, emit, None)
+}
+
+fn decode_observed(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>,
+                   n: usize, think_cap: Option<(bool, usize)>,
+                   emit: &mut dyn FnMut(&str) -> anyhow::Result<bool>,
+                   mut token_observer: Option<&mut dyn FnMut()>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
@@ -3173,6 +3193,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
+            if let Some(observer) = &mut token_observer { observer(); }
             term::decoded(1);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
