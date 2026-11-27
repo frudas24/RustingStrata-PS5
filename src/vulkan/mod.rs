@@ -1336,12 +1336,28 @@ impl Vk {
         ensure!(!self.0.st().batch, "Q8 preparation requires an ordered dispatch outside batch");
         ensure!(x != 0 && x % 4 == 0, "Q8 input must be a nonnull aligned F32 address");
         if self.0.ps5 { self.0.st().find(x, gemm_matrix_bytes(n_x, x_stride, cols)?)?; }
-        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
+        if q8.0.len() < need {
+            // Graphs retain device addresses in push constants, even after their
+            // submissions finish. A flush alone cannot make replacing one safe.
+            if q8.0.len() != 0 {
+                ensure!(self.0.st().rec.is_none(), "cannot grow Q8 scratch during graph recording");
+                self.graph_clear()?;
+            }
+            q8.0 = self.alloc(need)?;
+        }
         let xq = q8.0.addr();
         self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
         q8.1 = key;
         if self.0.ps5 && r13_quant_trace() { eprintln!("r13_q8,miss,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name()); }
         Ok(Some(xq))
+    }
+
+    // A graph can write Q8 scratch without calling q8_x on replay. A discarded
+    // recording can also have published a key for a quantization that never ran.
+    // Reuse remains available within each recording and ordered non-graph sequence.
+    fn invalidate_q8_keys(&self) {
+        self.3.lock().unwrap().1 = None;
+        self.4.lock().unwrap().1 = None;
     }
 
     // One marker per routed format and geometry, independent of the dense oracle.
@@ -1789,12 +1805,20 @@ impl Backend for Vk {
         Ok(())
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        // Lock Q8 before State, matching gemm_raw's lock order.
+        self.invalidate_q8_keys();
         let mut st = self.0.st();
+        ensure!(st.rec.is_none() && !st.batch, "nested graph or graph inside batch");
         if let Some(&g) = st.graphs.get(&key) {
             if self.0.r7_trace { self.0.r7_commands.graph_reuse.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             return self.0.enqueue_cb(&mut st, Some(g));
         }
-        if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
+        if std::env::var_os("STRATA_NO_GRAPH").is_some() {
+            drop(st);
+            let r = f();
+            self.invalidate_q8_keys();
+            return r;
+        }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
         unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
@@ -1803,6 +1827,7 @@ impl Backend for Vk {
         if st.need_cond { self.0.cond_on(&mut st, c); }
         drop(st);
         let r = f();
+        self.invalidate_q8_keys();
         let mut st = self.0.st();
         st.rec = None;
         self.0.end_cond(&mut st, c);
