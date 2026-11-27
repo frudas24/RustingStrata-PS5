@@ -20,11 +20,14 @@ pub const GEMM_BM: usize = 128;
 pub struct Buf {
     addr: u64,
     len: usize,
+    read_only: bool,
     _owner: std::sync::Arc<dyn Any + Send + Sync>,
 }
 
 impl Buf {
-    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: std::sync::Arc::new(owner) } }
+    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, read_only: false, _owner: std::sync::Arc::new(owner) } }
+    pub(crate) fn read_only(mut self) -> Self { self.read_only = true; self }
+    pub fn is_read_only(&self) -> bool { self.read_only }
     pub fn addr(&self) -> u64 { self.addr }
     pub fn len(&self) -> usize { self.len }
 }
@@ -43,6 +46,7 @@ impl GpuTensor {
     /// `rows` x `cols` of `ty` stored in `buf` from its start.
     pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, scale: 1.0, _buf: buf } }
     pub fn with_scale(mut self, scale: f32) -> GpuTensor { self.scale = scale; self }
+    pub fn is_read_only(&self) -> bool { self._buf.is_read_only() }
     pub fn bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) * self.rows }
 }
 
@@ -187,6 +191,11 @@ pub trait Backend: Send {
         let b = self.alloc(src.len())?;
         self.htod(src, &b, 0)?;
         Ok(b)
+    }
+
+    /// Explicit immutable model weights. Other backends preserve their existing upload behavior.
+    fn upload_immutable(&self, t: &Tensor, _source: &crate::gguf::Gguf) -> anyhow::Result<GpuTensor> {
+        self.upload(t)
     }
 
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {

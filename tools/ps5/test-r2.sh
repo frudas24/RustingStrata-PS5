@@ -6,6 +6,7 @@ cd "$PS5_ROOT"
 out=${1:-$PS5_ROOT/results/ps5-r2-parity}
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 export STRATA_PS5=1 STRATA_PS5_GTT=1 STRATA_PS5_DIRECT=1 STRATA_VK_NO_COOP=1
+export STRATA_PS5_ZERO_COPY=0
 export STRATA_TEST_BACKENDS=vulkan
 # Default numerics; use the same quantization mode for all cases.
 unset STRATA_LLAMA_NUMERICS STRATA_MMQ

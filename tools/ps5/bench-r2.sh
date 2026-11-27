@@ -8,6 +8,7 @@ out=${1:-ps5-r2-bench-$(date +%Y%m%d-%H%M%S)}; if (($#)); then shift; fi
 mkdir -p "$out"
 "$here/diagnose.sh" > "$out/diagnostics.txt" 2>&1 || true
 export STRATA_PS5=1 STRATA_PS5_GTT=1 STRATA_PS5_DIRECT=1 STRATA_FIXED_EXPERTS=1 STRATA_VK_NO_COOP=1
+export STRATA_PS5_ZERO_COPY=0
 export PS5_CTX=${PS5_CTX:-8192} PS5_CHUNK=${PS5_CHUNK:-512} PS5_KV=${PS5_KV:-q8} PS5_THREADS=${PS5_THREADS:-6}
 # Short prompts expose the small dense tile; long prompts measure normal prefill.
 args=(bench --model "$model" --pp "${PS5_PP:-32,64,512,2048,4096}" --tg "${PS5_TG:-128}" --reps "${PS5_REPS:-3}" --mtp 0 "$@")

@@ -667,7 +667,7 @@ impl<'a> GpuModel<'a> {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
         }
         let c = &m.cfg;
-        let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
+        let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload_immutable(&m.w.get(name)?, m.w.g) };
         let lt_cache = std::cell::RefCell::new(HashMap::<(usize, String), GpuTensor>::new());
         let lt = |il: usize, s: &str| -> anyhow::Result<GpuTensor> {
             let p = c.phys_layer.get(il).copied().unwrap_or(il);
@@ -676,7 +676,7 @@ impl<'a> GpuModel<'a> {
                     return Ok(cached.clone());
                 }
             }
-            let gt = gpu.upload(&m.w.layer(il, s)?)?;
+            let gt = gpu.upload_immutable(&m.w.layer(il, s)?, m.w.g)?;
             lt_cache.borrow_mut().insert((p, s.to_string()), gt.clone());
             Ok(gt)
         };

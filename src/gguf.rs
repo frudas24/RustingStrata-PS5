@@ -37,12 +37,12 @@ pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
     /// Each shard's map and data offset (one entry unless the model is split).
-    files: Vec<(Map, usize)>,
+    files: Vec<(std::sync::Arc<Map>, usize)>,
 }
 
 /// A mapped model file. `weights::preload` counted its bytes; unmapping takes them off the count, so a file that was
 /// opened only to read its metadata, or the model before a switch, does not make the next one look too large for RAM.
-struct Map(Mmap);
+pub(crate) struct Map(pub(crate) Mmap);
 
 impl Drop for Map {
     fn drop(&mut self) { crate::weights::unmapped(self.0.len()); }
@@ -130,7 +130,7 @@ impl Gguf {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
         crate::weights::preload(&mmap, read && !crate::weights::net_fs(path));
-        let mmap = Map(mmap);
+        let mmap = std::sync::Arc::new(Map(mmap));
         let mut c = Cur { b: &mmap.0, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;
@@ -162,6 +162,16 @@ impl Gguf {
             }
         }
         Ok(Gguf { meta, tensors, files: vec![(mmap, data_offset)] })
+    }
+
+    /// Only existing file-backed ranges may be imported; synthesized/heap tensors never qualify.
+    pub(crate) fn mapped_source(&self, bytes: &[u8]) -> Option<(std::sync::Arc<Map>, usize)> {
+        let p = bytes.as_ptr() as usize;
+        self.files.iter().find_map(|(m, data)| {
+            let offset = p.checked_sub(m.0.as_ptr() as usize)?;
+            if offset < *data || offset.checked_add(bytes.len())? > m.0.len() { return None; }
+            Some((m.clone(), offset))
+        })
     }
 
     pub fn get(&self, key: &str) -> anyhow::Result<&Value> {

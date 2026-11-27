@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub mod preflight;
 pub mod spv_smem;
 mod ps5_r2;
+mod ps5_r3;
 
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
@@ -181,6 +182,7 @@ struct Inner {
     igpu: bool,
     ps5: bool,
     r2: ps5_r2::Kernels,
+    r3: Option<ps5_r3::HostImport>,
     ps5_gtt: bool,
     ps5_direct: bool,
     ps5_host_reserve: u64,
@@ -299,20 +301,33 @@ struct State {
 }
 
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
-struct Mem { vk: Arc<Inner>, buf: vk::Buffer, mem: vk::DeviceMemory, addr: u64 }
+struct Mem { vk: Arc<Inner>, buf: vk::Buffer, mem: vk::DeviceMemory, addr: u64, imported: Option<(Arc<crate::gguf::Map>, u64, crate::weights::ImportedRange)> }
 
 impl Drop for Mem {
     fn drop(&mut self) {
         let mut st = self.vk.st();
-        let _ = self.vk.flush(&mut st); // queued work may still use the buffer
+        let flushed = self.vk.flush(&mut st); // queued work may still use the buffer
+        if self.imported.is_some() && flushed.is_err() {
+            // Never release host pages while GPU access may still be in flight. On an
+            // exceptional wait failure retain the mapping for the remaining process lifetime.
+            if unsafe { self.vk.dev.device_wait_idle() }.is_err() {
+                if let Some(imported) = self.imported.take() { std::mem::forget(imported); }
+                std::mem::forget(self.vk.clone());
+                return;
+            }
+        }
         st.bufs.remove(&self.addr);
         unsafe { self.vk.dev.destroy_buffer(self.buf, None); self.vk.dev.free_memory(self.mem, None) }
+        if let Some((_, bytes, _)) = &self.imported {
+            if let Some(r3) = &self.vk.r3 { r3.release(*bytes); }
+        }
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(r3) = &self.r3 { r3.report(); }
         if self.ps5 {
             let [mapped, staged] = self.ps5_upload_bytes.each_ref().map(|v| v.load(std::sync::atomic::Ordering::Relaxed));
             eprintln!("PS5 fresh weights: mapped {mapped} bytes, staged {staged} bytes");
@@ -456,6 +471,8 @@ impl Vk {
         if ps5 { crate::say!("PS5 R2: GEMV workgroup {}, small GEMM {}, packed signed dot accelerated {}", r2.wg, r2.small,
             dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE); }
         let ps5_gtt = ps5 && budget && std::env::var("STRATA_PS5_GTT").is_ok_and(|v| v == "1");
+        let r3_cfg = ps5_r3::probe(&instance, pd, ps5 && ps5_gtt, has(ash::ext::external_memory_host::NAME))?;
+        if r3_cfg.is_some() { exts.push(ash::ext::external_memory_host::NAME.as_ptr()); }
         let ps5_direct = ps5 && std::env::var("STRATA_PS5_DIRECT").is_ok_and(|v| v == "1");
         let ps5_host_reserve = if ps5 {
             std::env::var("STRATA_PS5_HOST_RESERVE_MB").ok().map(|v| v.parse::<u64>()).transpose()
@@ -543,7 +560,8 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1000,7 +1018,7 @@ impl Vk {
         let (buf, mem) = self.0.buffer(bytes, wants)?;
         let host = wants != DEVICE;
         let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
-        let owner = Mem { vk: self.0.clone(), buf, mem, addr };
+        let owner = Mem { vk: self.0.clone(), buf, mem, addr, imported: None };
         let mut st = self.0.st();
         st.bufs.insert(addr, (buf, bytes));
         let mut ptr = std::ptr::null_mut();
@@ -1131,6 +1149,13 @@ impl Backend for Vk {
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
 
+    fn upload_immutable(&self, t: &crate::weights::Tensor, source: &crate::gguf::Gguf) -> anyhow::Result<GpuTensor> {
+        if let Some(b) = self.try_import_weight(t, source)? {
+            return Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale));
+        }
+        self.upload(t)
+    }
+
     fn upload_bytes(&self, src: &[u8]) -> anyhow::Result<Buf> {
         // New buffer, never used by a submitted or recorded command: the next queue
         // submission makes coherent host writes available to device operations.
@@ -1149,7 +1174,7 @@ impl Backend for Vk {
                         let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
                         self.0.st().bufs.insert(addr, (buf, src.len()));
                         self.0.ps5_upload_bytes[0].fetch_add(src.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(Buf::new(addr, src.len(), Mem { vk: self.0.clone(), buf, mem, addr }));
+                        return Ok(Buf::new(addr, src.len(), Mem { vk: self.0.clone(), buf, mem, addr, imported: None }));
                     }
                     Err(_) => unsafe { self.0.dev.destroy_buffer(buf, None); self.0.dev.free_memory(mem, None); },
                 }
@@ -1162,6 +1187,7 @@ impl Backend for Vk {
     }
 
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
+        ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
         if st.step_pos.is_some_and(|(a, _)| dst.addr() + off as u64 == a) { st.step_pos = None; }
@@ -1237,6 +1263,7 @@ impl Backend for Vk {
     }
 
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()> {
+        ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
         ensure!(src_off + bytes <= src.len() && dst_off + bytes <= dst.len(), "dtod: {bytes} bytes out of range");
         if bytes == 0 { return Ok(()); }
         let mut st = self.0.st();
@@ -1249,6 +1276,7 @@ impl Backend for Vk {
     }
 
     fn memset(&self, dst: &Buf) -> anyhow::Result<()> {
+        ensure!(!dst.is_read_only(), "cannot clear imported immutable GGUF weights");
         let mut st = self.0.st();
         let (b, _) = st.find(dst.addr(), dst.len())?;
         let cb = self.0.cb(&mut st)?;

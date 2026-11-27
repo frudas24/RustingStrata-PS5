@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Keep the same model, context, chunk, KV, seed/greedy and threads in every mode.
 set -euo pipefail
+export STRATA_PS5_ZERO_COPY=0
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 [[ $# -ge 1 ]] || { echo 'usage: bench.sh MODEL.gguf [OUTPUT_DIR] [additional bench flags...]' >&2; exit 2; }
 model=$1; shift; [[ -r "$model" ]] || { echo "Model not readable: $model" >&2; exit 2; }

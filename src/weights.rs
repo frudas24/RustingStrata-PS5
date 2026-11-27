@@ -378,6 +378,31 @@ pub fn preloaded() -> bool {
     PRELOADING.load(std::sync::atomic::Ordering::Relaxed) == 0 && *FITS.get_or_init(fits_ram)
 }
 
+// R3: avoid invalidating a mapped virtual range while a Vulkan userptr may use it.
+// Counts allow overlapping or duplicate read-only imports. The token covers driver
+// import itself as well as successful allocation lifetime.
+static IMPORTED_RANGES: std::sync::Mutex<std::collections::BTreeMap<(usize, usize), usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) struct ImportedRange((usize, usize));
+impl ImportedRange {
+    pub(crate) fn new(start: usize, len: usize) -> Self {
+        let key = (start, start.checked_add(len).expect("validated import range"));
+        let mut ranges = IMPORTED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        *ranges.entry(key).or_default() += 1;
+        Self(key)
+    }
+}
+impl Drop for ImportedRange {
+    fn drop(&mut self) {
+        let mut ranges = IMPORTED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = ranges.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 { ranges.remove(&self.0); }
+        }
+    }
+}
+
 /// Drops the whole pages of `b` (MADV_DONTNEED): bytes now on the GPU, whose host copy competes with the experts that
 /// missed VRAM for page cache. Expert files exceed the page cache, so pages read once at load would otherwise outlive
 /// the experts a prompt reads from it. `STRATA_COLD_KEEP` only marks them reclaimable (MADV_COLD) instead. Nothing is
@@ -385,7 +410,12 @@ pub fn preloaded() -> bool {
 pub fn cold(b: &[u8]) {
     if fits_ram() { return; }
     let (a, e) = ((b.as_ptr() as usize + 4095) & !4095, (b.as_ptr() as usize + b.len()) & !4095);
-    if e > a { madvise(a, e - a, if std::env::var_os("STRATA_COLD_KEEP").is_some() { 20 } else { 4 }); }
+    if e > a {
+        let ranges = IMPORTED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if !ranges.keys().any(|&(start, end)| a < end && start < e) {
+            madvise(a, e - a, if std::env::var_os("STRATA_COLD_KEEP").is_some() { 20 } else { 4 });
+        }
+    }
 }
 
 /// Reads ranges of mapped weights into the page cache from a background thread (`will_need`), in the order sent, so

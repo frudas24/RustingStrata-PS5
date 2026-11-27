@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export STRATA_PS5_ZERO_COPY=0
 source "$(dirname -- "$0")/env.sh"
 cd "$PS5_ROOT"
 mode=${1:---cpu}
