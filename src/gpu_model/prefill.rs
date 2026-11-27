@@ -847,6 +847,12 @@ impl GpuModel<'_> {
                     // Research-only shadow comparison. Use an actual routed GPU row and the same hidden input.
                     let r9_here = r9_enabled && il == r9_layer && self.pos == r9_pos;
                     let stage_probe = r4_stage_probe && il < c.n_layer && (!r9_enabled || r9_here);
+                    let r9_trace_layer = r9_enabled && r9_token < t;
+                    if r9_trace_layer {
+                        eprintln!("r9_route_layer,{}", serde_json::json!({
+                            "layer": il, "pos": self.pos, "chunk": t, "top_k": k, "ids": &ids
+                        }));
+                    }
                     let shadow = if r9_here {
                         anyhow::ensure!(cpu.is_none() && r9_token < t && r9_rank < k, "R9 target missing or CPU route active");
                         let route = r9_token * k + r9_rank;
@@ -1111,6 +1117,11 @@ impl GpuModel<'_> {
                         anyhow::ensure!(combined.iter().all(|v| v.is_finite()), "R9 nonfinite combine");
                         // Full vector, not just a fingerprint: offline compares the exact GPU combine boundary.
                         eprintln!("r9_combine,{il},{},{token},{}", self.pos, serde_json::to_string(&combined)?);
+                    }
+                    if r9_trace_layer {
+                        let offset = ((fx - base) / 4) as usize + r9_token * ne;
+                        let combined = g.get::<f32>(&pf.slab, offset, ne)?;
+                        eprintln!("r9_layer_out,{il},{},{}", self.pos, serde_json::to_string(&combined)?);
                     }
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
