@@ -30,7 +30,9 @@ for prompt in 0 1; do
     case "$arm" in gpu) mode=; probe=0; r9=;; replay-*) mode=replay; r9=${arm#replay-};; esac
     iq=0
     if [[ ${PS5_R11_CONTRACT:-0} == 1 ]]; then iq=1; fi
-    STRATA_PS5_R11_IQ_F16="$iq" STRATA_PS5_R11_IQ_Q32="$iq" STRATA_PS5_R11_LOG="$iq" \
+    boundary=0
+    if [[ ${PS5_R12_BOUNDARY_TRACE:-0} == 1 && $probe == 1 ]]; then boundary=1; fi
+    STRATA_PS5_R12_BOUNDARY_TRACE="$boundary" STRATA_PS5_R11_IQ_F16="$iq" STRATA_PS5_R11_IQ_Q32="$iq" STRATA_PS5_R11_LOG="$iq" \
     PS5_R10_PROMPT="$prompt" STRATA_PS5_R9_MODE="$r9" STRATA_R7_R4_STAGE_PROBE="$probe" \
       STRATA_PS5_R10_ROUTES="$mode" STRATA_PS5_R10_ROUTE_FILE="$d/routes.json" PS5_R4_PARITY_FILE="$d/$arm.json" \
       python3 tools/ps5/r8-run-guarded.py --out "$d/$arm" --timeout "${PS5_R10_TIMEOUT:-5400}" --min-kib 1048576 -- \
@@ -41,4 +43,5 @@ for prompt in 0 1; do
     for arm in shadow sham replay-shadow contract replay-contract; do grep -Fq "R11 IQ exercised:" "$d/$arm.log"; done
   fi
   python3 tools/ps5/compare-r10.py compare "$d"
+  if [[ ${PS5_R12_BOUNDARY_TRACE:-0} == 1 ]]; then python3 tools/ps5/compare-r12-boundaries.py "$d"; fi
 done

@@ -452,6 +452,27 @@ impl GpuModel<'_> {
                 anyhow::ensure!(!r10_tape.is_empty(), "R10 missing route chunk");
             }
         }
+        // Full-chunk causal observation, limited to the intervention chunk and nine layers.
+        // No replacement, quantization, or scheduler policy is changed by this flag.
+        let r12_trace = std::env::var("STRATA_PS5_R12_BOUNDARY_TRACE").as_deref() == Ok("1");
+        if r12_trace {
+            anyhow::ensure!(!r10_mode.is_empty(), "R12 boundary trace requires R10 research");
+        }
+        let r12_pos = self.pos;
+        let r12_capture = r12_trace && r12_pos == r9_pos;
+        if r12_capture {
+            anyhow::ensure!(t.checked_mul(ne).is_some_and(|v| v <= 262144), "R12 full-chunk trace budget exceeded");
+        }
+        let boundary = |layer: usize, stage: &str, offset: usize, tokens: usize| -> anyhow::Result<()> {
+            if !r12_capture || layer < r9_layer || layer > r9_layer.saturating_add(8) { return Ok(()); }
+            let len = tokens.checked_mul(ne).ok_or_else(|| anyhow::anyhow!("R12 trace size overflow"))?;
+            anyhow::ensure!(offset.checked_add(len).is_some_and(|v| v <= pf.slab.len()/4), "R12 trace range");
+            let v = g.get::<f32>(&pf.slab, offset, len)?;
+            anyhow::ensure!(v.iter().all(|v| v.is_finite()), "R12 nonfinite boundary {layer}/{stage}");
+            let bits: Vec<u32> = v.iter().map(|v| v.to_bits()).collect();
+            eprintln!("r12_boundary,{layer},{r12_pos},{stage},{tokens},{ne},{}", serde_json::to_string(&bits)?);
+            Ok(())
+        };
         let r8_contract = std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1");
         if r8_contract {
             anyhow::ensure!(self.ps5_r4.is_some() && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1")
@@ -505,6 +526,7 @@ impl GpuModel<'_> {
             }
             // Hyper-connections / mHC: mixer and FFN outputs go to "mix" and "mo", then into the streams.
             // A batched step (`rows`) may take the decode GEMM; one request keeps the prefill GEMM's bits.
+            boundary(il, "layer_input", 0, t)?;
             let bf = if rows.is_some() { BATCHED } else { 0 };
             let (mx, mact) = if c.hc_n > 0 || ly.mhc.is_some() { (at(l.mix), 0) } else { (x, 2) };
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
@@ -530,6 +552,7 @@ impl GpuModel<'_> {
                     _ => unreachable!(),
                 }
             }
+            boundary(il, "mixer_norm", l.h, t)?;
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
@@ -663,6 +686,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(o, t, at(l.d), nh * hd, mx, ne, mact)?;
                 }
             }
+            boundary(il, "mixer_residual", 0, t)?;
             probe(&mut tr, "| mixer", &pf.slab, x, d, t)?;
             if let Some((_, mhc_a, mhc_f)) = &ly.mhc {
                 let s = c.mhc_streams;
@@ -687,6 +711,7 @@ impl GpuModel<'_> {
                     _ => unreachable!(),
                 }
             }
+            boundary(il, "ffn_norm", l.h, t)?;
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, bf)?;
@@ -1216,6 +1241,7 @@ impl GpuModel<'_> {
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
+            boundary(il, "layer_output", 0, t)?;
             probe(&mut tr, "| ffn", &pf.slab, x, d, t)?;
             if trace { crate::say!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             if il < c.n_layer {
