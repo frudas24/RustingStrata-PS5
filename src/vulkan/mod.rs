@@ -246,6 +246,7 @@ struct Inner {
     smem_limit: u32,
     /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     ts_period: f32,
+    r7_trace: bool,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -608,7 +609,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -846,7 +847,11 @@ impl Inner {
         let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wv[..n]).signal_semaphore_values(&sv);
         let si = vk::SubmitInfo::default().command_buffers(&cbs).wait_semaphores(&ws[..n]).wait_dst_stage_mask(&wst[..n])
             .signal_semaphores(&ss).push_next(&mut tl);
+        let submit_start = self.r7_trace.then(std::time::Instant::now);
         unsafe { self.dev.queue_submit(self.queue, &[si], fence) }?;
+        if let Some(start) = submit_start {
+            eprintln!("r7,host,compute_submit,{},{},{}", st.cval, cbs.len(), start.elapsed().as_nanos());
+        }
         st.twait = 0;
         st.busy = true;
         if wait {
@@ -866,6 +871,9 @@ impl Inner {
                     r => break r?,
                 }
             }
+            if self.r7_trace {
+                eprintln!("r7,host,compute_fence_wait,{},1,{}", st.cval, t0.elapsed().as_nanos());
+            }
             if !e.is_null() { unsafe { e.add(2).write_volatile(0) } }
             unsafe {
                 self.dev.reset_fences(&[st.fence])?;
@@ -884,7 +892,11 @@ impl Inner {
                 unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
                 for (i, n) in names.drain(..).enumerate() {
                     let e = tot.entry(n).or_default();
-                    e.0 += t[2 * i + 1].saturating_sub(t[2 * i]);
+                    let ticks = t[2 * i + 1].saturating_sub(t[2 * i]);
+                    e.0 += ticks;
+                    if self.r7_trace {
+                        eprintln!("r7,gpu,{n},{},{},{}", st.cval, i, ticks as f64 * self.ts_period as f64);
+                    }
                     e.1 += 1;
                     if i > 0 && t[2 * i] >= t[2 * i - 1] {
                         let g = tot.entry("_barrier_gap").or_default();
