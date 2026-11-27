@@ -164,7 +164,7 @@ STRATA_PREFILL_PROTECT=1|strict  # opt back into the fork's old prompt handling 
 Every R2–R12 switch is off by default — most later ones are read only as the literal `1`, with three exceptions:
 `STRATA_PS5_R9_MODE` takes `shadow`, `legacy` or `contract` and is off when empty, `STRATA_PS5_R12_IQ_INT_TILE` takes
 `32` or `64` and falls back to off on any other value, and the R11 register-pressure screens
-(`STRATA_PS5_R11_GEMV_RPW`, `_DOWN_RPW`) accept only `0/1/2/4/8`. A plain build is therefore R1 behaviour plus
+(`STRATA_PS5_R11_GEMV_RPW`, `STRATA_PS5_R11_DOWN_RPW`) accept only `0/1/2/4/8`. A plain build is therefore R1 behaviour plus
 upstream. `STRATA_SCALAR` overrides the new F16/BF16 CPU kernels, `STRATA_PS5_R4_RESEARCH=1` is still required to touch
 the quarantined R4 hybrid scheduler and the file-backed import, and `STRATA_PS5_R12_BOUNDARY_TRACE=1` is a
 research-only tracer: it refuses to run unless `STRATA_PS5_R10_ROUTES` is `record` or `replay` on a single-device R9
@@ -200,7 +200,7 @@ below rebuild any earlier point (`git switch --detach ps5-r3`, `bash tools/ps5/b
 | R8 | `ps5-r8` | routed-arithmetic contract investigation: a deliberately slow CPU oracle that follows Vulkan's own type/column selection, route-aware gate/up/down probes, and a guarded four-arm campaign; an accuracy experiment, never a production path | `STRATA_PS5_R8_CONTRACT`, `STRATA_R7_R4_STAGE_PROBE`, `PS5_R8_TIMEOUT` |
 | R9 | `ps5-r9` | matched single-expert causal replay: replaces exactly one GPU-routed expert row just before the Vulkan combine, reads the combined row back, and fails closed on a missing target or a mismatch | `STRATA_PS5_R9_MODE` (`shadow`, `legacy`, `contract`), `PS5_R9_LAYER`, `PS5_R9_POS`, `PS5_R9_TOKEN`, `PS5_R9_RANK` |
 | R10 | no tag — use the branch `ps5/r10` | identical-write (sham) control, a frozen route tape replayed into prefill, and the Venus F16 tail | `STRATA_PS5_R10_ROUTES` (`record`, `replay`), `STRATA_PS5_R10_ROUTE_FILE`, `STRATA_PS5_VENUS_TAIL` |
-| R11 | `ps5-r11` | routed IQ32 GPU GEMM, IQ CPU contract candidates (IQ2_XS SIMD, IQ3_XXS/IQ4_XS Q8-32) and GEMV/down register-pressure screens | `STRATA_PS5_R11_IQ32`, `_IQ_F16`, `_IQ_Q32`, `_LOG`, `_PROFILE`, `_GEMV_RPW`, `_DOWN_RPW` |
+| R11 | `ps5-r11` | routed IQ32 GPU GEMM, IQ CPU contract candidates (IQ2_XS SIMD, IQ3_XXS/IQ4_XS Q8-32) and GEMV/down register-pressure screens | `STRATA_PS5_R11_IQ32`, `STRATA_PS5_R11_IQ_F16`, `STRATA_PS5_R11_IQ_Q32`, `STRATA_PS5_R11_LOG`, `STRATA_PS5_R11_PROFILE`, `STRATA_PS5_R11_GEMV_RPW`, `STRATA_PS5_R11_DOWN_RPW` |
 | R11U1 | `ps5-r11u1` | selective upstream 1.4.1: backend fixes byte for byte, a bounds-checked `expert_cache::layer`, and the PS5 quarantine of the batch CPU-miss path | `STRATA_PS5_U1_BATCH_LOG` (diagnostic only) |
 | R11U1-Audit | `ps5-r11u1-audit` | defensive pass: atomic expert dedup with a per-slot fallback, bounded GGUF metadata recursion with validated arrays, KLD/NLL validation, telemetry parsing, causal evidence bound to coordinates and stage widths | none added; the dedup and Q8 changes alter behaviour where the old paths were wrong |
 | R12 | `ps5-r12` | routed IQ3_XXS/IQ4_XS integer tiles at 32 and 64 positions with the 128-position tile list left immutable, plus a research-only full-chunk FP32 boundary trace | `STRATA_PS5_R12_IQ_INT_TILE=32\|64`, `STRATA_PS5_R12_BOUNDARY_TRACE` (requires R10), `PS5_R12_BOUNDARY_TRACE` in the harness |
