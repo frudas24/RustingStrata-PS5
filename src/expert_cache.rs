@@ -178,7 +178,8 @@ impl ExpertCache {
         Ok(())
     }
 
-    pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers[il].as_ref() }
+    // A part of a --device split holds layers up to the end of its range only; later layers have no experts here.
+    pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers.get(il)?.as_ref() }
     pub fn base(&self, lx: &LayerExperts) -> (u64, usize) {
         let p = &self.pools[lx.pool];
         (p.buf.addr(), p.slot_bytes)
@@ -377,6 +378,16 @@ mod tests {
             }
         }
         c
+    }
+
+    #[test]
+    fn layer_lookup_outside_partition_is_none() {
+        let c = fake(2, 4, 2, None);
+        assert!(c.layer(0).is_some());
+        assert!(c.layer(1).is_some());
+        assert!(c.layer(2).is_none());
+        assert!(c.layer(usize::MAX).is_none());
+        assert!(fake(0, 4, 0, None).layer(0).is_none());
     }
 
     /// R2: the fast path needs *every* slot used; one expert left on the CPU keeps the mailbox path on.
