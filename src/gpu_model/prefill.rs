@@ -393,6 +393,13 @@ impl GpuModel<'_> {
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
         let venus = crate::venus_trace::Target::from_env()?;
+        let r4_stage_probe = std::env::var("STRATA_R7_R4_STAGE_PROBE").as_deref() == Ok("1");
+        if r4_stage_probe {
+            anyhow::ensure!(venus.is_none() && self.ps5_r4.is_some() && rows.is_none() && input.is_none()
+                && c.hadamard.is_none() && self.m.loras.is_empty() && g.name() == "vulkan" && !g.beside_overlaps()
+                && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1"),
+                "R4 stage probe requires ordinary Vulkan R4 research prefill; no Venus trace, LoRA, Hadamard or overlapping staging");
+        }
         if let Some(v) = venus {
             anyhow::ensure!(rows.is_none() && input.is_none() && self.ps5_r4.is_none() && c.hadamard.is_none()
                 && self.m.loras.is_empty() && g.name() == "vulkan", "Venus trace requires ordinary all-GPU Vulkan prefill, no R4/LoRA/Hadamard");
@@ -804,12 +811,81 @@ impl GpuModel<'_> {
                     };
                     // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
                     // wait for the host to stage them.
+                    // Research-only shadow comparison. Use an actual routed GPU row and the same hidden input.
+                    let stage_probe = r4_stage_probe && il < c.n_layer;
+                    let shadow = if stage_probe {
+                        if let Some(&(expert, _)) = groups.iter().flatten().next() {
+                            let slot = off[expert];
+                            let token = xrow[slot] as usize;
+                            let hidden = g.get::<f32>(&pf.slab, l.h + token * ne, ne)?;
+                            Some((expert, slot, token, hidden))
+                        } else { None }
+                    } else { None };
+                    let compare_stage = |stage: &str, cpu: &[f32], gpu: &[f32]| {
+                        assert_eq!(cpu.len(), gpu.len(), "R4 stage probe shape mismatch");
+                        assert!(cpu.iter().chain(gpu).all(|v| v.is_finite()), "R4 stage probe nonfinite values");
+                        let mut max_abs = 0.0f32;
+                        let mut denom = 0.0f32;
+                        let mut different = 0usize;
+                        for (&a, &b) in cpu.iter().zip(gpu) {
+                            max_abs = max_abs.max((a - b).abs());
+                            denom = denom.max(a.abs()).max(b.abs());
+                            different += usize::from(a.to_bits() != b.to_bits());
+                        }
+                        if let Some((expert, slot, token, _)) = shadow.as_ref() {
+                            eprintln!("r7_r4_stage,{il},{t},{expert},{slot},{token},{stage},{},{different},{max_abs},{denom}", cpu.len());
+                        }
+                    };
+                    let gate_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[0])?) } else { None };
+                    let up_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[1])?) } else { None };
+                    let down_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[2])?) } else { None };
                     let dispatch = || -> anyhow::Result<()> {
-                        for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
+                        for ((gs, cp), (gu, downs)) in steps.iter().zip(&spans) {
                             g.beside(&mut || {
                                 if gu[0].1 > 0 {
                                     g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                    let shadow_here = shadow.as_ref().filter(|(expert, ..)| gs.clone().any(|gi| groups[gi].iter().any(|row| row.0 == *expert)));
+                                    let mut cpu_activation = Vec::new();
+                                    if let Some((expert, slot, _, hidden)) = shadow_here {
+                                        let gate = gate_weight.as_ref().unwrap().expert(*expert, c.n_expert);
+                                        let up = up_weight.as_ref().unwrap().expert(*expert, c.n_expert);
+                                        let mut cg = vec![0.0f32; c.n_ff_exp];
+                                        let mut cu = vec![0.0f32; c.n_ff_exp];
+                                        crate::cpu_moe::matvec(&gate, hidden, &mut cg);
+                                        crate::cpu_moe::matvec(&up, hidden, &mut cu);
+                                        let pos = l.ge + slot * c.n_ff_exp;
+                                        let gpu_gate = g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?;
+                                        compare_stage("gate", &cg, &gpu_gate);
+                                        // Dequantized f64 reference for the first 16 rows. Both arms use the
+                                        // same decoded weight and reduction order, changing only the input Q8 grouping.
+                                        for (group, stage) in [(32, "gate_q8_32_oracle"), (256, "gate_q8k_256_oracle")] {
+                                            let x: Vec<f32> = hidden.chunks(group).flat_map(|block| {
+                                                let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                                                let signed = *block.iter().find(|v| v.abs() == amax).unwrap();
+                                                let id = if amax == 0.0 { 0.0 } else if group == 32 { 127.0 / amax } else { -127.0 / signed };
+                                                let scale = if id == 0.0 { 0.0 } else if group == 32 { amax / 127.0 } else { 1.0 / id };
+                                                block.iter().map(move |v| (v * id).round_ties_even().clamp(-128.0, 127.0) * scale)
+                                            }).collect();
+                                            let mut row = vec![0.0f32; gate.cols];
+                                            let n = 16.min(gpu_gate.len());
+                                            let mut oracle = Vec::with_capacity(n);
+                                            for i in 0..n {
+                                                gate.row(i, &mut row);
+                                                oracle.push(row.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() as f32);
+                                            }
+                                            compare_stage(stage, &oracle, &gpu_gate[..n]);
+                                        }
+                                        g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                                        compare_stage("up", &cu, &g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?);
+                                        g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                        cpu_activation = cg.iter().zip(&cu).map(|(&a, &b)| crate::ops::silu(a) * b).collect();
+                                        eprintln!("r7_r4_type,{il},{expert},{:?},{:?},{},{}", gate.ty, up.ty, gate.scale, up.scale);
+                                    }
                                     g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                    if let Some((_, slot, _, _)) = shadow_here {
+                                        let pos = l.ge + slot * c.n_ff_exp;
+                                        compare_stage("activation", &cpu_activation, &g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?);
+                                    }
                                 }
                                 for &((s0, n0), lo, hi) in downs {
                                     let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
@@ -831,6 +907,11 @@ impl GpuModel<'_> {
                         for &e in cm {
                             let len = (off[e + 1] - off[e]) * ne;
                             g.put(&o[j..j + len], &pf.slab, l.ye + off[e] * ne)?;
+                            if stage_probe && j == 0 {
+                                let actual = g.get::<f32>(&pf.slab, l.ye + off[e] * ne, ne)?;
+                                let different = actual.iter().zip(&o[j..j + ne]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                                eprintln!("r7_r4_scatter,{il},{t},{e},{},{different}", off[e]);
+                            }
                             j += len;
                         }
                         debug_assert_eq!(j, o.len());
@@ -887,6 +968,18 @@ impl GpuModel<'_> {
                         let a0 = g.get::<f32>(&pf.slab, l.ge + slot * c.n_ff_exp, c.n_ff_exp)?;
                         let y0 = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
                         crate::venus_trace::capture(self.m, v, expert, slot, h0, a0, y0)?;
+                    }
+                    if let Some((expert, slot, token, hidden)) = shadow.as_ref() {
+                        let activation = g.get::<f32>(&pf.slab, l.ge + slot * c.n_ff_exp, c.n_ff_exp)?;
+                        let down = down_weight.as_ref().unwrap().expert(*expert, c.n_expert);
+                        let mut cpu_down = vec![0.0f32; ne];
+                        crate::cpu_moe::matvec(&down, &activation, &mut cpu_down);
+                        let gpu_down = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
+                        compare_stage("down_same_gpu_activation", &cpu_down, &gpu_down);
+                        let hs = vec![hidden.clone()];
+                        let cpu_pipeline = crate::cpu_moe::expert_rows(self.m, il, &hs, &[(0, *expert, 0.0)]);
+                        compare_stage("down_full_cpu_pipeline", &cpu_pipeline, &gpu_down);
+                        eprintln!("r7_r4_down_type,{il},{expert},{token},{:?},{}", down.ty, down.scale);
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, bf)?; }
