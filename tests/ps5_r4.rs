@@ -22,7 +22,8 @@ fn prefill_scheduler_parity() {
     // Repeat the same prompts to give auto matching shape buckets without cross-process profiles.
     let r10_prompt = std::env::var("PS5_R10_PROMPT").ok().map(|s| s.parse::<usize>().unwrap());
     if let Some(i) = r10_prompt { assert!(i < inputs.len()); }
-    for _ in 0..if r10_prompt.is_some() { 1 } else { 3 } {
+    let repetitions = if r10_prompt.is_some() { 1 } else { 3 };
+    for _ in 0..repetitions {
         for (i, ids) in inputs.iter().enumerate() {
             if r10_prompt.is_some_and(|p| p != i) { continue; }
             gm.reset().unwrap();
@@ -43,6 +44,10 @@ fn prefill_scheduler_parity() {
         "cpu" | "auto" => assert!(trials > 0 && cpu_rows > 0),
         _ => panic!("unknown R4 mode"),
     }
-    let data = serde_json::json!({"mode":mode,"stats":[trials,cpu_rows,mixed],"logits":logits});
+    let mut data = serde_json::json!({"mode":mode,"stats":[trials,cpu_rows,mixed],"logits":logits});
+    if let Some(i) = r10_prompt {
+        let layers: Vec<usize> = (0..model.cfg.n_layer).filter(|&l| model.cfg.is_moe_layer(l)).collect();
+        data["r10"] = serde_json::json!({"prompt":i,"tokens":&inputs[i],"chunk":32,"layers":layers});
+    }
     std::fs::write(output, serde_json::to_vec(&data).unwrap()).unwrap();
 }

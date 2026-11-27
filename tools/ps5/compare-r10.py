@@ -23,6 +23,7 @@ def read_routes(root, arm):
             require(all(len(set(ids[i:i+k]))==k for i in range(0,len(ids),k)),arm+' duplicate expert')
         require(all(a[k]==b[k] for k in ('layer','pos','tokens','top_k')),arm+' route coordinate mismatch')
         require(len(row['raw_cutoff_gaps'])==len(a['tokens']) and all(x is None or (math.isfinite(x) and x>=0) for x in row['raw_cutoff_gaps']),arm+' invalid gap')
+        require(r9.finite(row['hidden']),arm+' invalid pre-router hidden')
         if mode=='record': require(same(a,b),arm+' record modified route')
     return rows
 
@@ -43,12 +44,19 @@ def tape(root):
 
 def evaluate(root):
     baseline=logits(root,'gpu'); fixed,combine,stages=r9.read_arm(root,'shadow',1)
+    meta=json.loads((root/'gpu.json').read_text())['r10']; n=meta['chunk']; tokens=meta['tokens']; layer_ids=meta['layers']
+    require(n>0 and tokens and layer_ids==sorted(set(layer_ids)) and layer_ids,'invalid baseline shape')
     routes=read_routes(root,'shadow'); ref=[x['effective'] for x in routes]; lay=layers(root,'shadow')
     target=key(fixed[0]); result={'production_promotion':False,'scope':'prefill routes only; fixed-token decode routes naturally','arms':{}}
+    expected=[(pos,layer,tokens[pos:pos+n]) for pos in range(0,len(tokens),n) for layer in layer_ids]
+    require([(r['pos'],r['layer'],r['tokens']) for r in ref]==expected,'reference route coverage mismatch')
+    require(target in [key(r) for r in ref],'missing intervention route')
     require(len(lay)==len(ref) and [(pos,layer) for layer,pos,_ in lay]==[key(r) for r in ref],'reference trace coverage mismatch')
     require(all(bits(a,b) for a,b in zip(baseline,logits(root,'shadow'),strict=True)),'shadow changed GPU')
     stored=json.loads((root/'routes.json').read_text()); require(len(stored)==len(ref) and all(same(a,b) for a,b in zip(stored,ref,strict=True)),'tape does not match shadow')
+    target_combines={}
     for arm,mode in ARMS.items():
+        require(json.loads((root/(arm+'.json')).read_text())['r10']==meta,arm+' prompt metadata changed')
         f,c,s=r9.read_arm(root,arm,1,mode); require(r9.same_fixed(fixed[0],f[0]) and s==stages,arm+' changed intervention input')
         rr=read_routes(root,arm); ll=layers(root,arm); vv=logits(root,arm)
         require(len(rr)==len(ref)==len(ll),arm+' incomplete trace')
@@ -60,10 +68,15 @@ def evaluate(root):
             if key(a)<=target or control: require(same(a,n),arm+' natural route changed before intervention/control')
             k=a['top_k']; tokens=[i for i in range(len(a['tokens'])) if a['ids'][i*k:(i+1)*k]!=n['ids'][i*k:(i+1)*k]]
             if tokens: changed.append({'pos':a['pos'],'layer':a['layer'],'tokens':tokens,'baseline_raw_gaps':[routes[len(residual)]['raw_cutoff_gaps'][i] for i in tokens], 'candidate_raw_gaps':[b['raw_cutoff_gaps'][i] for i in tokens]})
-            d=max(abs(x-y) for x,y in zip(lc[2],la[2],strict=True)); residual.append({'pos':a['pos'],'layer':a['layer'],'max_abs':d})
-            if control: require(bits(lc[2],la[2]),arm+' changed layer output')
+            before=routes[len(residual)]['hidden']; after=b['hidden']
+            h=max(abs(x-y) for x,y in zip(before,after,strict=True))
+            d=max(abs(x-y) for x,y in zip(lc[2],la[2],strict=True)); residual.append({'pos':a['pos'],'layer':a['layer'],'pre_router_max_abs':h,'max_abs':d})
+            if control or key(a)<=target: require(bits(before,after),arm+' changed pre-router hidden')
+            if control or key(a)<target: require(bits(lc[2],la[2]),arm+' changed layer output')
         if control: require(all(bits(a,b) for a,b in zip(baseline,vv,strict=True)) and bits(combine[0][1],c[0][1]),arm+' changed GPU output')
+        target_combines[arm]=c[0][1]
         result['arms'][arm]={'natural_route_changes':changed,'layer_residuals':residual,'logits':[r9.r8.metrics(a,b) for a,b in zip(baseline,vv,strict=True)]}
+    require(bits(target_combines['contract'],target_combines['replay-contract']),'contract intervention differs under replay')
     return result
 
 if __name__=='__main__':

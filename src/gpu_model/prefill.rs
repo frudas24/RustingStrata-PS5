@@ -740,7 +740,10 @@ impl GpuModel<'_> {
                             anyhow::ensure!(ids == fixed.ids && crate::ps5_r10::same_bits(&written, &fixed.weights), "R10 route readback mismatch");
                             fixed
                         } else { natural.clone() };
-                        eprintln!("r10_route,{}", serde_json::json!({"mode":r10_mode,"natural":natural,"effective":effective,"raw_cutoff_gaps":gaps}));
+                        anyhow::ensure!(r9_token < t, "R10 tracked token outside chunk");
+                        let hidden = g.get::<f32>(&pf.slab, l.h + r9_token*ne, ne)?;
+                        anyhow::ensure!(hidden.iter().all(|v| v.is_finite()), "R10 nonfinite pre-router hidden");
+                        eprintln!("r10_route,{}", serde_json::json!({"mode":r10_mode,"natural":natural,"effective":effective,"raw_cutoff_gaps":gaps,"hidden":hidden}));
                     }
                     let cache = self.cache.as_mut().unwrap();
                     cache.record_prompt(il, &ids);

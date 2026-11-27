@@ -10,7 +10,7 @@ class Gates(unittest.TestCase):
         for arm in ('gpu',*r10.ARMS):
             mode=r10.ARMS.get(arm); control=mode!='contract'
             logits=[[1.,0.,-1.],[.5,-.25,1.]] if control else [[1.1,0.,-1.],[.5,-.25,1.]]
-            (self.root/(arm+'.json')).write_text(json.dumps({'mode':'gpu','stats':[10,0,0],'logits':logits}))
+            (self.root/(arm+'.json')).write_text(json.dumps({'mode':'gpu','stats':[10,0,0],'logits':logits,'r10':{'prompt':0,'tokens':[7],'chunk':1,'layers':[0,1]}}))
             if arm=='gpu': continue
             rows=['r9_fixed,'+json.dumps(self.fixed)]
             rows.extend(f'r7_r4_stage,0,1,1,0,0,{s},2,0,0,1' for s in r10.r9.STAGES)
@@ -21,7 +21,7 @@ class Gates(unittest.TestCase):
                 natural=copy.deepcopy(ref)
                 if not control and layer==1: natural.update(ids=[2,3],weights=[.6,.4])
                 replay=arm.startswith('replay-'); effective=ref if replay else natural
-                rows.append('r10_route,'+json.dumps({'mode':'replay' if replay else 'record','natural':natural,'effective':effective,'raw_cutoff_gaps':[.001]}))
+                rows.append('r10_route,'+json.dumps({'mode':'replay' if replay else 'record','natural':natural,'effective':effective,'raw_cutoff_gaps':[.001],'hidden':[1.,-0.0] if control or layer==0 else [1.00001,-0.0]}))
                 rows.append(f'r9_layer_out,{layer},0,'+json.dumps([.25,.5] if control else [.250001,.5]))
             (self.root/(arm+'.log')).write_text('\n'.join(rows)+'\n')
         r10.tape(self.root)
@@ -38,6 +38,12 @@ class Gates(unittest.TestCase):
     def test_replay_wrong_weight(self):
         self.edit('replay-contract',lambda s:s.replace('"effective": {"layer": 1, "pos": 0, "tokens": [7], "top_k": 2, "ids": [1, 2], "weights": [0.5, 0.5]', '"effective": {"layer": 1, "pos": 0, "tokens": [7], "top_k": 2, "ids": [1, 2], "weights": [0.6, 0.4]'))
         with self.assertRaisesRegex(ValueError,'effective route changed'):r10.evaluate(self.root)
+    def test_changed_target_combine(self):
+        self.edit('replay-contract',lambda s:s.replace('r9_combine,0,0,0,[0.25,0.5]','r9_combine,0,0,0,[0.3,0.5]'))
+        with self.assertRaisesRegex(ValueError,'intervention differs'):r10.evaluate(self.root)
+    def test_changed_target_hidden(self):
+        self.edit('contract',lambda s:s.replace('"hidden": [1.0, -0.0]}','"hidden": [1.1, -0.0]}',1))
+        with self.assertRaisesRegex(ValueError,'changed pre-router hidden'):r10.evaluate(self.root)
     def test_no_write(self):
         self.edit('sham',lambda s:s.replace('r9_write,sham','ignored'))
         with self.assertRaisesRegex(ValueError,'number of writes'):r10.evaluate(self.root)
