@@ -41,11 +41,13 @@ fn fingerprint() {
                 let second=cnt+4;
                 let tile=common::up(&g,&[w.ptr,2u64|((cnt as u64)<<32),w2.ptr,second as u64|(3u64<<32)]);
                 for indexed in [false,true] { for act in [0,1,2] {
-                    let y=common::up(&g,&vec![0.125f32;n*ys]);
+                    let mut initial=vec![0.125f32;n*ys];
+                    if act==0 { for r in (2..2+cnt).chain(second..second+3) { initial[r*ys..r*ys+rows].fill(f32::NAN); } }
+                    let y=common::up(&g,&initial);
                     g.gemm(ty,rows,cols,tile.addr(),2,x.addr(),xs,n,if indexed{ix.addr()}else{0},y.addr(),ys,act).unwrap();
                     let v=common::down::<f32>(&g,&y);
                     assert_eq!(v.len(),n*ys);
-                    let oracle=common::up(&g,&vec![0.125f32;n*ys]);
+                    let oracle=common::up(&g,&initial);
                     let xr=if indexed {x_indexed.addr()} else {x.addr()};
                     for (weight,start,len) in [(&w,2,cnt),(&w2,second,3)] {
                         g.gemm_dense(weight,len,xr+(4*start*xs) as u64,xs,oracle.addr()+(4*start*ys) as u64,ys,act).unwrap();

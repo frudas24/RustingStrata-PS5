@@ -1330,12 +1330,36 @@ impl Vk {
             if self.0.ps5 && r13_quant_trace() { eprintln!("r13_q8,hit,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name()); }
             return Ok(Some(q8.0.addr()));
         }
+        // A miss may replace the allocation or fail during recording. Never leave the
+        // old key advertising a buffer whose contents are no longer guaranteed.
+        q8.1 = None;
+        ensure!(!self.0.st().batch, "Q8 preparation requires an ordered dispatch outside batch");
+        ensure!(x != 0 && x % 4 == 0, "Q8 input must be a nonnull aligned F32 address");
+        if self.0.ps5 { self.0.st().find(x, gemm_matrix_bytes(n_x, x_stride, cols)?)?; }
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.0.addr();
         self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
         q8.1 = key;
         if self.0.ps5 && r13_quant_trace() { eprintln!("r13_q8,miss,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name()); }
         Ok(Some(xq))
+    }
+
+    // One marker per routed format and geometry, independent of the dense oracle.
+    // Existing R12/R13 markers identify the kernel; these prove both formats used it.
+    fn mark_routed_iq(&self, ty: GgmlType, kernel: &str) {
+        if !self.0.ps5 || !self.0.r6_trace { return; }
+        let (bit, name) = match (ty, kernel) {
+            (GgmlType::IQ3XXS, "gemmi_dp") => (22, "r13_int_base_iq3xxs"),
+            (GgmlType::IQ4XS, "gemmi_dp") => (23, "r13_int_base_iq4xs"),
+            (GgmlType::IQ3XXS, "gemmi_dp_ps5_iq32") => (24, "r13_int_32_iq3xxs"),
+            (GgmlType::IQ4XS, "gemmi_dp_ps5_iq32") => (25, "r13_int_32_iq4xs"),
+            (GgmlType::IQ3XXS, "gemmi_dp_ps5_iq64") => (26, "r13_int_64_iq3xxs"),
+            (GgmlType::IQ4XS, "gemmi_dp_ps5_iq64") => (27, "r13_int_64_iq4xs"),
+            (GgmlType::IQ3XXS, "gemm_f_dp") => (28, "r13_int_f16_iq3xxs"),
+            (GgmlType::IQ4XS, "gemm_f_dp") => (29, "r13_int_f16_iq4xs"),
+            _ => return,
+        };
+        self.0.r6_mark(1u32 << bit, name);
     }
 
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
@@ -1354,6 +1378,23 @@ impl Vk {
         ensure!(n_x.checked_mul(x_stride).is_some_and(|v| v <= u32::MAX as usize), "GEMM input offsets exceed shader uint range");
         // Routed output rows are indexed by the tile list, not n_x. Only dense output is bounded by nd here.
         ensure!(tiles != 0 || nd.checked_mul(y_stride).is_some_and(|v| v <= u32::MAX as usize), "GEMM output offsets exceed shader uint range");
+        ensure!(x != 0 && x % 4 == 0 && y != 0 && y % 4 == 0 && xrow % 4 == 0 && tiles % 8 == 0,
+            "GEMM invalid buffer-reference alignment");
+        ensure!(tiles != 0 || (wd != 0 && nd == n_x && n_tiles == nd.div_ceil(128)), "GEMM invalid dense geometry");
+        // Validate actual device allocations on PS5. The tile list is device data:
+        // individual routed row ranges remain the planner's responsibility.
+        if self.0.ps5 {
+            let st = self.0.st();
+            st.find(x, gemm_matrix_bytes(n_x, x_stride, cols)?)?;
+            st.find(y, gemm_matrix_bytes(if tiles == 0 { nd } else { 1 }, y_stride, rows)?)?;
+            if tiles != 0 {
+                ensure!(n_tiles <= (u32::MAX / 2) as usize, "GEMM tile indexing exceeds shader uint range");
+                st.find(tiles, n_tiles.checked_mul(16).context("GEMM tile list overflow")?)?;
+                if xrow != 0 { st.find(xrow, 4)?; }
+            } else {
+                st.find(wd, rows.checked_mul(ty.row_bytes(cols as u64)).context("GEMM weight span overflow")?)?;
+            }
+        }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
@@ -1386,11 +1427,14 @@ impl Vk {
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if f {
             if !same { q8.1 = None; }
+            gemm_f_input_alignment(x, x_stride)?;
             let args: [&dyn Arg; 12] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
             if tiles != 0 && self.r11_iq32(ty) {
                 return self.run(self.r13_gemm_kernel(ty, "gemm_f_dp_ps5_iq32"), &spec, grid, &args);
             }
-            self.run(if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" }, &spec, grid, &args)?;
+            let kernel = if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" };
+            self.run(kernel, &spec, grid, &args)?;
+            if tiles != 0 { self.mark_routed_iq(ty, kernel); }
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
@@ -1422,12 +1466,17 @@ impl Vk {
             if tile != 0 {
                 // Original routed tile list is bounded to 128 positions. z selects
                 // a disjoint subtile; each output still reduces the entire K dimension.
-                return self.run(self.r13_gemm_kernel(ty, if tile == 32 { "gemmi_dp_ps5_iq32" } else { "gemmi_dp_ps5_iq64" }),
-                    &spec, [grid[0], grid[1], crate::backend::GEMM_BM / tile], &args);
+                let kernel = self.r13_gemm_kernel(ty, if tile == 32 { "gemmi_dp_ps5_iq32" } else { "gemmi_dp_ps5_iq64" });
+                self.run(kernel, &spec, [grid[0], grid[1], crate::backend::GEMM_BM / tile], &args)?;
+                self.mark_routed_iq(ty, kernel);
+                return Ok(());
             }
         }
         if tiles != 0 && self.0.coop_i8 == 0 {
-            return self.run(self.r13_gemm_kernel(ty, "gemmi_dp"), &spec, grid, &args);
+            let kernel = self.r13_gemm_kernel(ty, "gemmi_dp");
+            self.run(kernel, &spec, grid, &args)?;
+            self.mark_routed_iq(ty, kernel);
+            return Ok(());
         }
         if self.0.r2.tiled64(self.0.coop_i8, tiles, nd) {
             // SM=2 uses two 16-column fragments per logical wave and 64 dense positions.
@@ -1440,6 +1489,38 @@ impl Vk {
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
         if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
         Ok(())
+    }
+}
+
+// Last row needs only `width` elements, not trailing padding.
+fn gemm_matrix_bytes(n: usize, stride: usize, width: usize) -> anyhow::Result<usize> {
+    ensure!(n > 0 && width > 0 && stride >= width, "invalid GEMM matrix span");
+    (n - 1).checked_mul(stride).and_then(|v| v.checked_add(width)).and_then(|v| v.checked_mul(4))
+        .context("GEMM matrix span overflow")
+}
+
+#[test]
+fn r13_audit_matrix_span() {
+    assert_eq!(gemm_matrix_bytes(2, 260, 256).unwrap(), 2064);
+    assert_eq!(gemm_matrix_bytes(1, usize::MAX, 16).unwrap(), 64);
+    for (n, s, w) in [(0, 256, 256), (1, 256, 0), (2, 255, 256), (usize::MAX, 256, 256), (2, usize::MAX, 1)] {
+        assert!(gemm_matrix_bytes(n, s, w).is_err());
+    }
+}
+
+// gemm_f uses V4 references and integer division of float offsets by four.
+// A non-multiple-of-four stride otherwise silently selects the wrong input row.
+fn gemm_f_input_alignment(x: u64, stride: usize) -> anyhow::Result<()> {
+    ensure!(x != 0 && x % 16 == 0 && stride % 4 == 0, "FP16 GEMM requires 16-byte input address and a stride divisible by four");
+    Ok(())
+}
+
+#[test]
+fn r13_audit_f16_alignment() {
+    assert!(gemm_f_input_alignment(0x1000, 2048).is_ok());
+    assert!(gemm_f_input_alignment(0x1010, 260).is_ok());
+    for (x, stride) in [(0, 256), (0x1004, 256), (0x1000, 257), (0x1000, 258), (0x1000, 259)] {
+        assert!(gemm_f_input_alignment(x, stride).is_err());
     }
 }
 

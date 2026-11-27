@@ -30,10 +30,12 @@ fn fingerprint(){
             // Nonzero base, exactly one tile; use same tile list ABI as routed prefill.
             let tile=common::up(&g,&[w.ptr,2u64|((cnt as u64)<<32)]);
             for indexed in [false,true] {for act in [0,1,2] {
-                let y=common::up(&g,&vec![0.125f32;n*ys]);
+                let mut initial=vec![0.125f32;n*ys];
+                if act==0 { for r in 2..2+cnt { initial[r*ys..r*ys+rows].fill(f32::NAN); } }
+                let y=common::up(&g,&initial);
                 g.gemm(ty,rows,cols,tile.addr(),1,x.addr(),xs,n,if indexed{ix.addr()}else{0},y.addr(),ys,act).unwrap();
                 let v=common::down::<f32>(&g,&y);
-                let oracle=common::up(&g,&vec![0.125f32;n*ys]);
+                let oracle=common::up(&g,&initial);
                 let xr=if indexed {x_indexed.addr()} else {x.addr()};
                 g.gemm_dense(&w,cnt,xr+(4*2*xs) as u64,xs,oracle.addr()+(4*2*ys) as u64,ys,act).unwrap();
                 let expected=common::down::<f32>(&g,&oracle);
