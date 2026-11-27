@@ -78,6 +78,8 @@ def knobs_ok(k):
     for key, val in k.items():
         require(type(val) is type(BASE[key]) and val in SPACE[key], f'invalid knob {key}: {val!r}')
     require(not k['zero'] or k['gtt'], 'zero-copy requires GTT')
+    require(k['sched']=='off', 'R7: hybrid R4 failed physical parity; excluded from deployable profiles')
+    require(k['zero']==0, 'R7: file-backed R3 import rejected by physical RADV; use separate test-r3.sh')
     return k
 
 def settings_ok(s):
@@ -248,7 +250,9 @@ def search(session,budget,experimental):
     baseline=BASE.copy(); best=baseline.copy(); best_run=session.measure(best); tested=0; history=[]
     # Coordinate descent; each candidate measured against current incumbent and original baseline output.
     baseline_run=best_run
-    order=('gemv','small','attn','threads','chunk','gtt','direct')+ (('zero','sched') if experimental else ())
+    # Retain CLI compatibility; physical research failed both R3 and R4 deployment gates.
+    if experimental: print('R7: R3/R4 remain isolated research; not searched or promoted', file=sys.stderr, flush=True)
+    order=('gemv','small','attn','threads','chunk','gtt','direct')
     for key in order:
         original=best[key]
         for value in SPACE[key]:
@@ -276,7 +280,7 @@ def cli():
     parser=argparse.ArgumentParser(description=__doc__); sub=parser.add_subparsers(dest='cmd',required=True)
     def common(p):
         p.add_argument('--model',required=True,type=Path); p.add_argument('--bin',type=Path,default=DEFAULT_BIN); p.add_argument('--profile',required=True,type=Path)
-    t=sub.add_parser('tune'); common(t); t.add_argument('--out',required=True,type=Path); t.add_argument('--ctx',type=int,default=4096); t.add_argument('--kv',choices=('f16','q8','q4','q2'),default='q8'); t.add_argument('--pp',default='32,64,512,2048'); t.add_argument('--tg',type=int,default=32); t.add_argument('--reps',type=int,default=3); t.add_argument('--timeout',type=int,default=900); t.add_argument('--min-ram-mb',type=int,default=512); t.add_argument('--budget',type=int,default=24); t.add_argument('--experimental',action='store_true'); t.add_argument('--dry-run',action='store_true')
+    t=sub.add_parser('tune'); common(t); t.add_argument('--out',required=True,type=Path); t.add_argument('--ctx',type=int,default=4096); t.add_argument('--kv',choices=('f16','q8','q4','q2'),default='q8'); t.add_argument('--pp',default='32,64,512,2048'); t.add_argument('--tg',type=int,default=32); t.add_argument('--reps',type=int,default=3); t.add_argument('--timeout',type=int,default=900); t.add_argument('--min-ram-mb',type=int,default=512); t.add_argument('--budget',type=int,default=24); t.add_argument('--experimental',action='store_true',help='Compatibility flag; R7 quarantines R3/R4 from deployable profiles'); t.add_argument('--dry-run',action='store_true')
     v=sub.add_parser('verify'); common(v); v.add_argument('--out',required=True,type=Path)
     c=sub.add_parser('compare-pgo'); common(c); c.add_argument('--out',required=True,type=Path); c.add_argument('--candidate-bin',required=True,type=Path)
     pg=sub.add_parser('train-pgo'); common(pg); pg.add_argument('--out',required=True,type=Path); pg.add_argument('--instrumented-bin',required=True,type=Path); pg.add_argument('--raw-dir',required=True,type=Path)

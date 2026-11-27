@@ -52,6 +52,9 @@ impl Policy {
             "off" => return Ok(None), "auto" => Mode::Auto, "gpu" => Mode::Gpu, "half" => Mode::Half, "cpu" => Mode::Cpu,
             x => anyhow::bail!("STRATA_PS5_SCHED must be off, auto, gpu, half or cpu; got {x}"),
         };
+        // R6 physical 35B gate: CPU-bearing arms changed logits and argmax. GPU-only is safe to measure.
+        anyhow::ensure!(mode == Mode::Gpu || std::env::var("STRATA_PS5_R4_RESEARCH").is_ok_and(|v| v == "1"),
+            "PS5 R7: hybrid prefill failed the physical R4 parity gate; use off/gpu (research only: STRATA_PS5_R4_RESEARCH=1)");
         fn number(name: &str, default: usize, max: usize) -> anyhow::Result<usize> {
             let n = match std::env::var(name) { Ok(s) => s.parse::<usize>()?, Err(std::env::VarError::NotPresent) => default, Err(e) => return Err(e.into()) };
             anyhow::ensure!(n > 0 && n <= max, "{name} must be in 1..={max}"); Ok(n)

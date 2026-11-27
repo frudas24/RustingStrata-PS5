@@ -71,6 +71,11 @@ class Tests(unittest.TestCase):
         finally:
             if old is None:os.environ.pop('STRATA_EXPERT_MB')
             else:os.environ['STRATA_EXPERT_MB']=old
+    def test_r7_quarantine(self):
+        for update in ({'sched':'half'}, {'sched':'auto'}, {'zero':1}):
+            with self.subTest(update=update):
+                with self.assertRaises(r6.Reject): r6.knobs_ok({**r6.BASE,**update})
+        self.assertEqual(r6.knobs_ok(r6.BASE),r6.BASE)
     def test_shards_and_atomic(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); self.assertEqual([x.name for x in r6.model_files(root/'a-00001-of-00002.gguf')],['a-00001-of-00002.gguf','a-00002-of-00002.gguf'])
