@@ -23,7 +23,7 @@ for flag in 0 1; do
   test -s "$out/gpu-$flag.bin"
   grep -Fq 'R11 IQ GPU parity: 648 cases' "$out/gpu-$flag.log"
 done
-! grep -Fq 'PS5 R6 exercised: gemm_f_dp_ps5_iq32' "$out/gpu-0.log"
+if grep -Fqx 'PS5 R6 exercised: gemm_f_dp_ps5_iq32' "$out/gpu-0.log"; then echo "candidate dispatched in control" >&2; exit 1; fi
 grep -Fq 'PS5 R6 exercised: gemm_f_dp_ps5_iq32' "$out/gpu-1.log"
 cmp "$out/gpu-0.bin" "$out/gpu-1.bin"
 sha256sum "$out"/gpu-*.bin > "$out/gpu.sha256"

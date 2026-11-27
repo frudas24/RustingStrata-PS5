@@ -40,14 +40,33 @@ def compare(ref, other):
     for key,(tokens,width,a) in ref.items():
         t,w,b=other[key]
         require((tokens,width)==(t,w),'boundary shape changed')
-        changed=0; maximum=0.; token=None
+        changed=0; maximum=0.; token=None; changed_tokens=set()
         for i,(x,y) in enumerate(zip(a,b,strict=True)):
             if x!=y:
-                changed+=1
+                changed+=1; changed_tokens.add(i//width)
+                if token is None: token=i//width
                 d=abs(struct.unpack('<f',struct.pack('<I',x))[0]-struct.unpack('<f',struct.pack('<I',y))[0])
                 if d>maximum: maximum=d;token=i//width
-        out.append(dict(pos=key[0],layer=key[1],stage=key[2],changed=changed,max_abs=maximum,worst_token=token))
+        out.append(dict(pos=key[0],layer=key[1],stage=key[2],changed=changed,changed_tokens=sorted(changed_tokens),max_abs=maximum,worst_token=token))
     return out
+
+
+def bind_to_existing(r10, root, arm, rows, target):
+    # Tie each full-chunk capture to the independently logged R9/R10 tracked row.
+    tok=target['token']
+    def fpbits(values):
+        return [struct.unpack('<I',struct.pack('<f',v))[0] for v in values]
+    def check(key,values):
+        if key not in rows: return
+        t,w,raw=rows[key]
+        require(tok<t and len(values)==w and raw[tok*w:(tok+1)*w]==fpbits(values),
+                arm+' boundary disagrees with independent tracked row '+str(key))
+    for route in r10.read_routes(root,arm):
+        r=route['effective'];check((r['pos'],r['layer'],'ffn_norm'),route['hidden'])
+    for layer,pos,vec in r10.layers(root,arm):
+        check((pos,layer,'layer_output'),vec)
+    _,combine,_=r10.r9.read_arm(root,arm,1,r10.ARMS[arm]); coord,vec=combine[0]
+    check((coord[1],coord[0],'layer_output'),vec)
 
 
 def evaluate(root):
@@ -66,8 +85,11 @@ def evaluate(root):
     end=min(layer+8,max(meta['layers']))
     require(keys==[(pos,l,s) for l in range(layer,end+1) for s in STAGES],'incomplete reference stage coverage')
     require(all((t,w)==(target['chunk'],width) for t,w,_ in ref.values()),'trace prompt shape differs')
+    bind_to_existing(r10,root,'shadow',ref,target)
     for arm in CONTROLS:
-        require(not any(r['changed'] for r in compare(ref,read(root/f'{arm}.log'))),arm+' changed raw boundary bits')
+        captured=read(root/f'{arm}.log')
+        require(not any(r['changed'] for r in compare(ref,captured)),arm+' changed raw boundary bits')
+        bind_to_existing(r10,root,arm,captured,target)
     result={}
     initial={}
     for arm in CANDIDATES:
@@ -78,6 +100,7 @@ def evaluate(root):
         a,b=ref[key][2],captured[key][2]
         start=target['token']*width;end=start+width
         require(a[:start]==b[:start] and a[end:]==b[end:],arm+' changed an unselected token at intervention')
+        bind_to_existing(r10,root,arm,captured,target)
         initial[arm]=b
         result[arm]=rows
     require(initial['contract']==initial['replay-contract'],'initial full chunk differs under replay')

@@ -14,7 +14,9 @@ def finite(a):
     return isinstance(a,list) and bool(a) and all(type(v) in (int,float) and math.isfinite(v) for v in a)
 def read_arm(root, arm, expected=6, write_mode=None):
     mode=arm if write_mode is None else write_mode
-    raw=(root/(arm+'.log')).read_text().splitlines()
+    # R12 boundary lines can be megabytes each; R9 needs none of them.
+    with (root/(arm+'.log')).open() as log:
+        raw=[line.rstrip('\n') for line in log if line.startswith(('r9_fixed,','r9_combine,','r9_write,','r7_r4_stage,'))]
     fixed=[json.loads(x.split(',',1)[1]) for x in raw if x.startswith('r9_fixed,')]
     combine=[(tuple(map(int,p[1:4])),json.loads(p[4])) for x in raw if x.startswith('r9_combine,') for p in [x.split(',',4)]]
     writes=[x.split(',')[1:] for x in raw if x.startswith('r9_write,')]

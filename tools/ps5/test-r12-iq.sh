@@ -13,11 +13,13 @@ cargo test "${args[@]}" --test r12_iq shared_bound -- --exact --nocapture 2>&1 |
 grep -Fq 'R12 LDS type=18' "$out/lds.log"; grep -Fq 'R12 LDS type=23' "$out/lds.log"
 for flag in 0 32 64; do
   STRATA_PS5_R12_IQ_INT_TILE=$flag PS5_R12_GPU_FILE="$out/gpu-$flag.bin" cargo test "${args[@]}" --test r12_iq fingerprint -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$out/gpu-$flag.log"
-  test -s "$out/gpu-$flag.bin"
+  [[ $(stat -c %s "$out/gpu-$flag.bin") == 37981440 ]]
   grep -Fq 'R12 IQ integer GPU parity: 1296 cases' "$out/gpu-$flag.log"
   for tile in 32 64; do
-    if [[ $flag == "$tile" ]]; then grep -Fq "PS5 R6 exercised: gemmi_dp_ps5_iq$tile" "$out/gpu-$flag.log"
-    else ! grep -Fq "PS5 R6 exercised: gemmi_dp_ps5_iq$tile" "$out/gpu-$flag.log"; fi
+    if [[ $flag == "$tile" ]]; then grep -Fqx "PS5 R6 exercised: gemmi_dp_ps5_iq$tile" "$out/gpu-$flag.log"
+    elif grep -Fqx "PS5 R6 exercised: gemmi_dp_ps5_iq$tile" "$out/gpu-$flag.log"; then
+      echo "unexpected IQ tile $tile dispatched in arm $flag" >&2; exit 1
+    fi
   done
   cmp "$out/gpu-0.bin" "$out/gpu-$flag.bin"
 done

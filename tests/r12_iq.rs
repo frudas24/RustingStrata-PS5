@@ -29,8 +29,13 @@ fn fingerprint() {
             let data2:Vec<u8>=raw.iter().copied().cycle().skip(ty.block_bytes()).take(rb*rows).collect();
             let w2=g.upload(&Tensor{ty,rows,cols,data:&data2,scale:1.}).unwrap();
             let xs=cols+32; let ys=rows+3; let n=140usize;
-            let x=common::up(&g,&(0..n*xs).map(|i|((i*37%251) as f32-125.)/127.).collect::<Vec<_>>());
-            let ix=common::up(&g,&(0..n).map(|i|((i*17+3)%n) as i32).collect::<Vec<_>>());
+            let host_x=(0..n*xs).map(|i|((i*37%251) as f32-125.)/127.).collect::<Vec<_>>();
+            let order=(0..n).map(|i|((i*17+3)%n) as i32).collect::<Vec<_>>();
+            let x=common::up(&g,&host_x);
+            let ix=common::up(&g,&order);
+            // Independent dense oracle with the same input rows gathered on the host.
+            let gathered: Vec<f32> = order.iter().flat_map(|&i| host_x[i as usize*xs..(i as usize+1)*xs].iter().copied()).collect();
+            let x_indexed=common::up(&g,&gathered);
             for cnt in [1usize,15,16,17,31,32,33,63,64,65,127,128] {
                 // Two non-overlapping tiles, different experts and a gap between outputs.
                 let second=cnt+4;
@@ -40,6 +45,15 @@ fn fingerprint() {
                     g.gemm(ty,rows,cols,tile.addr(),2,x.addr(),xs,n,if indexed{ix.addr()}else{0},y.addr(),ys,act).unwrap();
                     let v=common::down::<f32>(&g,&y);
                     assert_eq!(v.len(),n*ys);
+                    let oracle=common::up(&g,&vec![0.125f32;n*ys]);
+                    let xr=if indexed {x_indexed.addr()} else {x.addr()};
+                    for (weight,start,len) in [(&w,2,cnt),(&w2,second,3)] {
+                        g.gemm_dense(weight,len,xr+(4*start*xs) as u64,xs,oracle.addr()+(4*start*ys) as u64,ys,act).unwrap();
+                    }
+                    let expected=common::down::<f32>(&g,&oracle);
+                    assert_eq!(expected.len(),v.len());
+                    assert!(v.iter().zip(&expected).all(|(a,b)| a.to_bits()==b.to_bits()),
+                        "routed vs dense: {ty:?} {rows}x{cols} cnt={cnt} indexed={indexed} act={act}");
                     for (r,row) in v.chunks_exact(ys).enumerate() {
                         assert!(row.iter().all(|v|v.is_finite()));
                         assert!(row[rows..].iter().all(|&v|v==0.125));

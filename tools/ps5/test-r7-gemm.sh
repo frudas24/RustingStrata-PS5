@@ -15,7 +15,7 @@ for tile in 0 64; do
     cargo test "${args[@]}" fingerprint -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$out/$tile.log"
   test -s "$out/$tile.bin"
 done
-! grep -Fq 'PS5 R6 exercised: gemmi_dp_ps5_64' "$out/0.log"
+if grep -Fqx 'PS5 R6 exercised: gemmi_dp_ps5_64' "$out/0.log"; then echo "candidate dispatched in control" >&2; exit 1; fi
 grep -Fq 'PS5 R6 exercised: gemmi_dp_ps5_64' "$out/64.log"
 cmp "$out/0.bin" "$out/64.bin"
 sha256sum "$out/0.bin" "$out/64.bin" > "$out/sha256.txt"
