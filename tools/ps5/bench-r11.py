@@ -30,7 +30,7 @@ def compare(runs, mark):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--candidate', choices=('iq32','gemv1','gemv2','gemv4','gemv8','down1','down2','down4','down8'), required=True)
+    p.add_argument('--candidate', choices=('iq32','gemv1','gemv2','gemv4','gemv8','down1','down2','down4','down8','iqint32','iqint64'), required=True)
     p.add_argument('--profile-only', action='store_true', help='separate timestamps; never score or promote')
     p.add_argument('--model', required=True, type=Path)
     p.add_argument('--bin', type=Path, default=r6.DEFAULT_BIN)
@@ -50,7 +50,9 @@ def main():
     session = r6.Session(a.model, a.bin, s, a.out)
     ident = r6.identity(a.model, a.bin)
     r6.atomic_json(session.out/'identity.json', ident)
-    if a.candidate == 'iq32': key, value, mark = 'STRATA_PS5_R11_IQ32', '1', 'gemm_f_dp_ps5_iq32'
+    int_tile = a.candidate in ('iqint32','iqint64')
+    if int_tile: key, value, mark = 'STRATA_PS5_R12_IQ_INT_TILE', a.candidate[-2:], 'gemmi_dp_ps5_iq'+a.candidate[-2:]
+    elif a.candidate == 'iq32': key, value, mark = 'STRATA_PS5_R11_IQ32', '1', 'gemm_f_dp_ps5_iq32'
     elif a.candidate.startswith('gemv'): key, value, mark = 'STRATA_PS5_R11_GEMV_RPW', a.candidate[-1], 'r11_gemv_rpw'
     else: key, value, mark = 'STRATA_PS5_R11_DOWN_RPW', a.candidate[-1], 'r11_down_rpw'
     reports = {}
@@ -62,16 +64,20 @@ def main():
                 log, result = (session.out/(stem+x) for x in ('.log','.json'))
                 env = r6.child_env(k)
                 env[key] = value if tile else '0'
+                if int_tile: env['STRATA_PS5_R11_IQ32']='1'
                 if a.profile_only: env.update(STRATA_VK_PROF='1', STRATA_PS5_R11_PROFILE='1')
                 cmd = [str(session.binary),'bench',*r6.engine_args(a.model,k,s),'--pp',a.pp,'--tg',str(s['tg']),'--reps',str(s['reps']),'--json-out',str(result)]
                 if task == 'holdout': cmd += ['--prompt-file',str(session.holdout)]
-                r6.atomic_json(session.out/(stem+'-request.json'), dict(cmd=cmd,knobs=k,candidate=a.candidate,enabled=bool(tile),profile_only=a.profile_only))
+                r6.atomic_json(session.out/(stem+'-request.json'), dict(cmd=cmd,knobs=k,candidate=a.candidate,enabled=bool(tile),profile_only=a.profile_only, base_iq32=int_tile, flags={key:env[key], **({'STRATA_PS5_R11_IQ32':'1'} if int_tile else {})}))
                 print(stem, flush=True)
                 memory = r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
                 rates, signatures = r6.checked_rates(json.loads(result.read_text()),k,s,a.model)
                 r6.match_signatures(signatures,signatures)
                 evidence = r6.evidence(log.read_text(errors='replace'),k)
                 r6.require((mark in evidence['marks'])==bool(tile), 'candidate dispatch absent or leaked')
+                if int_tile:
+                    r6.require('gemm_f_dp_ps5_iq32' in evidence['marks'], 'validated IQ32 baseline absent')
+                    r6.require(not (set(evidence['marks']) & ({'gemmi_dp_ps5_iq32','gemmi_dp_ps5_iq64'} - {mark})), 'other R12 tile leaked')
                 run = dict(rates=rates,signatures=signatures,evidence=evidence,memory=memory)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run)
                 runs.append(run)

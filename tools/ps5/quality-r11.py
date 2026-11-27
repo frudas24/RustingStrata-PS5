@@ -31,12 +31,14 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',required=True,type=pathlib.Path);p.add_argument('--bin',type=pathlib.Path,default=r6.DEFAULT_BIN)
     p.add_argument('--corpus',required=True,type=pathlib.Path);p.add_argument('--out',required=True,type=pathlib.Path)
-    p.add_argument('--candidate',choices=('iq32','gemv1','gemv2','gemv4','gemv8','down1','down2','down4','down8'),required=True)
+    p.add_argument('--candidate',choices=('iq32','gemv1','gemv2','gemv4','gemv8','down1','down2','down4','down8','iqint32','iqint64'),required=True)
     p.add_argument('--ctx',type=int,default=8192);p.add_argument('--ctx-len',type=int,default=512);p.add_argument('--chunks',type=int,default=4)
     p.add_argument('--threads',type=int,choices=(4,6,8,16),default=6);p.add_argument('--chunk',type=int,choices=(128,256,512,1024),default=512)
     p.add_argument('--kv',choices=('f16','q8','q4','q2'),default='q8');p.add_argument('--timeout',type=int,default=5400)
     a=p.parse_args();a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False)
-    if a.candidate=='iq32':key,val,mark='STRATA_PS5_R11_IQ32','1','gemm_f_dp_ps5_iq32'
+    int_tile=a.candidate in ('iqint32','iqint64')
+    if int_tile:key,val,mark='STRATA_PS5_R12_IQ_INT_TILE',a.candidate[-2:],'gemmi_dp_ps5_iq'+a.candidate[-2:]
+    elif a.candidate=='iq32':key,val,mark='STRATA_PS5_R11_IQ32','1','gemm_f_dp_ps5_iq32'
     elif a.candidate.startswith('gemv'):key,val,mark='STRATA_PS5_R11_GEMV_RPW',a.candidate[-1],'r11_gemv_rpw'
     else:key,val,mark='STRATA_PS5_R11_DOWN_RPW',a.candidate[-1],'r11_down_rpw'
     try:
@@ -47,12 +49,16 @@ def main():
         hashes=[]
         for flag in [0,1]:
             env=r6.child_env(k);env[key]=val if flag else '0'
+            if int_tile:env['STRATA_PS5_R11_IQ32']='1'
             dump=a.out/f'{flag}.bin';log=a.out/f'{flag}.log'
             cmd=[str(a.bin.resolve()),'perplexity',*r6.engine_args(a.model,k,s),'--file',str(a.corpus.resolve()),'--ctx-len',str(a.ctx_len),'--chunks',str(a.chunks),'--kld-base',str(dump)]
-            r6.atomic_json(a.out/f'{flag}-request.json',dict(cmd=cmd,candidate=a.candidate,enabled=bool(flag)))
+            r6.atomic_json(a.out/f'{flag}-request.json',dict(cmd=cmd,candidate=a.candidate,enabled=bool(flag),base_iq32=int_tile,flags={key:env[key], **({'STRATA_PS5_R11_IQ32':'1'} if int_tile else {})}))
             r6.run_child(cmd,env,log,a.timeout,1024)
             evidence=r6.evidence(log.read_text(errors='replace'),k)
             r6.require((mark in evidence['marks'])==bool(flag),'missing dispatch or leaked into control')
+            if int_tile:
+                r6.require('gemm_f_dp_ps5_iq32' in evidence['marks'], 'validated IQ32 baseline absent')
+                r6.require(not (set(evidence['marks']) & ({'gemmi_dp_ps5_iq32','gemmi_dp_ps5_iq64'} - {mark})), 'other R12 tile leaked')
             check_dump(dump,log.read_text(errors='replace'),a.ctx_len,a.chunks)
             hashes.append(r6.digest(dump))
         r6.require(ident==r6.identity(a.model,a.bin) and corpus==r6.file_id(a.corpus),'identity changed')
