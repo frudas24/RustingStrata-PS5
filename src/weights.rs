@@ -44,6 +44,17 @@ impl<'a> Tensor<'a> {
     /// out[t][r] = row_r · x[t] for all rows and tokens. `x` is `n_tokens * cols`, `out` is `n_tokens * rows`.
     pub fn matmul(&self, x: &[f32], n_tokens: usize, out: &mut [f32]) {
         assert_eq!((x.len(), out.len()), (n_tokens * self.cols, n_tokens * self.rows));
+        if std::env::var("STRATA_PS5_VENUS_F16").as_deref() == Ok("1")
+            && std::env::var_os("STRATA_SCALAR").is_none()
+            && crate::venus_f16::try_matmul(self, x, n_tokens, out) {
+            if std::env::var("STRATA_PS5_VENUS_LOG").as_deref() == Ok("1") {
+                static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("PS5 Venus exercised: f16_3x4 rows={} cols={} tokens={n_tokens}", self.rows, self.cols);
+                }
+            }
+            return;
+        }
         // Row-outer: each weight row is decoded once, whatever n_tokens is. Blocks of rows that fit the L2 cache stay
         // there while every token passes over them.
         let block = (1 << 16) / self.cols.max(1) + 1;
