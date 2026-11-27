@@ -405,7 +405,7 @@ impl GpuModel<'_> {
         let r9_mode = std::env::var("STRATA_PS5_R9_MODE").unwrap_or_default();
         let r9_enabled = !r9_mode.is_empty();
         let (r9_layer, r9_pos, r9_token, r9_rank) = if r9_enabled {
-            anyhow::ensure!(matches!(r9_mode.as_str(), "shadow" | "legacy" | "contract") && r4_stage_probe
+            anyhow::ensure!(matches!(r9_mode.as_str(), "shadow" | "legacy" | "contract" | "sham") && r4_stage_probe
                 && std::env::var("STRATA_PS5_SCHED").as_deref() == Ok("gpu")
                 && std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() != Ok("1")
                 && c.hc_n == 0 && c.mhc_streams == 0 && self.mtp.is_none(),
@@ -419,6 +419,24 @@ impl GpuModel<'_> {
                 "R9 target must be a routed layer and valid expert rank");
             target
         } else { (0, 0, 0, 0) };
+        // R10 records all routes and optionally replays both IDs and mixture weights. It deliberately
+        // covers prefill only; the following fixed-token decode uses its natural router.
+        let r10_mode = std::env::var("STRATA_PS5_R10_ROUTES").unwrap_or_default();
+        let mut r10_tape = std::collections::BTreeMap::new();
+        if !r10_mode.is_empty() {
+            anyhow::ensure!(r9_enabled && matches!(r10_mode.as_str(), "record" | "replay")
+                && rows.is_none() && input.is_none() && self.first == 0 && self.layers.len() == c.n_layer,
+                "R10 requires single-device ordinary R9 prefill");
+            if r10_mode == "replay" {
+                let path = std::env::var("STRATA_PS5_R10_ROUTE_FILE")?;
+                let routes: Vec<crate::ps5_r10::Route> = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
+                for route in routes.into_iter().filter(|r| r.pos == self.pos) {
+                    let layer = route.layer;
+                    anyhow::ensure!(r10_tape.insert(layer, route).is_none(), "R10 duplicate route coordinate");
+                }
+                anyhow::ensure!(!r10_tape.is_empty(), "R10 missing route chunk");
+            }
+        }
         let r8_contract = std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1");
         if r8_contract {
             anyhow::ensure!(self.ps5_r4.is_some() && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1")
@@ -691,12 +709,38 @@ impl GpuModel<'_> {
                     };
                     probe(&mut tr, "router", &pf.slab, at(l.rl), c.n_expert, t)?;
                     probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
-                    let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
+                    let mut ids = g.get::<i32>(&pf.ints, 0, t * k)?;
                     // Ids outside 0..n_expert mean the router ran on corrupt logits (issue #25: one prefill past ~128k
                     // tokens). Fail here with the place, not in the index math below. ponytail: the root cause is still open.
                     if let Some(&bad) = ids.iter().find(|&&e| e < 0 || e as usize >= c.n_expert) {
                         anyhow::bail!("prefill: router gave expert id {bad} at layer {il}, chunk of {t} tokens from position {}; \
                             lower --chunk (for example --chunk 1024) or --ctx, and try STRATA_NAN_TRACE=1 for a non-finite hidden state", self.pos);
+                    }
+                    if !r10_mode.is_empty() {
+                        let natural = crate::ps5_r10::Route { layer: il, pos: self.pos, tokens: toks.to_vec(), top_k: k,
+                            ids: ids.clone(), weights: g.get::<f32>(&pf.slab, l.wts, t*k)? };
+                        natural.validate(il, self.pos, toks, k, c.n_expert)?;
+                        // Raw logit gap at the selection boundary, not the shader's rounded probability gap.
+                        let scores = g.get::<f32>(&pf.slab, l.rl, t*c.n_expert)?;
+                        anyhow::ensure!(scores.iter().all(|v| v.is_finite()), "R10 nonfinite router scores");
+                        let gaps: Vec<Option<f64>> = scores.chunks_exact(c.n_expert).map(|row| {
+                            let mut v = row.to_vec(); v.sort_unstable_by(|a,b| b.total_cmp(a));
+                            (k < v.len()).then(|| v[k-1] as f64 - v[k] as f64)
+                        }).collect();
+                        let effective = if r10_mode == "replay" {
+                            let fixed = r10_tape.remove(&il).ok_or_else(|| anyhow::anyhow!("R10 missing route layer {il}"))?;
+                            fixed.validate(il, self.pos, toks, k, c.n_expert)?;
+                            if (self.pos, il) <= (r9_pos, r9_layer) {
+                                anyhow::ensure!(fixed.ids == natural.ids && crate::ps5_r10::same_bits(&fixed.weights, &natural.weights), "R10 changed route before intervention");
+                            }
+                            g.put(&fixed.ids, &pf.ints, 0)?;
+                            g.put(&fixed.weights, &pf.slab, l.wts)?;
+                            ids = g.get::<i32>(&pf.ints, 0, t*k)?;
+                            let written = g.get::<f32>(&pf.slab, l.wts, t*k)?;
+                            anyhow::ensure!(ids == fixed.ids && crate::ps5_r10::same_bits(&written, &fixed.weights), "R10 route readback mismatch");
+                            fixed
+                        } else { natural.clone() };
+                        eprintln!("r10_route,{}", serde_json::json!({"mode":r10_mode,"natural":natural,"effective":effective,"raw_cutoff_gaps":gaps}));
                     }
                     let cache = self.cache.as_mut().unwrap();
                     cache.record_prompt(il, &ids);
@@ -1042,7 +1086,7 @@ impl GpuModel<'_> {
                         let y0 = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
                         crate::venus_trace::capture(self.m, v, expert, slot, h0, a0, y0)?;
                     }
-                    let mut r9_replacement: Option<(usize, usize, Vec<f32>, Vec<f32>)> = None;
+                    let mut r9_replacement: Option<(usize, usize, Vec<f32>, Vec<f32>, Vec<f32>)> = None;
                     if let Some((expert, slot, token, hidden)) = shadow.as_ref() {
                         let activation = g.get::<f32>(&pf.slab, l.ge + slot * c.n_ff_exp, c.n_ff_exp)?;
                         let down = down_weight.as_ref().unwrap().expert(*expert, c.n_expert);
@@ -1083,7 +1127,7 @@ impl GpuModel<'_> {
                             eprintln!("r9_fixed,{}", serde_json::json!({"layer":il,"pos":self.pos,"chunk":t,
                                 "token":token,"rank":r9_rank,"expert":expert,"slot":slot,"ids":&ids,
                                 "hidden":hidden,"gpu_down":&gpu_down,"weights":&wts}));
-                            r9_replacement = Some((*slot, *token, cpu_pipeline, actual));
+                            r9_replacement = Some((*slot, *token, cpu_pipeline, actual, gpu_down));
                         }
                         eprintln!("r7_r4_down_type,{il},{expert},{token},{:?},{}", down.ty, down.scale);
                     }
@@ -1101,8 +1145,8 @@ impl GpuModel<'_> {
                     let fx = if ly.hc.is_some() { at(l.mo) } else { x };
                     // R9 optionally substitutes exactly one row AFTER its GPU computation, with no planner changes.
                     // All preceding rows/layers are fixed by the all-GPU baseline. Measure combine on the real shader.
-                    if let Some((slot, _, legacy, contract)) = &r9_replacement {
-                        let candidate = match r9_mode.as_str() { "legacy" => Some(legacy), "contract" => Some(contract), _ => None };
+                    if let Some((slot, _, legacy, contract, gpu_row)) = &r9_replacement {
+                        let candidate = match r9_mode.as_str() { "legacy" => Some(legacy), "contract" => Some(contract), "sham" => Some(gpu_row), _ => None };
                         if let Some(row) = candidate {
                             anyhow::ensure!(row.len() == ne && row.iter().all(|v| v.is_finite()), "R9 invalid replacement");
                             g.put(row, &pf.slab, l.ye + *slot * ne)?;
@@ -1112,7 +1156,7 @@ impl GpuModel<'_> {
                         }
                     }
                     g.moe_combine_seq(fx, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
-                    if let Some((_, token, _, _)) = &r9_replacement {
+                    if let Some((_, token, _, _, _)) = &r9_replacement {
                         let combined = g.get::<f32>(&pf.slab, *token * ne, ne)?;
                         anyhow::ensure!(combined.iter().all(|v| v.is_finite()), "R9 nonfinite combine");
                         // Full vector, not just a fingerprint: offline compares the exact GPU combine boundary.
@@ -1156,6 +1200,7 @@ impl GpuModel<'_> {
             }
             g.kick()?;
         }
+        anyhow::ensure!(r10_tape.is_empty(), "R10 unconsumed route layers");
         if rows.is_some() { return Ok(()); }
         if fill && is_eagle {
             g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?;

@@ -12,7 +12,8 @@ def bits(a,b):
     return len(a)==len(b) and all(struct.pack('<f',x)==struct.pack('<f',y) for x,y in zip(a,b))
 def finite(a):
     return isinstance(a,list) and bool(a) and all(math.isfinite(v) for v in a)
-def read_arm(root, arm):
+def read_arm(root, arm, expected=6, write_mode=None):
+    mode=arm if write_mode is None else write_mode
     raw=(root/(arm+'.log')).read_text().splitlines()
     fixed=[json.loads(x.split(',',1)[1]) for x in raw if x.startswith('r9_fixed,')]
     combine=[(tuple(map(int,p[1:4])),json.loads(p[4])) for x in raw if x.startswith('r9_combine,') for p in [x.split(',',4)]]
@@ -25,16 +26,16 @@ def read_arm(root, arm):
             n, different, err, denom=int(p[7]),int(p[8]),float(p[9]),float(p[10])
             require(n>0 and 0<=different<=n and math.isfinite(err) and math.isfinite(denom) and min(err,denom)>=0,'invalid stage '+p[6])
             stages[p[6]].append(dict(n=n,different=different,max_abs=err,denom=denom))
-    require(len(fixed)==len(combine)==6,arm+' must exercise all six prompts once')
-    require(all(len(v)==6 for v in stages.values()),arm+' incomplete stages')
+    require(len(fixed)==len(combine)==expected,arm+' wrong number of matched cases')
+    require(all(len(v)==expected for v in stages.values()),arm+' incomplete stages')
     require(all(v['different']==0 for v in stages['r9_contract_self']),arm+' inconsistent contract decomposition')
-    require(len(writes)==(0 if arm=='shadow' else 6),arm+' wrong number of writes')
+    require(len(writes)==(0 if mode=='shadow' else expected),arm+' wrong number of writes')
     for i,(f,(key,vec)) in enumerate(zip(fixed,combine)):
         require(key==(f['layer'],f['pos'],f['token']) and finite(vec),arm+' invalid combine boundary')
         require(all(finite(f[k]) for k in FIELDS),arm+' invalid fixed vector')
         require(len(f['gpu_down'])==len(vec),arm+' wrong combine width')
-        if arm!='shadow':
-            w=writes[i]; require(w==[arm,str(f['layer']),str(f['pos']),str(f['slot']),str(len(vec))],arm+' wrong write identity')
+        if mode!='shadow':
+            w=writes[i]; require(w==[mode,str(f['layer']),str(f['pos']),str(f['slot']),str(len(vec))],arm+' wrong write identity')
     return fixed,combine,stages
 
 def same_fixed(a,b):

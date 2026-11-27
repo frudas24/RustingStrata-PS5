@@ -20,8 +20,11 @@ fn prefill_scheduler_parity() {
     assert_eq!(gm.cache.as_ref().unwrap().resident_count(), 0);
     let mut logits = vec![];
     // Repeat the same prompts to give auto matching shape buckets without cross-process profiles.
-    for _ in 0..3 {
-        for ids in &inputs {
+    let r10_prompt = std::env::var("PS5_R10_PROMPT").ok().map(|s| s.parse::<usize>().unwrap());
+    if let Some(i) = r10_prompt { assert!(i < inputs.len()); }
+    for _ in 0..if r10_prompt.is_some() { 1 } else { 3 } {
+        for (i, ids) in inputs.iter().enumerate() {
+            if r10_prompt.is_some_and(|p| p != i) { continue; }
             gm.reset().unwrap();
             let a = gm.prefill(ids).unwrap();
             assert!(!a.is_empty() && a.iter().all(|x| x.is_finite()));
