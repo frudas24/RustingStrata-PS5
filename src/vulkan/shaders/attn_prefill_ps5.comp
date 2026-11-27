@@ -1,0 +1,85 @@
+#version 460
+// R5: wave32, shared K/V tile, packed pair loads and exact sliding-window skipping.
+#ifndef STRATA_R5_WG
+#define STRATA_R5_WG 512
+#endif
+layout(local_size_x = STRATA_R5_WG) in;
+#include "common.glsl"
+layout(constant_id = 1) const uint HD = 128;  // 64, 128 or 256 (host spec constant)
+const uint PER = HD / 32;                     // dimensions per lane
+const uint ELEMS = uint(STRATA_R5_WG) * 8u;
+const uint BK = ELEMS / HD; // 8–128 keys depending on tile and head width
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint bq; uint hper; uint hgroups; uint q_off; F32 sink; int win; } p;
+// K and V rows of the current key tile, all f16 (also with KV_Q8: ldkv rounds to f16, so this is exact).
+shared float16_t sk[ELEMS], sv[ELEMS];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, task = WARP, lane = LANE;
+    uint g = p.nh / p.nkv;                     // query heads per KV head
+    uint kvh = gl_WorkGroupID.y / p.hgroups, head_group = gl_WorkGroupID.y % p.hgroups;
+    uint q0 = gl_WorkGroupID.x * p.bq;
+    if (q0 >= p.t) return;                     // uniform in the workgroup: no barrier below has run
+    uint head_local = task / p.bq, q_local = task % p.bq;
+    uint h = kvh * g + head_group * p.hper + head_local, q = q0 + q_local;
+    bool live = q < p.t && head_local < p.hper && head_group * p.hper + head_local < g;
+    uint qr = min(q, p.t - 1), hr = min(h, p.nh - 1);  // inactive tasks still form a safe address below
+    uint pos0 = uint(p.step.v[0]), last_max = pos0 + p.q_off + min(q0 + p.bq, p.t) - 1, last_q = pos0 + p.q_off + q;
+    uint kvd = p.nkv * HD, kvo = kvh * HD;
+    float qv[PER], acc[PER], m = 0.0, l = 0.0;
+    bool first = true;
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        qv[j] = live ? p.q.v[(qr * p.nh + hr) * HD + lane + 32 * j] * p.scale : 0.0;
+        acc[j] = 0.0;
+    }
+    // A whole tile strictly before the earliest live query window cannot contribute.
+    uint earliest = pos0 + p.q_off + q0;
+    uint start = p.win > 0 && earliest >= uint(p.win) ? earliest - uint(p.win) + 1u : 0u;
+    for (uint k0 = (start / BK) * BK; k0 <= last_max; k0 += BK) {
+        barrier();
+        // All threads load the tile (inactive tasks too, they still reach the barrier). Rows past the last key are
+        // zeroed; no task reads them, since every task masks k > last_q below.
+        // Pair starts are even and HD is a multiple of 64: never cross a row or scale block.
+        for (uint i = 2u * tid; i < ELEMS; i += 2u * uint(STRATA_R5_WG)) {
+            uint r = i / HD, c = i % HD, k = k0 + r;
+            bool ok = k <= last_max;
+            uint a = 0u, b = 0u;
+            if (ok) {
+                uint off = k * kvd + kvo + c;
+                if (KV_MODE == 0u) {
+                    a = uint(p.kc.v[off]) | (uint(p.kc.v[off + 1u]) << 16u);
+                    b = uint(p.vc.v[off]) | (uint(p.vc.v[off + 1u]) << 16u);
+                } else {
+                    a = ldkv2(p.kc, off, HD);
+                    b = ldkv2(p.vc, off, HD);
+                }
+            }
+            sk[i] = uint16BitsToHalf(uint16_t(a));
+            sk[i + 1u] = uint16BitsToHalf(uint16_t(a >> 16u));
+            sv[i] = uint16BitsToHalf(uint16_t(b));
+            sv[i + 1u] = uint16BitsToHalf(uint16_t(b >> 16u));
+        }
+        barrier();
+        if (live) for (uint r = 0; r < BK; r++) {
+            uint k = k0 + r;
+            if (k > last_q || (p.win > 0 && last_q >= uint(p.win) && k <= last_q - uint(p.win)) || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, p.q_off + q, k))) continue;
+            float s = 0.0;
+            [[unroll]] for (uint j = 0; j < PER; j++) s += qv[j] * float(sk[r * HD + lane + 32 * j]);
+            s = W64 ? warp_sum(s) : subgroupAdd(s);
+            float mn = first ? s : max(m, s), c = first ? 0.0 : expf_(m - mn), e = expf_(s - mn);
+            l = first ? e : fma(l, c, e);
+            first = false;
+            [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, float(sv[r * HD + lane + 32 * j]), acc[j] * c);
+            m = mn;
+        }
+    }
+    if (!live) return;
+    float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : uintBitsToFloat(0xff800000u);
+    float M = max(m, sk), sc = m == uintBitsToFloat(0xff800000u) ? 0.0 : expf_(m - M);
+    float den = l * sc + (uint64_t(p.sink) == 0 ? 0.0 : expf_(sk - M));
+    float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        uint col = lane + 32 * j;
+        float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[q * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
+        p.o.v[q * p.nh * HD + h * HD + col] = acc[j] * inv * gate;
+    }
+}

@@ -1,4 +1,4 @@
-// R2 shaders are optional, built from the same sources as the checked-in R1 SPIR-V.
+// R2 and R5 shaders are optional, built from the same sources as the checked-in R1 SPIR-V.
 use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=src/vulkan/shaders");
@@ -9,6 +9,9 @@ fn main() {
     let compiler = env::var_os("GLSLC").unwrap_or_else(|| "glslc".into());
     let validator = env::var_os("SPIRV_VAL").unwrap_or_else(|| "spirv-val".into());
     for (name, source, defs) in [
+        ("attn_prefill_ps5_256", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=256"][..]),
+        ("attn_prefill_ps5_512", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=512"][..]),
+        ("attn_prefill_ps5_1024", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=1024"][..]),
         ("gemv_q_ps5_64", "gemv_q.comp", & ["-DSTRATA_GEMV_WG=64"][..]),
         ("gemv_q_ps5_128", "gemv_q.comp", &["-DSTRATA_GEMV_WG=128"][..]),
         ("moe_gemv_q_ps5_64", "moe_gemv_q.comp", &["-DSTRATA_GEMV_WG=64"][..]),
@@ -18,10 +21,10 @@ fn main() {
         let file = out.join(format!("{name}.spv"));
         let status = Command::new(&compiler).current_dir("src/vulkan/shaders")
             .args(["--target-env=vulkan1.3", "-O"]).args(defs).arg("-o").arg(&file).arg(source)
-            .status().expect("PS5 R2 requires glslc (or GLSLC=path)");
+            .status().expect("PS5 R2/R5 requires glslc (or GLSLC=path)");
         assert!(status.success(), "glslc failed for {name}");
         let status = Command::new(&validator).args(["--target-env", "vulkan1.3"]).arg(&file)
-            .status().expect("PS5 R2 requires spirv-val (or SPIRV_VAL=path)");
+            .status().expect("PS5 R2/R5 requires spirv-val (or SPIRV_VAL=path)");
         assert!(status.success(), "spirv-val failed for {name}");
     }
 }

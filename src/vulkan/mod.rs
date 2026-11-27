@@ -14,6 +14,7 @@ pub mod preflight;
 pub mod spv_smem;
 mod ps5_r2;
 mod ps5_r3;
+mod ps5_r5;
 
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
@@ -30,6 +31,12 @@ const SPV: &[(&str, &[u8])] = &[
     ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
     ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
     ("attn_prefill_llama", include_bytes!("spv/attn_prefill_llama.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("attn_prefill_ps5_256", include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_ps5_256.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("attn_prefill_ps5_512", include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_ps5_512.spv"))),
+    #[cfg(feature = "ps5-r2")]
+    ("attn_prefill_ps5_1024", include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_ps5_1024.spv"))),
     ("attn_prefill_tile", include_bytes!("spv/attn_prefill_tile.spv")),
     ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
     ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
@@ -198,6 +205,8 @@ struct Inner {
     /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
     /// when the device allows it. STRATA_VK_DP_OLD=1 keeps the older per-query `attn_prefill_dp`.
     dp_tile: bool,
+    r5: ps5_r5::Attention,
+    r5_logged: std::sync::atomic::AtomicBool,
     /// Int8 cooperative matrix K-dimension (`32` for NVIDIA `16x16x32`, `16` for AMD RDNA3/3.5 `16x16x16`, `0` = off).
     coop_i8: u32,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
@@ -488,6 +497,12 @@ impl Vk {
                 .iter().any(|k| name_up.contains(k)));
         let dp_tile = !coop && limits.max_compute_work_group_invocations >= 1024 && limits.max_compute_shared_memory_size >= 32 << 10
             && std::env::var_os("STRATA_VK_DP_OLD").is_none();
+        // Validate requested R5 variant before allocating logical-device resources. Respect a lowered test limit.
+        let r5_smem = std::env::var("STRATA_VK_SMEM_LIMIT").ok().map(|v| v.parse::<u32>()).transpose()
+            .context("STRATA_VK_SMEM_LIMIT")?.unwrap_or(limits.max_compute_shared_memory_size)
+            .min(limits.max_compute_shared_memory_size);
+        let r5 = ps5_r5::Attention::read(ps5, wave64, coop, crate::cuda::llama_numerics(),
+            limits.max_compute_work_group_invocations.min(limits.max_compute_work_group_size[0]), r5_smem)?;
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let mut fdc = vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default();
         let amd_coherent = has(ash::amd::device_coherent_memory::NAME) && {
@@ -561,7 +576,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1635,6 +1650,7 @@ impl Backend for Vk {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
             _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
         if t == 0 { return Ok(()); }
+        ensure!(nkv > 0 && nh >= nkv && nh % nkv == 0, "attention prefill: invalid head geometry {nh}/{nkv}");
         // A chunk's prefill attention is t * (pos + t) query-key pairs, which can grow past amdgpu's 10 s job timeout
         // at a long context. Cut it into query slices, each its own submit, so no one job runs that long. The budget
         // is query-key pairs per slice; STRATA_VK_ATTN_BUDGET overrides it (0 turns slicing off). 2^30 does not split
@@ -1658,14 +1674,18 @@ impl Backend for Vk {
                 return self.run("attn_prefill_llama", &[0, hd as u32], [n, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32), &(q_off as u32), &sink, &(win as i32)]);
             }
             if !self.0.coop {
-                if self.0.dp_tile {
-                    // One workgroup: 32 (query, head) tasks of one KV head, sharing a 32 KB K/V tile. hper query heads
-                    // per KV head, bq queries each; h groups when there are more than 32 heads per KV head.
+                if self.0.r5.wg != 0 || self.0.dp_tile {
+                    // One workgroup: 8/16/32 (query, head) tasks of one KV head, sharing its K/V tile.
+                    // hper heads, bq queries each; separate head groups when GQA exceeds the task count.
                     let g = nh / nkv;
-                    let hper = g.min(32);
-                    let bq = 32 / hper;
+                    let (kernel, tasks) = self.0.r5.kernel();
+                    let hper = g.min(tasks);
+                    let bq = tasks / hper;
                     let hgroups = g.div_ceil(hper);
-                    return self.run("attn_prefill_tile", &[0, hd as u32], [n.div_ceil(bq), nkv * hgroups, 1],
+                    if self.0.r5.wg != 0 && !self.0.r5_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("PS5 R5 attention dispatch: {kernel}");
+                    }
+                    return self.run(kernel, &[0, hd as u32], [n.div_ceil(bq), nkv * hgroups, 1],
                         &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32),
                           &(bq as u32), &(hper as u32), &(hgroups as u32), &(q_off as u32), &sink, &(win as i32)]);
                 }

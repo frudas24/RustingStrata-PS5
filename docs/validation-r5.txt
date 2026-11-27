@@ -1,0 +1,22 @@
+R5 independent local checks
+PASS: 6,000 dispatch geometries; 100,000 window bounds; 9 pair geometries; 60,000 reference quantized pairs
+PASS: 4080 GEMV/MoE dispatch and split cases
+PASS: GEMM 32/128 tile bijections, 780 tail cases
+LDS PW=20: 40960 -> 20992 bytes; reduction 48.75%
+LDS PW=36: 49152 -> 29184 bytes; reduction 40.62%
+NOTE: CPU geometry only; GLSL/SPIR-V validation and GPU parity require target toolchain.
+PASS: 100000 independent window geometry cases (23220 eligible), plus 5 boundaries
+PASS: 20,000 randomized router/cache/budget cases; 60,000 partitions and scatter checks
+PASS: deterministic exploration and EWMA convergence (1,024 synthetic observations)
+PASS: 1000000 AVX2 vectors / 2000000 signed group sums (including -128 and +127 extremes)
+PASS: shell syntax
+f16   8,589,934,592 bytes     8.000 GiB
+q8    4,563,402,752 bytes     4.250 GiB
+q4    2,415,919,104 bytes     2.250 GiB
+q2    1,610,612,736 bytes     1.500 GiB
+Excludes weights, activations, scratch, driver, alignment and OS. Hybrid/sliding layers require per-layer accounting; this engine may still allocate full-length caches.
+MISSING: cargo
+MISSING: rustc
+MISSING: glslc
+MISSING: spirv-val
+PASS: synthetic benchmark analyzer accepts complete matching arms and rejects missing dispatch, wrong prompt, mismatched KV, and zero throughput. No physical benchmark executed.
