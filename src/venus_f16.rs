@@ -136,6 +136,51 @@ unsafe fn tile_3x4(w: &[u8], x: &[f32], cols: usize) -> [f32; 12] {
     }
 }
 
+/// Single-token F16 path derived from Venus' four-accumulator dotF16AVX.
+/// Kept independently gated from the 3x4 kernel: this reaches ordinary CPU text decode.
+pub(crate) fn try_matvec(t: &Tensor<'_>, x: &[f32], out: &mut [f32]) -> bool {
+    if t.ty != GgmlType::F16 || t.scale != 1.0 || t.cols < 8 || t.cols % 8 != 0 || t.rows == 0
+        || t.cols != x.len() || t.rows != out.len() || !supported()
+        || t.rows.checked_mul(t.cols).and_then(|n| n.checked_mul(2)) != Some(t.data.len()) { return false; }
+    #[cfg(target_arch="x86_64")]
+    {
+        let rb = 2*t.cols;
+        out.par_chunks_mut(16).enumerate().for_each(|(b, ys)| {
+            for (i,y) in ys.iter_mut().enumerate() {
+                let r=b*16+i;
+                // SAFETY: the F16 view, activation lengths and CPU features are checked above.
+                *y=unsafe { dot_f16(&t.data[r*rb..(r+1)*rb],x) };
+            }
+        });
+        true
+    }
+    #[cfg(not(target_arch="x86_64"))]
+    { false }
+}
+
+#[cfg(target_arch="x86_64")]
+#[target_feature(enable="avx,fma,f16c")]
+unsafe fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut a0=_mm256_setzero_ps(); let mut a1=a0; let mut a2=a0; let mut a3=a0;
+        let mut i=0;
+        macro_rules! step { ($a:ident,$j:expr) => {{
+            let j=$j;
+            let v=_mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(2*j).cast()));
+            $a=_mm256_fmadd_ps(v,_mm256_loadu_ps(x.as_ptr().add(j)),$a);
+        }}; }
+        while x.len()-i>=32 {
+            step!(a0,i); step!(a1,i+8); step!(a2,i+16); step!(a3,i+24); i+=32;
+        }
+        a0=_mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0,a1),a2),a3);
+        while i<x.len() { step!(a0,i); i+=8; }
+        let s=_mm_add_ps(_mm256_castps256_ps128(a0),_mm256_extractf128_ps::<1>(a0));
+        let s=_mm_hadd_ps(s,s);
+        _mm_cvtss_f32(_mm_hadd_ps(s,s))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +188,7 @@ mod tests {
 
     #[test]
     fn venus_f16_shapes_and_reference() {
-        assert!(supported(), "this test requires AVX/FMA/F16C; run on the target CPU");
+        if !supported() { eprintln!("SKIP: requires AVX/FMA/F16C"); return; }
         for rows in [3, 4, 5, 6, 17] {
             for cols in [8, 16, 24, 128, 1032] {
                 for n in [4, 5, 7, 8, 13] {
@@ -173,6 +218,26 @@ mod tests {
     }
 
     #[test]
+    fn venus_f16_matvec_reference() {
+        if !supported() { eprintln!("SKIP: requires AVX/FMA/F16C"); return; }
+        for cols in [8,16,24,32,40,56,128,1032] {
+            let rows=19;
+            let mut raw=vec![0u8];
+            for i in 0..rows*cols { raw.extend(f16::from_f32(((i*71%197) as f32-98.)/71.).to_le_bytes()); }
+            let t=Tensor{ty:GgmlType::F16,cols,rows,data:&raw[1..],scale:1.};
+            let x:Vec<_>=(0..cols).map(|i| ((i*41%173) as f32-86.)/79.).collect();
+            let mut y=vec![f32::NAN;rows]; assert!(try_matvec(&t,&x,&mut y));
+            let mut w=vec![0.;cols];
+            for (r,&actual) in y.iter().enumerate() {
+                t.row(r,&mut w);
+                let exact:f64=w.iter().zip(&x).map(|(&a,&b)|a as f64*b as f64).sum();
+                let abs_sum:f64=w.iter().zip(&x).map(|(&a,&b)|(a as f64*b as f64).abs()).sum();
+                assert!(actual.is_finite() && (actual as f64-exact).abs()<=2e-6*abs_sum+1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn venus_f16_rejects_without_writing() {
         let data = [0u8; 48];
         let base = Tensor { ty: GgmlType::F16, cols: 8, rows: 3, data: &data, scale: 1.0 };
@@ -182,4 +247,45 @@ mod tests {
             assert_eq!(y, [17.;12]);
         }
     }
+
+    #[test]
+    #[ignore = "requires a local F16 GGUF; see test-venus.sh"]
+    fn venus_f16_real_gguf() {
+        assert!(supported(), "AVX/FMA/F16C required");
+        assert_ne!(std::env::var("STRATA_PS5_VENUS_F16").as_deref(), Ok("1"), "baseline must be disabled");
+        let path = std::env::var("VENUS_F16_MODEL").expect("provide F16 GGUF");
+        let gg = crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+        let chosen = std::env::var("VENUS_F16_TENSOR").ok();
+        let info = gg.tensors.values().find(|t| t.ty == 1 && t.dims.len() == 2 && t.dims[0] >= 8 && t.dims[0] <= 8192
+            && t.dims[0] % 8 == 0 && t.dims[1] >= 3 && chosen.as_ref().is_none_or(|name| name == &t.name))
+            .expect("no eligible F16 matrix; choose an F16 GGUF or set VENUS_F16_TENSOR");
+        let cols = info.dims[0] as usize;
+        let rows = info.dims[1].min(384) as usize;
+        let t = Tensor { ty: GgmlType::F16, cols, rows, data: gg.raw_bytes(info, 2*cols*rows).unwrap(), scale:1. };
+        for n in [4, 8, 17] {
+            let x: Vec<_> = (0..n*cols).map(|i| (((i*41+17)%173) as f32-86.)/79.).collect();
+            let mut a = vec![0.;rows*n]; let mut b = a.clone();
+            t.matmul(&x,n,&mut a); assert!(try_matmul(&t,&x,n,&mut b));
+            let mut w=vec![0.;cols]; let mut worst=0f64;
+            for r in 0..rows {
+                t.row(r,&mut w);
+                for j in 0..n {
+                    let v=&x[j*cols..(j+1)*cols];
+                    let sum:f64=w.iter().zip(v).map(|(&p,&q)|(p as f64*q as f64).abs()).sum();
+                    let d=(a[j*rows+r] as f64-b[j*rows+r] as f64).abs();
+                    assert!(a[j*rows+r].is_finite() && b[j*rows+r].is_finite() && d <= 5e-6*sum+1e-6, "F16 parity failed");
+                    worst=worst.max(d);
+                }
+            }
+            let mut samples=Vec::new();
+            for candidate in [false,true,true,false,false,true,true,false] {
+                let now=std::time::Instant::now();
+                if candidate { assert!(try_matmul(&t,&x,n,&mut b)); std::hint::black_box(&b); }
+                else { t.matmul(&x,n,&mut a); std::hint::black_box(&a); }
+                samples.push((candidate,now.elapsed().as_nanos() as u64));
+            }
+            println!("VENUS_F16_GGUF {}",serde_json::json!({"tensor":info.name,"rows":rows,"cols":cols,"tokens":n,"max_abs":worst,"samples_ns":samples}));
+        }
+    }
+
 }
