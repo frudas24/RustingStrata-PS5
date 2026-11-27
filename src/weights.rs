@@ -43,6 +43,16 @@ impl<'a> Tensor<'a> {
             }
             return;
         }
+        if std::env::var("STRATA_PS5_VENUS_BF16").as_deref() == Ok("1")
+            && std::env::var_os("STRATA_SCALAR").is_none() && crate::venus_f16::try_bf16_matvec(self,x,y) {
+            if std::env::var("STRATA_PS5_VENUS_LOG").as_deref() == Ok("1") {
+                static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("PS5 Venus exercised: bf16_matvec rows={} cols={}",self.rows,self.cols);
+                }
+            }
+            return;
+        }
         y.par_chunks_mut(16).enumerate().for_each_init(|| vec![0f32; self.cols], |buf, (ci, ys)| {
             for (k, yv) in ys.iter_mut().enumerate() {
                 self.row(ci * 16 + k, buf);

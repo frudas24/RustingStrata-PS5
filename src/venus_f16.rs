@@ -181,6 +181,52 @@ unsafe fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// BF16 is already the upper 16 bits of IEEE FP32. Zen 2 can expand eight
+/// values with AVX2 zero-extension + shift, without converting to F16 or
+/// requiring AVX512_BF16. Separate flag: does not change the F16 path.
+pub(crate) fn try_bf16_matvec(t: &Tensor<'_>, x: &[f32], out: &mut [f32]) -> bool {
+    if t.ty != GgmlType::BF16 || t.scale != 1.0 || t.cols < 8 || t.cols % 8 != 0 || t.rows == 0
+        || t.cols != x.len() || t.rows != out.len()
+        || t.rows.checked_mul(t.cols).and_then(|n| n.checked_mul(2)) != Some(t.data.len()) { return false; }
+    #[cfg(target_arch="x86_64")]
+    {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") { return false; }
+        let rb=2*t.cols;
+        out.par_chunks_mut(16).enumerate().for_each(|(b, ys)| {
+            for (i,y) in ys.iter_mut().enumerate() {
+                let r=b*16+i;
+                // SAFETY: features, row length, input and output sizes checked above.
+                *y=unsafe { dot_bf16(&t.data[r*rb..(r+1)*rb],x) };
+            }
+        });
+        true
+    }
+    #[cfg(not(target_arch="x86_64"))]
+    { false }
+}
+
+#[cfg(target_arch="x86_64")]
+#[target_feature(enable="avx2,fma")]
+unsafe fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut a0=_mm256_setzero_ps(); let mut a1=a0; let mut a2=a0; let mut a3=a0;
+        let mut i=0;
+        macro_rules! step { ($a:ident,$j:expr) => {{
+            let j=$j;
+            let bits=_mm256_cvtepu16_epi32(_mm_loadu_si128(w.as_ptr().add(2*j).cast()));
+            let v=_mm256_castsi256_ps(_mm256_slli_epi32::<16>(bits));
+            $a=_mm256_fmadd_ps(v,_mm256_loadu_ps(x.as_ptr().add(j)),$a);
+        }}; }
+        while x.len()-i>=32 { step!(a0,i); step!(a1,i+8); step!(a2,i+16); step!(a3,i+24); i+=32; }
+        a0=_mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0,a1),a2),a3);
+        while i<x.len() { step!(a0,i); i+=8; }
+        let s=_mm_add_ps(_mm256_castps256_ps128(a0),_mm256_extractf128_ps::<1>(a0));
+        let s=_mm_hadd_ps(s,s);
+        _mm_cvtss_f32(_mm_hadd_ps(s,s))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +279,32 @@ mod tests {
                 let exact:f64=w.iter().zip(&x).map(|(&a,&b)|a as f64*b as f64).sum();
                 let abs_sum:f64=w.iter().zip(&x).map(|(&a,&b)|(a as f64*b as f64).abs()).sum();
                 assert!(actual.is_finite() && (actual as f64-exact).abs()<=2e-6*abs_sum+1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn venus_bf16_matvec_reference_and_fallback() {
+        for cols in [8,16,24,32,40,56,128,1032] {
+            let rows=19;
+            let mut raw=vec![0u8];
+            for i in 0..rows*cols { raw.extend(half::bf16::from_f32(((i*71%197) as f32-98.)/71.).to_le_bytes()); }
+            let t=Tensor{ty:GgmlType::BF16,cols,rows,data:&raw[1..],scale:1.};
+            let x:Vec<_>=(0..cols).map(|i| ((i*41%173) as f32-86.)/79.).collect();
+            let mut y=vec![17.;rows];
+            if try_bf16_matvec(&t,&x,&mut y) {
+                let mut w=vec![0.;cols];
+                for (r,&actual) in y.iter().enumerate() {
+                    t.row(r,&mut w);
+                    let exact:f64=w.iter().zip(&x).map(|(&a,&b)|a as f64*b as f64).sum();
+                    let abs_sum:f64=w.iter().zip(&x).map(|(&a,&b)|(a as f64*b as f64).abs()).sum();
+                    assert!(actual.is_finite() && (actual as f64-exact).abs()<=2e-6*abs_sum+1e-6);
+                }
+            } else { assert_eq!(y,vec![17.;rows]); }
+            for bad in [Tensor{scale:2.,..t},Tensor{ty:GgmlType::F16,..t},Tensor{data:&t.data[..t.data.len()-1],..t}] {
+                y.fill(17.);
+                assert!(!try_bf16_matvec(&bad,&x,&mut y));
+                assert_eq!(y,vec![17.;rows]);
             }
         }
     }
