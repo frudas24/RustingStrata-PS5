@@ -5,9 +5,9 @@ Linux.** Original author Vasyl Trefilov, same [LICENSE.md](LICENSE.md), no endor
 docs and numbers further down are unchanged and still describe upstream; this fork keeps an opt-in PS5 path on top of
 them.
 
-Current tip: **R6U1** — the cumulative PS5 line R1–R6 merged with upstream 1.4.0 (`Cargo.toml` 1.4.0). R6U1 is not
-R7 and not a replacement for the R6 baseline: the rollout in [docs/PS5-R6U1.md](docs/PS5-R6U1.md) compares the two
-A/B/B/A before anything is promoted.
+Current tip: **R7** — evidence-driven delta over R6U1 (upstream 1.4.0). See [docs/PS5-R7.md](docs/PS5-R7.md)
+for the physical R6 findings, ported fixes, experimental dense64 GEMM and validation gates. The R7 build itself is
+not yet physically validated; R6 research results must not be attributed to R7.
 
 ## This fork is meant for the PS5
 
@@ -57,8 +57,8 @@ The model behind every number here is the GGUF `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`
 head `mtp-Qwen3.6-35B-A3B-Q8_0.gguf`. A BF16 (~70 GB) or FP8 (~35 GB) checkpoint neither fits the 13.09 GiB ceiling
 nor is a format this engine loads, which reads GGUF.
 
-**Those three rows belong to R1 and to the pre-merge prefill-protect build.** No tok/s has been taken from R2, R3,
-R4, R5, R6 or R6U1 on this console. Building a tree is not a measurement, and the per-version documents state
+**Those three rows belong to R1 and to the pre-merge prefill-protect build.** A subsequent physical R6 research campaign is summarized separately in [docs/PS5-R7.md](docs/PS5-R7.md).
+No R6U1 or R7 benchmark is claimed here. Building a tree is not a measurement, and the per-version documents state
 themselves that their authors had no console, no toolchain and no weights when they were written. Treat R2–R6 and R6U1
 as candidates until a benchmark says otherwise.
 
