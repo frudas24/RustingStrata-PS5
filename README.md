@@ -5,13 +5,18 @@ Linux.** Original author Vasyl Trefilov, same [LICENSE.md](LICENSE.md), no endor
 docs and numbers further down are unchanged and still describe upstream; this fork keeps an opt-in PS5 path on top of
 them.
 
-Integration branch: **R11U1** — R11 (`c2cacb3`) plus a selective content integration of upstream 1.4.1
-(`956904f`). The frozen R11 physical campaign remains separate. R10 adds controlled routing and Venus tail;
-R11 adds experimental IQ kernels for Qwen3.6-35B-A3B. R11U1 preserves these flags, adopts backend fixes and
-blocks the separate CPU batch-miss path on the active PS5 profile until validated. Multi-device batching and
-upstream's relaxed MoE test tolerances are deferred. No new physical performance is claimed for R11U1.
-See [docs/PS5-R10.md](docs/PS5-R10.md), [docs/PS5-R11.md](docs/PS5-R11.md) and
-[docs/PS5-R11U1.md](docs/PS5-R11U1.md) for exact evidence, scope and gates.
+Current tip: **R12-Audit** (`3854f34`) — R12 (`1bea8f6`) on R11U1-Audit (`db9fb69`), which sits on R11U1 and the
+selective content integration of upstream 1.4.1 (`956904f`). R10 added controlled routing and the Venus tail, R11
+experimental IQ kernels for Qwen3.6-35B-A3B, R11U1 the upstream 1.4.1 backend fixes plus a PS5 quarantine of the batch
+CPU-miss path, and R11U1-Audit a defensive pass over the shader dedup, GGUF metadata, KLD and telemetry paths. R12 adds
+opt-in routed IQ integer tiles at 32 and 64 positions; R12-Audit adds dispatch and range preflight, the
+incomplete-subgroup Q8 fallback, a dense non-routed reference and stricter evidence binding. Every R12 flag is off by
+default, multi-device batching and upstream's relaxed MoE test tolerances stay deferred, and **no new physical
+performance is claimed here**: the table below is still R1's, and the 8K/32K/64K IQ32 figures quoted further down are
+physical **R11**. See [docs/PS5-R10.md](docs/PS5-R10.md), [docs/PS5-R11.md](docs/PS5-R11.md),
+[docs/PS5-R11U1.md](docs/PS5-R11U1.md), [docs/PS5-R11U1-AUDIT.md](docs/PS5-R11U1-AUDIT.md),
+[docs/PS5-R12.md](docs/PS5-R12.md) and [docs/PS5-R12-AUDIT.md](docs/PS5-R12-AUDIT.md) for exact evidence, scope and
+gates.
 
 ## This fork is meant for the PS5
 
@@ -42,6 +47,14 @@ What the fork adds, all of it in `main`:
   and a matched single-expert causal replay (R9). None of them promotes anything: R4's hybrid scheduler and the
   file-backed import stay quarantined behind an explicit research switch, and every number they report comes from their
   authors' environment, not from this console.
+- **Three more research deltas, R10 to R12**, all default-off: controlled identical-write routing with a frozen route
+  tape plus a F16 tail on the Venus kernels (R10); routed IQ32 GPU GEMM with IQ CPU contract candidates and GEMV/down
+  register-pressure screens (R11); and routed IQ3_XXS/IQ4_XS integer tiles at 32 and 64 positions, with a
+  research-only boundary trace (R12). Two audit passes sit under them: R11U1-Audit (atomic expert dedup, bounded GGUF
+  metadata recursion, validated KLD payloads and telemetry) and R12-Audit (checked dispatch dimensions and typed
+  buffer ranges, the incomplete-Q8-subgroup fallback, a dense non-routed reference per case, and causal evidence bound
+  to the tracked row). Nothing here is promoted: R12's own document asks for measure-before-adopt, and its cited
+  physical numbers are R11's, from its author's console.
 - **Tooling** (`tools/ps5/`): `build.sh` (explicit `znver2`, fat LTO, one codegen unit, target-feature check),
   `env.sh`, the `run.sh` preset, `diagnose.sh`, `test.sh`, `test-merge.sh`, `test-r2.sh`–`test-r7.sh`, `bench.sh`,
   `bench-r2.sh`–`bench-r5.sh`, `check-r2.py`–`check-r6.py`, `summarize*.py`, `kv-budget.py`, `parity-r4.py`,
@@ -49,7 +62,10 @@ What the fork adds, all of it in `main`:
   `bench-r7-gemm.py` (dense64 fingerprint and A/B); `test-venus.sh` with `check-venus-cpu.py`,
   `check-venus-trace.py`, `venus-f16-check.c`, `venus-real-model.py` and `venus-real-weights.c` (F16/BF16 parity);
   `test-r8-contract.sh` with `r8-run-guarded.py`, `check-r8.py` and `compare-r8.py` (four-arm contract campaign); and
-  `test-r9.sh` with `check-r9.py` and `compare-r9.py` (single-expert replay). None of it modifies the console or the
+  `test-r9.sh` with `check-r9.py` and `compare-r9.py` (single-expert replay); and the R10–R12 gates: `test-r10.sh`
+  with `check-r10.py`, `compare-r10.py` and `compare-r12-boundaries.py`, `test-r11-iq.sh`, `test-r11u1.sh`,
+  `test-r11u1-audit.sh`, `check-r11.py`, `check-r11u1-audit.py`, `test-r12-iq.sh`, `test-r12-audit.sh`,
+  `check-r12.py`, `check-r12-audit.py`, `bench-r11.py` and `quality-r11.py`. None of it modifies the console or the
   system.
 
 ### Measured on one console (R1, historical)
@@ -76,9 +92,17 @@ nor is a format this engine loads, which reads GGUF.
 not in this table: [docs/PS5-R7.md](docs/PS5-R7.md) summarizes the supplied physical R6 campaign (one exploratory run per
 depth, 65024 prompt tokens at 139.5 prefill / 53.0 decode) and [docs/PS5-R8.md](docs/PS5-R8.md) a single-run R7
 comparison whose own text says the 8K decode delta comes from a slow baseline arm and is not a causal gain. No R6U1,
-R7, R8 or R9 benchmark is claimed here. Building a tree is not a measurement, and the per-version documents state
-themselves that their authors had no console, no toolchain and no weights when they were written. Treat R2–R9 as
-candidates until a benchmark says otherwise.
+R7, R8, R9, R10, R11U1 or R12 benchmark of this tree is claimed here. Building a tree is not a measurement, and the
+per-version documents state themselves that their authors had no console, no toolchain and no weights when they were
+written. Treat R2–R12 as candidates until a benchmark says otherwise.
+
+The one body of console evidence added after R1 is the physical **R11** campaign archived in
+[docs/validation-r12/](docs/validation-r12/physical-r11-results.md): routed IQ32 against the same binary's baseline at
+three contexts, 8128, 32256 and 65024 prompt tokens, gave prefill 314.4→408.0, 206.2→242.7 and 139.8→155.6 tok/s with
+decode 97.7→101.0, 82.4→84.1 and 67.4→67.3. Those are R11 numbers on the author's console with a specific build and
+residency (all 10240 experts resident, 100% hits at the near-64K run), the A/B/B/A prompt arms are 8K-only, and the
+corpus is synthetic and repeated; they are not a claim about R12, not raw-logit equivalence, and not general
+intelligence equivalence.
 
 ### Build and run on the console
 
@@ -94,6 +118,11 @@ bash tools/ps5/test-r5.sh
 bash tools/ps5/test-r7.sh         # R7: empty attention and MoE mailbox gates
 bash tools/ps5/test-r7-gemm.sh    # R7: dense128/dense64 fingerprint comparison
 bash tools/ps5/test-venus.sh --cpu   # R7-V1/V2 CPU kernels; no GPU and no shader compiler needed
+bash tools/ps5/test-r10.sh        # R10 frozen-route replay; PS5_R12_BOUNDARY_TRACE=1 adds the R12 boundaries
+bash tools/ps5/test-r11-iq.sh     # R11 IQ CPU contracts and the routed IQ32 GPU fingerprint
+bash tools/ps5/test-r11u1-audit.sh --offline  # defensive audit; --cpu and --gpu need a toolchain and the console
+bash tools/ps5/test-r12-iq.sh     # R12 routed integer tiles: 1296 geometries per arm at 0/32/64
+bash tools/ps5/test-r12-audit.sh --offline    # R12 audit gate; --gpu needs the console
 bash tools/ps5/run.sh chat  --model "$MODEL" --ctx 8192 --k q8 --v q4   # mixed KV (R6U1)
 bash tools/ps5/run.sh serve --model "$MODEL" --ctx 65536 --kv q8
 ```
@@ -104,9 +133,22 @@ The `ps5-r2` Cargo feature (five extra shader variants built with `glslc` and ch
 default in that script; `PS5_R2_BUILD=0` falls back to the R1 shaders on a console without the shader tools.
 `PS5_R5_ALL_PAIRS=1` widens the R5 test from 8 to 16 K/V pairs. R7's repaired shaders need a recent shader
 toolchain: the campaign used Shaderc 2026.4 and SPIRV-Tools 2025.1, and glslc 2023.8 fails the packed-dot compile.
-The R8 and R9 research campaigns are run separately, with the MoE model and a directory that must not exist yet:
-`bash tools/ps5/test-r8-contract.sh "$MODEL_MOE" results/r8-contract` and
-`bash tools/ps5/test-r9.sh "$MODEL_MOE" results/r9-layer0`.
+The R8, R9, R10, R11 and R12 research campaigns are run separately, with the MoE model and a directory that must not
+exist yet: `bash tools/ps5/test-r8-contract.sh "$MODEL_MOE" results/r8-contract`,
+`bash tools/ps5/test-r9.sh "$MODEL_MOE" results/r9-layer0` and `bash tools/ps5/test-r10.sh "$MODEL_MOE" results/r12-causal`
+with `PS5_R12_BOUNDARY_TRACE=1`. The R12 benchmark arm is compared against IQ32, not against an old baseline, and
+refuses to run without its marker in both arms:
+
+```sh
+for c in iqint32 iqint64; do
+  python3 tools/ps5/bench-r11.py --model "$MODEL_MOE" --candidate "$c" --out "results/r12-$c-8k" \
+    --ctx 8192 --pp 128,512,2048,4096 --tg 32 --reps 3 --min-ram-mb 1024
+  python3 tools/ps5/quality-r11.py --model "$MODEL_MOE" --candidate "$c" --corpus "$CORPUS" --out "results/r12-$c-quality"
+done
+```
+
+No R12 promotion is possible on aggregate alone: [docs/PS5-R12.md](docs/PS5-R12.md) requires a 3% aggregate gain, no
+phase below −5%, the signature and dispatch gates, and an independent quality corpus.
 
 ### Rollback
 
@@ -119,25 +161,29 @@ STRATA_PS5_DIRECT=0              # only the direct upload path
 STRATA_PREFILL_PROTECT=1|strict  # opt back into the fork's old prompt handling (now OFF by default, see R6U1)
 ```
 
-Every R2–R9 switch is off by default — the later ones are read only as the literal `1`, except `STRATA_PS5_R9_MODE`,
-which takes `shadow`, `legacy` or `contract` and is off when empty — so a plain build is R1 behaviour plus upstream.
-`STRATA_SCALAR` overrides the new F16/BF16 CPU kernels, and `STRATA_PS5_R4_RESEARCH=1` is still required to touch the
-quarantined R4 hybrid scheduler and the file-backed import. The tags below rebuild any earlier point
-(`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure).
+Every R2–R12 switch is off by default — most later ones are read only as the literal `1`, with three exceptions:
+`STRATA_PS5_R9_MODE` takes `shadow`, `legacy` or `contract` and is off when empty, `STRATA_PS5_R12_IQ_INT_TILE` takes
+`32` or `64` and falls back to off on any other value, and the R11 register-pressure screens
+(`STRATA_PS5_R11_GEMV_RPW`, `_DOWN_RPW`) accept only `0/1/2/4/8`. A plain build is therefore R1 behaviour plus
+upstream. `STRATA_SCALAR` overrides the new F16/BF16 CPU kernels, `STRATA_PS5_R4_RESEARCH=1` is still required to touch
+the quarantined R4 hybrid scheduler and the file-backed import, and `STRATA_PS5_R12_BOUNDARY_TRACE=1` is a
+research-only tracer: it refuses to run unless `STRATA_PS5_R10_ROUTES` is `record` or `replay` on a single-device R9
+prefill, it is enabled only in the instrumented arms of `test-r10.sh`, and its timings are not benchmarks. The tags
+below rebuild any earlier point (`git switch --detach ps5-r3`, `bash tools/ps5/build.sh`, measure).
 
 ### Branches and tags
 
 | ref | what it is |
 |---|---|
-| `main` (received) | frozen R11, `c2cacb3`; do not interrupt its physical campaign |
-| `ps5/r11u1` | selective upstream 1.4.1 integration, not yet physically validated |
+| `main` | **R12-Audit**, `3854f34`; everything below is already an ancestor of it |
+| `ps5/r10`, `ps5/r11`, `ps5/r11u1`, `ps5/r11u1-audit`, `ps5/r12`, `ps5/r12-audit` | one branch per later delta, each merged fast-forward into `main` and each with its own document; the four latter ones carry tags `ps5-r11u1`, `ps5-r11u1-audit`, `ps5-r12` and `ps5-r12-audit`, while R10 has **no tag** — rebuild it from `ps5/r10` (`51b1d46`) |
 | `ps5-r1` … `ps5-r6` | one tag per PS5 version; each checkpoint stays reconstructible without being re-derived |
-| `ps5-r6u1` | the R6U1 merge |
+| `ps5-r6u1` | the R6U1 merge (annotated) |
 | `ps5-r7`, `ps5-r7-venus`, `ps5-r7-venus-v2`, `ps5-r8`, `ps5-r9` | one tag per later delta, each with its own branch (`ps5/r7` … `ps5/r9`) and its own document; they arrived as git bundles and were merged fast-forward, so their commit hashes are the authors' |
 | `feat/expert-cache-prefill-protect` | `b7b832b`, the prefill-protect change alone (the upstream PR branch, pushed as `upstream/pr-108`), kept free of the PS5 port so the PR does not carry it |
 | upstream source archives | `260a11c9` (1.4.0), R6U1 merge base; `956904f` (1.4.1), R11U1 comparison target |
 
-### PS5 versions R1–R11U1
+### PS5 versions R1–R12-Audit
 
 | version | tag | what it adds | opt-in switches |
 |---|---|---|---|
@@ -153,18 +199,28 @@ quarantined R4 hybrid scheduler and the file-backed import. The tags below rebui
 | R7-V2 | `ps5-r7-venus-v2` | native BF16 CPU GEMV for exact 2-byte rows, and an independent BF16/F16 parity harness over real Qwen3-0.6B weights; needs a GGUF converted with `--outtype bf16` | `STRATA_PS5_VENUS_BF16` |
 | R8 | `ps5-r8` | routed-arithmetic contract investigation: a deliberately slow CPU oracle that follows Vulkan's own type/column selection, route-aware gate/up/down probes, and a guarded four-arm campaign; an accuracy experiment, never a production path | `STRATA_PS5_R8_CONTRACT`, `STRATA_R7_R4_STAGE_PROBE`, `PS5_R8_TIMEOUT` |
 | R9 | `ps5-r9` | matched single-expert causal replay: replaces exactly one GPU-routed expert row just before the Vulkan combine, reads the combined row back, and fails closed on a missing target or a mismatch | `STRATA_PS5_R9_MODE` (`shadow`, `legacy`, `contract`), `PS5_R9_LAYER`, `PS5_R9_POS`, `PS5_R9_TOKEN`, `PS5_R9_RANK` |
-| R10 | `ps5/r10` (branch) | sham write control, frozen routing and Venus tail | see [R10](docs/PS5-R10.md) |
-| R11 | `ps5/r11` (branch) | IQ32 GPU, IQ CPU contracts and GEMV/down wave candidates | see [R11](docs/PS5-R11.md) |
-| R11U1 | `ps5/r11u1` (branch) | selective upstream 1.4.1; PS5 batch CPU quarantine | `STRATA_PS5_U1_BATCH_LOG` (diagnostic only) |
+| R10 | no tag — use the branch `ps5/r10` | identical-write (sham) control, a frozen route tape replayed into prefill, and the Venus F16 tail | `STRATA_PS5_R10_ROUTES` (`record`, `replay`), `STRATA_PS5_R10_ROUTE_FILE`, `STRATA_PS5_VENUS_TAIL` |
+| R11 | `ps5-r11` | routed IQ32 GPU GEMM, IQ CPU contract candidates (IQ2_XS SIMD, IQ3_XXS/IQ4_XS Q8-32) and GEMV/down register-pressure screens | `STRATA_PS5_R11_IQ32`, `_IQ_F16`, `_IQ_Q32`, `_LOG`, `_PROFILE`, `_GEMV_RPW`, `_DOWN_RPW` |
+| R11U1 | `ps5-r11u1` | selective upstream 1.4.1: backend fixes byte for byte, a bounds-checked `expert_cache::layer`, and the PS5 quarantine of the batch CPU-miss path | `STRATA_PS5_U1_BATCH_LOG` (diagnostic only) |
+| R11U1-Audit | `ps5-r11u1-audit` | defensive pass: atomic expert dedup with a per-slot fallback, bounded GGUF metadata recursion with validated arrays, KLD/NLL validation, telemetry parsing, causal evidence bound to coordinates and stage widths | none added; the dedup and Q8 changes alter behaviour where the old paths were wrong |
+| R12 | `ps5-r12` | routed IQ3_XXS/IQ4_XS integer tiles at 32 and 64 positions with the 128-position tile list left immutable, plus a research-only full-chunk FP32 boundary trace | `STRATA_PS5_R12_IQ_INT_TILE=32\|64`, `STRATA_PS5_R12_BOUNDARY_TRACE` (requires R10), `PS5_R12_BOUNDARY_TRACE` in the harness |
+| R12-Audit | `ps5-r12-audit` | dispatch and typed-range preflight against the device limits, incomplete-Q8-subgroup fallback to the F16 route, dense non-routed reference per case, shell gates that can no longer pass on a leaked marker, stricter KLD/NLL and telemetry | none added; shapes divisible by 128 but not 256 now take F16 |
 
-Keep the frozen R11 worktree for its running physical campaign. R11U1 is cumulative in code, not in evidence;
-validate it in a separate worktree before adopting it. Earlier checkpoints remain reconstructible.
+The chain is cumulative in code but not in evidence: R11U1, R12 and the two audit passes were each prepared without a
+toolchain or a console, so validate them in a separate worktree before adopting anything. What did reach a console is
+the physical **R11** campaign, now archived in
+[docs/validation-r12/physical-r11-results.md](docs/validation-r12/physical-r11-results.md) — its IQ32 runs at 8K, 32K
+and 64K completed, and its combined arm is recorded `NOT_RUN_NO_COMPATIBLE_FINALISTS`. Earlier checkpoints remain
+reconstructible.
 
 Per-version documentation: [docs/PS5.md](docs/PS5.md) (R1), [docs/PS5-R2.md](docs/PS5-R2.md),
 [docs/PS5-R3.md](docs/PS5-R3.md), [docs/PS5-R4.md](docs/PS5-R4.md), [docs/PS5-R5.md](docs/PS5-R5.md),
 [docs/PS5-R6.md](docs/PS5-R6.md), [docs/PS5-R6U1.md](docs/PS5-R6U1.md), [docs/PS5-R7.md](docs/PS5-R7.md),
-[docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md), [docs/PS5-R8.md](docs/PS5-R8.md)
-and [docs/PS5-R9.md](docs/PS5-R9.md), each with its contracts, its flags and its own limits.
+[docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md), [docs/PS5-R8.md](docs/PS5-R8.md),
+[docs/PS5-R9.md](docs/PS5-R9.md), [docs/PS5-R10.md](docs/PS5-R10.md), [docs/PS5-R11.md](docs/PS5-R11.md),
+[docs/PS5-R11U1.md](docs/PS5-R11U1.md), [docs/PS5-R11U1-AUDIT.md](docs/PS5-R11U1-AUDIT.md),
+[docs/PS5-R12.md](docs/PS5-R12.md) and [docs/PS5-R12-AUDIT.md](docs/PS5-R12-AUDIT.md), each with its contracts, its
+flags and its own limits.
 
 ### R6U1: what the upstream merge changed
 
@@ -190,10 +246,11 @@ behaviour:
 
 ### Validation status
 
-R11U1: independent R9/R10/R11 and KLD checks passed locally; Rust compilation and physical batch guard are pending.
-R10's document records later R9 physical Venus F16/BF16 performance and causal findings. R11 physical results remain
-pending at this integration point. The following bullets describe earlier reports at their original preparation dates,
-not the current cumulative physical status:
+R12-Audit: the offline regression suite ran here and passed; Rust compilation, shader validation, dense-vs-routed parity
+and every physical measurement are pending. R12's own gates (1296 routed integer geometries per arm, the IQ32 baseline
+reproduction, the 3%/-5% promotion thresholds) have not been executed either. The archived R11 physical campaign is the
+newest console evidence in the tree. The bullets below describe each report at its original preparation date, not a
+cumulative physical status:
 
 
 - **R6U1 was not compiled, not GLSL/SPIR-V validated, not run and not benchmarked** in the environment that prepared
@@ -204,7 +261,8 @@ not the current cumulative physical status:
 - **R6 (the tree before this merge) was compiled on the console** with `tools/ps5/build.sh`, shader variants included,
   in 3m11s. That is compilation only.
 - **R1 was compiled and measured** on the console; those are the numbers in the table. **R2–R6 were never
-  benchmarked**, and neither were R6U1 or R7–R9; none of them inherits the R1 figures as a measurement of its own.
+  benchmarked**, and neither were R6U1, R7–R9 or R11U1–R12; none of them inherits the R1 figures as a measurement of its
+  own.
 - **R7–R9 were prepared without a toolchain and without a console**, as their own documents state: the Rust build, the
   new shader build, GPU parity and any tok/s are pending for all five deltas. What they do ship is evidence from their
   authors' environment — `docs/validation-r8/` copies the R6/R7 campaign tables (four-arm parity, dense64 retries,
@@ -213,13 +271,27 @@ not the current cumulative physical status:
   was produced on this console, and R9's own document says outright that R9 has no physical parity and that R8's
   physical results are not R9 results.
 
+- **R10–R12 were prepared the same way**, without a Rust compiler, a shader validator or a console, and what ran in
+  their environments is Python and C: `check-r10.py`, `check-r11.py` (routed tile coverage), `check-r11u1-audit.py`,
+  `check-r12.py` (2322 routed integer geometries), `check-r12-audit.py` (20 000 deduplication scenarios and 16 rejected
+  KLD fixtures) and `compare-r12-boundaries.py`, with their logs in `docs/validation-r12/` and
+  `docs/validation-r12-audit/`. None of that exercises Vulkan, the `--gpu` arms of `test-r11u1-audit.sh` and
+  `test-r12-audit.sh` are `#[ignore]` and have never been run, and the physical R11 campaign R12 cites is R11's
+  evidence, not R12's.
+
 What is still open is written down rather than implied: the A/B/B/A plan, the acceptance criteria, the mixed-KV
 quality question and the unresolved `attn_merge` / TurboQuant / MoE shared-flag risks are in
 [docs/PS5-R6U1.md](docs/PS5-R6U1.md); the physical build of R7 and R7's dense64 gate are in
 [docs/PS5-R7.md](docs/PS5-R7.md); the Rust/parity gates of the Venus kernels are in
 [docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md) and [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md); the R4 hybrid failure and the
-four-arm race are in [docs/PS5-R8.md](docs/PS5-R8.md), and the replay is in [docs/PS5-R9.md](docs/PS5-R9.md). Those
-documents, not this README, are the acceptance criteria. The historical fork report is preserved verbatim in
+four-arm race are in [docs/PS5-R8.md](docs/PS5-R8.md), and the replay in [docs/PS5-R9.md](docs/PS5-R9.md). The later
+deltas keep the same discipline: R10's route tape and boundary controls are in [docs/PS5-R10.md](docs/PS5-R10.md),
+R11's IQ work and its refusal to promote the register-pressure screens in [docs/PS5-R11.md](docs/PS5-R11.md), the
+deferred multi-device batching in [docs/PS5-R11U1.md](docs/PS5-R11U1.md) and
+[docs/PS5-R11U1-AUDIT.md](docs/PS5-R11U1-AUDIT.md), R12's ordered physical acceptance plan in
+[docs/PS5-R12.md](docs/PS5-R12.md), and R12-Audit's "do not relax bitwise tolerances to pass" in
+[docs/PS5-R12-AUDIT.md](docs/PS5-R12-AUDIT.md). Those documents, not this README, are the acceptance criteria. The
+historical fork report is preserved verbatim in
 [docs/archive/PS5-fork-612c3c9-README.md](docs/archive/PS5-fork-612c3c9-README.md), with its R1 measurements, and its
 own report in `docs/archive/PS5-fork-612c3c9-R1-report.md`.
 
@@ -356,9 +428,11 @@ Inkling 2 open the GPU by themselves.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
 - [PS5.md](docs/PS5.md), [PS5-R2.md](docs/PS5-R2.md), [PS5-R3.md](docs/PS5-R3.md), [PS5-R4.md](docs/PS5-R4.md),
   [PS5-R5.md](docs/PS5-R5.md), [PS5-R6.md](docs/PS5-R6.md), [PS5-R6U1.md](docs/PS5-R6U1.md), [PS5-R7.md](docs/PS5-R7.md),
-  [PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [PS5-R7-V2.md](docs/PS5-R7-V2.md), [PS5-R8.md](docs/PS5-R8.md) and
-  [PS5-R9.md](docs/PS5-R9.md): this fork's PS5 port, one version per document, with its contracts, its switches and its
-  limits.
+  [PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [PS5-R7-V2.md](docs/PS5-R7-V2.md), [PS5-R8.md](docs/PS5-R8.md),
+  [PS5-R9.md](docs/PS5-R9.md), [PS5-R10.md](docs/PS5-R10.md), [PS5-R11.md](docs/PS5-R11.md),
+  [PS5-R11U1.md](docs/PS5-R11U1.md), [PS5-R11U1-AUDIT.md](docs/PS5-R11U1-AUDIT.md), [PS5-R12.md](docs/PS5-R12.md) and
+  [PS5-R12-AUDIT.md](docs/PS5-R12-AUDIT.md): this fork's PS5 port, one version per document, with its contracts, its
+  switches and its limits.
 - [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
