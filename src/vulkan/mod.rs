@@ -2060,12 +2060,16 @@ impl Vk {
             self.quant_xq(x, x_stride, cols, ntok, self.1.addr())?;
             self.1.addr()
         };
-        let max_nm = match max_dup.min(17) {
-            0 | 1 => 1u32,
-            2..=4 => 4,
-            5..=8 => 8,
-            _ => 17,
-        };
+        // Without rebuilt shaders the checked-in SPIR-V still contains the old shared
+        // flag race and truncated dedup list. Keep its correct single-slot path.
+        let max_nm = if cfg!(feature = "ps5-r2") {
+            match max_dup.min(17) {
+                0 | 1 => 1u32,
+                2..=4 => 4,
+                5..=8 => 8,
+                _ => 17,
+            }
+        } else { 1 };
         let spec = [&ws[..], &[max_nm]].concat();
         let original = if max_nm > 1 { 1 } else { (4096 / cols).max(1) };
         let rpw = if max_nm == 1 && ntok == 1 { self.r11_rpw(ty, "STRATA_PS5_R11_GEMV_RPW", original)? } else { original };
