@@ -12,11 +12,11 @@ class Gates(unittest.TestCase):
             lines=[]
             if arm!='gpu':
                 for i in range(6):
-                    row={'layer':0,'pos':0,'chunk':32,'token':0,'rank':0,'expert':2+i%2,'slot':3,'ids':[2,3],'hidden':[1.,-0.0],'gpu_down':[.25,.5],'weights':[.5,.5]}
+                    row={'layer':0,'pos':0,'chunk':2,'token':1,'rank':0,'expert':2,'slot':1,'ids':[2,3,2,3],'hidden':[1.,-0.0],'gpu_down':[.25,.5],'weights':[.5,.5]}
                     lines.append('r9_fixed,'+json.dumps(row))
-                    lines.extend(f'r7_r4_stage,0,32,2,3,0,{s},2,0,0,1' for s in r9.STAGES)
-                    if arm!='shadow': lines.append(f'r9_write,{arm},0,0,3,2')
-                    lines.append('r9_combine,0,0,0,[0.25,0.5]')
+                    lines.extend(f'r7_r4_stage,0,2,2,1,1,{s},2,0,0,1' for s in r9.STAGES)
+                    if arm!='shadow': lines.append(f'r9_write,{arm},0,0,1,2')
+                    lines.append('r9_combine,0,0,1,[0.25,0.5]')
             (self.root/(arm+'.log')).write_text('\n'.join(lines))
     def edit(self,arm,fn):
         p=self.root/(arm+'.log');p.write_text(fn(p.read_text()))
@@ -26,10 +26,10 @@ class Gates(unittest.TestCase):
         self.edit('contract',lambda s:s.replace('"hidden": [1.0, -0.0]','"hidden": [1.0, 0.0]',1))
         with self.assertRaisesRegex(ValueError,'fixed input'):r9.evaluate(self.root)
     def test_route_change(self):
-        self.edit('legacy',lambda s:s.replace('"ids": [2, 3]','"ids": [2, 4]',1))
+        self.edit('legacy',lambda s:s.replace('"ids": [2, 3, 2, 3]','"ids": [2, 4, 2, 3]',1))
         with self.assertRaisesRegex(ValueError,'fixed input'):r9.evaluate(self.root)
     def test_missing_write(self):
-        self.edit('contract',lambda s:s.replace('r9_write,contract,0,0,3,2','ignored',1))
+        self.edit('contract',lambda s:s.replace('r9_write,contract,0,0,1,2','ignored',1))
         with self.assertRaisesRegex(ValueError,'number of writes'):r9.evaluate(self.root)
     def test_missing_stage(self):
         self.edit('shadow',lambda s:s.replace(',r9_gate_full,',',missing,',1))
@@ -37,7 +37,16 @@ class Gates(unittest.TestCase):
     def test_shadow_changed(self):
         p=self.root/'shadow.json';d=json.loads(p.read_text());d['logits'][0][0]=2;p.write_text(json.dumps(d))
         with self.assertRaisesRegex(ValueError,'shadow changed'):r9.evaluate(self.root)
+    def test_wrong_stage_identity(self):
+        self.edit('contract',lambda s:s.replace('r7_r4_stage,0,2,2,1,1,r9_gate_full','r7_r4_stage,0,2,3,1,1,r9_gate_full',1))
+        with self.assertRaisesRegex(ValueError,'stage coordinates'):r9.evaluate(self.root)
+    def test_wrong_stage_width(self):
+        self.edit('shadow',lambda s:s.replace(',r9_down_own,2,0,0,1',',r9_down_own,1,0,0,1',1))
+        with self.assertRaisesRegex(ValueError,'stage width'):r9.evaluate(self.root)
+    def test_wrong_slot(self):
+        self.edit('shadow',lambda s:s.replace('"slot": 1','"slot": 0',1))
+        with self.assertRaisesRegex(ValueError,'expert/slot'):r9.evaluate(self.root)
     def test_nonfinite(self):
-        self.edit('shadow',lambda s:s.replace('r9_combine,0,0,0,[0.25,0.5]','r9_combine,0,0,0,[NaN,0.5]',1))
+        self.edit('shadow',lambda s:s.replace('r9_combine,0,0,1,[0.25,0.5]','r9_combine,0,0,1,[NaN,0.5]',1))
         with self.assertRaisesRegex(ValueError,'invalid combine'):r9.evaluate(self.root)
 if __name__=='__main__':unittest.main(verbosity=2)

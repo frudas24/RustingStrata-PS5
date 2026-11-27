@@ -1203,7 +1203,7 @@ impl GpuModel<'_> {
                     }
                     g.moe_combine_seq(fx, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
                     if let Some((_, token, _, _, _)) = &r9_replacement {
-                        let combined = g.get::<f32>(&pf.slab, *token * ne, ne)?;
+                        let combined = g.get::<f32>(&pf.slab, ((fx - base) / 4) as usize + *token * ne, ne)?;
                         anyhow::ensure!(combined.iter().all(|v| v.is_finite()), "R9 nonfinite combine");
                         // Full vector, not just a fingerprint: offline compares the exact GPU combine boundary.
                         eprintln!("r9_combine,{il},{},{token},{}", self.pos, serde_json::to_string(&combined)?);

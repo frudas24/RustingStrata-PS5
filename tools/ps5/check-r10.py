@@ -50,6 +50,10 @@ class Gates(unittest.TestCase):
     def test_corrupt_tape(self):
         p=self.root/'routes.json';r=json.loads(p.read_text());r[1]['weights'][0]=.6;p.write_text(json.dumps(r))
         with self.assertRaisesRegex(ValueError,'tape does not match'):r10.evaluate(self.root)
+    def test_fixed_route_not_tape(self):
+        for arm in r10.ARMS:
+            self.edit(arm,lambda s:s.replace('"weights": [0.5, 0.5]}','"weights": [0.6, 0.4]}',1))
+        with self.assertRaisesRegex(ValueError,'does not match recorded route'):r10.evaluate(self.root)
     def test_missing_layer(self):
         self.edit('replay-contract',lambda s:'\n'.join(x for x in s.splitlines() if not x.startswith('r9_layer_out,1,')))
         with self.assertRaisesRegex(ValueError,'incomplete trace'):r10.evaluate(self.root)

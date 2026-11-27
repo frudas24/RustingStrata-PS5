@@ -11,7 +11,7 @@ def require(ok, msg):
 def bits(a,b):
     return len(a)==len(b) and all(struct.pack('<f',x)==struct.pack('<f',y) for x,y in zip(a,b))
 def finite(a):
-    return isinstance(a,list) and bool(a) and all(math.isfinite(v) for v in a)
+    return isinstance(a,list) and bool(a) and all(type(v) in (int,float) and math.isfinite(v) for v in a)
 def read_arm(root, arm, expected=6, write_mode=None):
     mode=arm if write_mode is None else write_mode
     raw=(root/(arm+'.log')).read_text().splitlines()
@@ -25,7 +25,7 @@ def read_arm(root, arm, expected=6, write_mode=None):
         if len(p)==11 and p[6] in stages:
             n, different, err, denom=int(p[7]),int(p[8]),float(p[9]),float(p[10])
             require(n>0 and 0<=different<=n and math.isfinite(err) and math.isfinite(denom) and min(err,denom)>=0,'invalid stage '+p[6])
-            stages[p[6]].append(dict(n=n,different=different,max_abs=err,denom=denom))
+            stages[p[6]].append(dict(coordinates=list(map(int,p[1:6])),n=n,different=different,max_abs=err,denom=denom))
     require(len(fixed)==len(combine)==expected,arm+' wrong number of matched cases')
     require(all(len(v)==expected for v in stages.values()),arm+' incomplete stages')
     require(all(v['different']==0 for v in stages['r9_contract_self']),arm+' inconsistent contract decomposition')
@@ -33,7 +33,19 @@ def read_arm(root, arm, expected=6, write_mode=None):
     for i,(f,(key,vec)) in enumerate(zip(fixed,combine)):
         require(key==(f['layer'],f['pos'],f['token']) and finite(vec),arm+' invalid combine boundary')
         require(all(finite(f[k]) for k in FIELDS),arm+' invalid fixed vector')
-        require(len(f['gpu_down'])==len(vec),arm+' wrong combine width')
+        require(len(f['gpu_down'])==len(vec)==len(f['hidden']),arm+' wrong combine width')
+        chunk, token, rank, expert, slot = (f[k] for k in ('chunk','token','rank','expert','slot'))
+        ids, k = f['ids'], len(f['weights'])
+        require(all(type(v) is int and v>=0 for v in (chunk,token,rank,expert,slot,f['layer'],f['pos']))
+                and chunk>0 and token<chunk and rank<k and len(ids)==chunk*k
+                and all(type(v) is int and v>=0 for v in ids),arm+' invalid fixed route shape')
+        route=token*k+rank
+        require(ids[route]==expert and slot==sum(e<expert for e in ids)+sum(e==expert for e in ids[:route]),arm+' expert/slot mismatch')
+        coordinates=[f['layer'],chunk,expert,slot,token]
+        require(all(rows[i]['coordinates']==coordinates for rows in stages.values()),arm+' stage coordinates do not match intervention')
+        activation_width=stages['r9_gate_full'][i]['n']
+        require(all(stages[name][i]['n']==activation_width for name in STAGES[:4])
+                and all(stages[name][i]['n']==len(vec) for name in STAGES[4:]),arm+' stage width mismatch')
         if mode!='shadow':
             w=writes[i]; require(w==[mode,str(f['layer']),str(f['pos']),str(f['slot']),str(len(vec))],arm+' wrong write identity')
     return fixed,combine,stages

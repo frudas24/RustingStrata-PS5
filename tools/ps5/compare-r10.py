@@ -51,6 +51,10 @@ def evaluate(root):
     expected=[(pos,layer,tokens[pos:pos+n]) for pos in range(0,len(tokens),n) for layer in layer_ids]
     require([(r['pos'],r['layer'],r['tokens']) for r in ref]==expected,'reference route coverage mismatch')
     require(target in [key(r) for r in ref],'missing intervention route')
+    target_row=next(r for r in ref if key(r)==target)
+    selected=fixed[0]; k=target_row['top_k']; tok=selected['token']
+    require(selected['chunk']==len(target_row['tokens']) and selected['ids']==target_row['ids']
+            and bits(selected['weights'],target_row['weights'][tok*k:(tok+1)*k]),'fixed intervention does not match recorded route')
     require(len(lay)==len(ref) and [(pos,layer) for layer,pos,_ in lay]==[key(r) for r in ref],'reference trace coverage mismatch')
     require(all(bits(a,b) for a,b in zip(baseline,logits(root,'shadow'),strict=True)),'shadow changed GPU')
     stored=json.loads((root/'routes.json').read_text()); require(len(stored)==len(ref) and all(same(a,b) for a,b in zip(stored,ref,strict=True)),'tape does not match shadow')
