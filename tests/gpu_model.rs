@@ -924,3 +924,47 @@ fn prefill_slots_matches_single() {
     eprintln!("prefill_slots_matches_single {bk}: largest logit difference {worst}");
     }
 }
+
+/// PS5-only guard, isolated from the ordinary test suite. Run with test-r11u1.sh --batch.
+/// Force misses, then ensure STRATA_CPU_FRAC cannot override the profile's GPU-only batch route.
+#[test]
+#[ignore]
+fn u1_ps5_batch_quarantine() {
+    let _lock = common::gpu_lock();
+    let path = std::env::var("STRATA_MODEL").expect("set STRATA_MODEL to the exact MoE GGUF");
+    assert_eq!(std::env::var("STRATA_PS5").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("STRATA_EXPERT_MB").as_deref(), Ok("0"));
+    assert_eq!(std::env::var("STRATA_FIXED_EXPERTS").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("STRATA_PS5_SCHED").as_deref(), Ok("off"));
+    let gguf = Gguf::open(std::path::Path::new(&path)).unwrap();
+    let model = Model::load(&gguf).unwrap();
+    let gpu: Box<dyn rusting_strata::backend::Backend> = Box::new(rusting_strata::vulkan::Vk::new(0).unwrap());
+    assert!(gpu.ps5_preset(), "test requires the active PS5 Vulkan profile");
+    let mut gm = GpuModel::load_slots(&model, gpu, 256, 16, 768 << 20, 6).unwrap();
+    assert!(gm.is_moe() && gm.slots() >= 6 && gm.batch_cap() >= 6, "batch path not supported");
+    gm.adapt_every = 0;
+    let run = |gm: &mut GpuModel| {
+        for s in 0..6 { gm.use_slot(s); gm.reset().unwrap(); }
+        let cache = gm.cache.as_ref().expect("MoE cache not configured");
+        assert!(cache.total_experts() > 0);
+        assert_eq!(cache.resident_count(), 0, "test must force cache misses");
+        let rows: Vec<_> = (0..6).map(|s| (s, 11u32 + s as u32, true)).collect();
+        let got = gm.step_batch(&rows).unwrap();
+        assert_eq!(got.len(), rows.len());
+        assert!(got.iter().all(|(_, l)| !l.is_empty() && l.iter().all(|x| x.is_finite())));
+        got
+    };
+    // SAFETY: this ignored test must be run alone, as in the wrapper; the GPU lock
+    // also serializes model-loading tests. Neither arm runs CPU batch experts.
+    unsafe { std::env::set_var("STRATA_CPU_FRAC", "0"); }
+    let a = run(&mut gm);
+    unsafe { std::env::set_var("STRATA_CPU_FRAC", "1"); }
+    let b = run(&mut gm);
+    unsafe { std::env::remove_var("STRATA_CPU_FRAC"); }
+    for ((ta, a), (tb, b)) in a.iter().zip(&b) {
+        assert_eq!(ta, tb);
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    }
+    eprintln!("R11U1_BATCH_GUARD PASS: 6 finite, bit-identical full-logit rows");
+}
