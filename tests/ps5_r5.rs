@@ -38,8 +38,8 @@ fn fingerprint() {
         let n = (pos + t) * nkv * hd;
         let k = common::up(&g, &vals(n, 11));
         let v = common::up(&g, &vals(n, 97));
-        let kc = g.zeros::<u16>(g.kv_words(n)).unwrap();
-        let vc = g.zeros::<u16>(g.kv_words_v(n)).unwrap();
+        let kc = g.alloc(g.kv_words(n) * size_of::<u16>()).unwrap();
+        let vc = g.alloc(g.kv_words_v(n) * size_of::<u16>()).unwrap();
         let zero = common::up(&g, &[0i32]);
         g.kv_store(k.addr(), v.addr(), kc.addr(), vc.addr(), nkv * hd, pos + t, zero.addr(), hd).unwrap();
         let q = common::up(&g, &vals(t * nh * hd, 23));

@@ -46,20 +46,20 @@ fn parity_fingerprint() {
             let x = common::up(&g, &xs);
             let ids = common::up(&g, &[18i32, 0, 9, 2, 5]);
             for nt in [1usize, 2, 3, 4, 5, 17] {
-                let y = g.zeros::<f32>(nt * rows).unwrap();
+                let y = g.alloc((nt * rows) * std::mem::size_of::<f32>()).unwrap();
                 g.gemvq(&w, x.addr(), x_stride, 0, y.addr(), rows, nt).unwrap();
                 append(common::down(&g, &y));
-                let a = g.zeros::<f32>(nt * rows).unwrap();
-                let b = g.zeros::<f32>(nt * 7).unwrap();
+                let a = g.alloc((nt * rows) * std::mem::size_of::<f32>()).unwrap();
+                let b = g.alloc((nt * 7) * std::mem::size_of::<f32>()).unwrap();
                 g.gemvq2(&w, &w2, x.addr(), x_stride, 0, a.addr(), b.addr(), nt).unwrap();
                 append(common::down(&g, &a)); append(common::down(&g, &b));
-                let selected = g.zeros::<f32>(nt * 5).unwrap();
+                let selected = g.alloc((nt * 5) * std::mem::size_of::<f32>()).unwrap();
                 g.gemv_rows_n(&w, x.addr(), x_stride, 0, ids.addr(), 5, selected.addr(), nt).unwrap();
                 append(common::down(&g, &selected));
             }
             let experts = common::up(&g, &[2i32, -1, 0, 1]);
             for (k, xg) in [(4usize, 4usize), (4, 2), (4, 1)] {
-                let y = g.zeros::<f32>(k * rows).unwrap();
+                let y = g.alloc((k * rows) * std::mem::size_of::<f32>()).unwrap();
                 g.moe_gemv(ty, rows, cols, all.ptr, rows * rb, experts.addr(), k, x.addr(), x_stride, xg, y.addr(), None, 0).unwrap();
                 let out: Vec<f32> = common::down(&g, &y);
                 assert!(out[rows..2*rows].iter().all(|&f| f == 0.0));
