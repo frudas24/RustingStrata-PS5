@@ -51,6 +51,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("dflash2_conv", include_bytes!("spv/dflash2_conv.spv")),
     ("gemm_f", include_bytes!("spv/gemm_f.spv")),
     ("gemm_f_dp", include_bytes!("spv/gemm_f_dp.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("gemm_f_dp_ps5_iq32", include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f_dp_ps5_iq32.spv"))),
     ("gemm_fs", include_bytes!("spv/gemm_fs.spv")),
     ("gemmi", include_bytes!("spv/gemmi.spv")),
     ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
@@ -1119,6 +1121,7 @@ impl Vk {
                 "gemv_q_ps5_128" | "moe_gemv_q_ps5_128" => 2,
                 "gemmi_dp_ps5_32" => 4,
                 "gemmi_dp_ps5_64" => 1 << 8,
+                "gemm_f_dp_ps5_iq32" => 1 << 9,
                 "attn_prefill_ps5_256" => 8,
                 "attn_prefill_ps5_512" => 16,
                 "attn_prefill_ps5_1024" => 32,
@@ -1190,6 +1193,11 @@ impl Vk {
 }
 
 impl Vk {
+    fn r11_iq32(&self, ty: GgmlType) -> bool {
+        cfg!(feature = "ps5-r2") && self.0.ps5 && !self.0.coop && ty == GgmlType::IQ2XS
+            && std::env::var("STRATA_PS5_R11_IQ32").as_deref() == Ok("1")
+    }
+
     fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if n_x <= crate::cpu_worker::TMAX && need <= (1 << 20) { &self.4 } else { &self.3 }
@@ -1239,6 +1247,9 @@ impl Vk {
         if f {
             if !same { q8.1 = None; }
             let args: [&dyn Arg; 12] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
+            if tiles != 0 && self.r11_iq32(ty) {
+                return self.run("gemm_f_dp_ps5_iq32", &spec, grid, &args);
+            }
             self.run(if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" }, &spec, grid, &args)?;
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }

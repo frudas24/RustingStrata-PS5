@@ -50,6 +50,63 @@ void stw(uint tid, uint wv[8]) {
     [[unroll]] for (uint q = 0; q < 2; q++) [[unroll]] for (uint e = 0; e < 4; e++) ws[(tid / 8 + 32 * q) * PW + (tid % 8) * 4 + e] = wv[4 * q + e];
 }
 
+#ifdef STRATA_R11_SHORT
+// Same 128-position routed tile ABI, internally consume 32 positions at a time.
+// Each logical wave owns a 16x16 tile. FMA order per output is unchanged.
+void main() {
+    uint tid = gl_LocalInvocationID.x, w = WARP, n0 = gl_WorkGroupID.x * 64;
+    uint t = LANE & 3, g = LANE >> 2;
+    uint tm = 16 * (w & 1), tn = 16 * (w >> 1);
+    uint64_t meta = p.tiles.v[2 * gl_WorkGroupID.y + 1];
+    U8 wt = U8(p.tiles.v[2 * gl_WorkGroupID.y]);
+    uint start = uint(meta), count = uint(meta >> 32);
+    load_tables();
+    for (uint base = 0; base < count; base += 32) {
+        uint m0 = start + base, cnt = min(32u, count - base);
+        float acc[8];
+        [[unroll]] for (uint i = 0; i < 8; i++) acc[i] = 0.0;
+        uint xc = (tid & 15) * 4, xb[2];
+        [[unroll]] for (uint q = 0; q < 2; q++) {
+            uint r = (tid >> 4) + 16 * q;
+            xb[q] = r < cnt ? ((uint64_t(p.xrow) != 0 ? uint(p.xrow.v[m0 + r]) : m0 + r) * p.xs + xc) / 4 : ~0u;
+        }
+        uint wv[8];
+        ldw(wt, n0, 0, tid, wv);
+        stw(tid, wv);
+        for (uint kb = 0; kb < p.nk; kb++) {
+            [[unroll]] for (uint q = 0; q < 2; q++) {
+                uint r = (tid >> 4) + 16 * q;
+                vec4 v = xb[q] != ~0u ? p.x.v[xb[q] + kb * BK / 4] : vec4(0.0);
+                xs[r * PW + xc / 2] = h2(v.x, v.y);
+                xs[r * PW + xc / 2 + 1] = h2(v.z, v.w);
+            }
+            barrier();
+            if (kb + 1 < p.nk) ldw(wt, n0, kb + 1, tid, wv);
+            if (tm < cnt) {
+                for (uint k = 0; k < BK / 2; k++) {
+                    vec2 xv[2], ww[4];
+                    [[unroll]] for (uint e = 0; e < 2; e++) xv[e] = unpackHalf2x16(xs[(tm + RI(4 * e)) * PW + k]);
+                    [[unroll]] for (uint e = 0; e < 4; e++) ww[e] = unpackHalf2x16(ws[(tn + CI(e)) * PW + k]);
+                    [[unroll]] for (uint i = 0; i < 8; i++) {
+                        vec2 a = xv[i >> 2], b = ww[i & 3];
+                        acc[i] = fma(a.y, b.y, fma(a.x, b.x, acc[i]));
+                    }
+                }
+            }
+            barrier();
+            if (kb + 1 < p.nk) stw(tid, wv);
+        }
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            uint r = tm + RI(i), n = n0 + tn + CI(i);
+            if (r < cnt && n < p.rows) {
+                uint o = (m0 + r) * p.ys + n;
+                float v = acc[i] * p.sc;
+                p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
+            }
+        }
+    }
+}
+#else
 void main() {
     uint tid = gl_LocalInvocationID.x, w = WARP, n0 = gl_WorkGroupID.x * 64;
     uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
@@ -149,3 +206,5 @@ void main() {
                 p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
             }
 }
+
+#endif

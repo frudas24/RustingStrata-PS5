@@ -93,7 +93,7 @@ impl Vk {
             // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
             if float || !crate::cuda::Gpu::mmq(ty) {
                 if self.0.coop { push("gemm_f", ws.clone()); push("gemm_fs", ws.clone()); }
-                else { push("gemm_f_dp", ws.clone()); }
+                else { push("gemm_f_dp", ws.clone()); if self.r11_iq32(ty) { push("gemm_f_dp_ps5_iq32", ws.clone()); } }
             }
             if !float {
                 if self.0.coop_i8 == 32 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); push("gemmi_s2", ws.clone()); }
