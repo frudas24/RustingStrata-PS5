@@ -31,6 +31,14 @@ The upstream SPIR-V binaries, all attention/quantization formulas, model archite
 
 `main` also carries the upstream-PR `STRATA_PREFILL_PROTECT` change in `src/expert_cache.rs` and `src/gpu_model/prefill.rs` (see the README branch list). It is not part of this port and the measurements above were taken without it; it interacts with the prefetch the PS5 profile disables, and that combination is not measured yet.
 
+## Later PS5 checkpoints (R2–R6)
+
+This document describes **R1**, the base port. The fork's `main` continues the PS5 line with one commit and one tag per
+version, and R6 is the tip: it contains R1–R5, so the last version alone is enough to run, while the earlier ones stay
+reconstructible from their tags. **[docs/PS5-R2.md](PS5-R2.md)** starts the rest of the series (R3, R4, R5, R6 are
+`PS5-R3.md` … `PS5-R6.md`, and the README carries the full map with each version's opt-in switches). The R2–R6
+checkpoints are integrated here but **not measured on a console**; the numbers in this document are R1's.
+
 ## Build / run
 
 From a terminal on the console running Linux, or a compatible x86-64 Linux machine with a sufficiently old compatible glibc and the Rust target installed. Requires stable Rust with edition 2024 support and upstream dependencies, C compiler, Vulkan loader + PS5 RADV driver. Build on the console if unsure about glibc portability. No sudo is used by these scripts.

@@ -73,6 +73,36 @@ Branches of this fork:
   decode cache, overlaps the next layer's cold NVMe read-ahead and releases cold prefill experts. It is merged into
   `main` here, and the branch must stay free of the PS5 port or the PR would carry it.
 
+### PS5 versions R1–R6
+
+`main` carries the whole PS5 line, one commit and one tag per version, so every checkpoint stays reconstructible while
+the tip is the version to run:
+
+| version | tag | what it adds | opt-in switches |
+|---|---|---|---|
+| R1 | `ps5-r1` (`71d4a92`, tip before R2) | the base port: opt-in Vulkan PS5 profile with separate local/GTT budgets and a `MemAvailable` reserve, direct `HOST_VISIBLE`/`HOST_COHERENT` uploads, F16→F32 streaming through 4 MiB scratch, AVX2 Q8_K fusion, `tools/ps5/` | `STRATA_PS5`, `STRATA_PS5_GTT`, `STRATA_PS5_DIRECT` |
+| R2 | `ps5-r2` | wave32 quantized kernels: optional 64/128-thread `gemv_q` and `moe_gemv_q` workgroups, 32×64 `gemmi_dp_ps5_32` small INT8 GEMM tile; Cargo feature `ps5-r2` builds five extra shader variants with `glslc` and validates them with `spirv-val` | `STRATA_PS5_GEMV_WG`, `STRATA_PS5_SMALL`, `STRATA_PS5_SMALL_GEMM`, `PS5_R2_BUILD` |
+| R3 | `ps5-r3` | experimental immutable GGUF host-pointer import over `VK_EXT_external_memory_host`, with `weights::cold` skipping imported ranges | `STRATA_PS5_ZERO_COPY`, `STRATA_PS5_ZERO_COPY_MB` (512) |
+| R4 | `ps5-r4` | adaptive heterogeneous MoE prefill: each layer's missed experts split between GPU, half and CPU arms by a bounded EWMA policy instead of staging every miss | `STRATA_PS5_SCHED`, `_SCHED_LOG`, `_SCHED_MAX_ROWS`, `_SCHED_SCRATCH_MB` |
+| R5 | `ps5-r5` | tiled long-context attention prefill (`attn_prefill_ps5.comp`, 1/2/4 KiB K/V tiles, sliding-window start bound) and paired KV loads | `STRATA_PS5_ATTN_WG`, `STRATA_R5_WG` |
+| R6 | `ps5-r6` (tip) | bounded autotuner (`autotune-r6.py`), dispatch telemetry and the PGO/probe toolchain | `STRATA_PS5_R6` |
+
+**Yes, the last one is enough.** The line is cumulative: R6 contains R1–R5, and `main` at the tip is R6 plus the
+`STRATA_PREFILL_PROTECT` change. The earlier versions are kept as commits and tags because each one is then
+reconstructible without being re-derived (`git switch --detach ps5-r3`, rebuild, measure). No version removes a file
+of the one before it, and none of them touches `src/expert_cache.rs`; R4–R6 modify `src/gpu_model/prefill.rs`, so the
+two `STRATA_PREFILL_PROTECT` hunks were reapplied on top of their version of that file.
+
+Per-version documentation: [docs/PS5.md](docs/PS5.md) (R1), [docs/PS5-R2.md](docs/PS5-R2.md),
+[docs/PS5-R3.md](docs/PS5-R3.md), [docs/PS5-R4.md](docs/PS5-R4.md), [docs/PS5-R5.md](docs/PS5-R5.md) and
+[docs/PS5-R6.md](docs/PS5-R6.md), each with its contracts, its flags and its own limits.
+
+What is still unmeasured: **R2–R6 were never benchmarked on this console.** The numbers above belong to the R1 port
+(rows 1 and 2) and to the pre-merge R1 + prefill-protect build (row 3); no tok/s has been taken from R2, R3, R4, R5 or
+R6. Building a tree is not a measurement, and the R4, R5 and R6 documents state themselves that their authors had no
+console, no toolchain and no weights when they were written. Treat R2–R6 as candidates until a benchmark says
+otherwise; `STRATA_PS5=0`, each version's default-off switches and the tags are the rollback.
+
 The licence and the credit are unchanged: original RustingStrata by Vasyl Trefilov, distributed under the same
 [LICENSE.md](LICENSE.md), no endorsement implied. Upstream's own README follows.
 
