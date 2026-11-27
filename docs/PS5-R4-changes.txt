@@ -1,0 +1,17 @@
+R3 archive SHA256: 4c40ba750ced5495ccfea9962458252a170bfcde009b50641eb237e32e3f6f98
+ADDED docs/PS5-R4.md
+ADDED src/ps5_r4.rs
+ADDED tests/ps5_r4.rs
+ADDED tools/ps5/bench-r4.sh
+ADDED tools/ps5/check-r4.py
+ADDED tools/ps5/parity-r4.py
+ADDED tools/ps5/summarize-r4.py
+ADDED tools/ps5/test-r4.sh
+MODIFIED README.md
+MODIFIED src/backend.rs
+MODIFIED src/gpu_model.rs
+MODIFIED src/gpu_model/prefill.rs
+MODIFIED src/lib.rs
+MODIFIED src/vulkan/mod.rs
+MODIFIED tools/ps5/run.sh
+ADDED docs/PS5-R4-changes.txt (this manifest)

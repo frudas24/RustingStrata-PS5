@@ -125,6 +125,8 @@ pub trait Backend: Send {
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;
+    /// PS5-specific AMD Vulkan preset actually active on this device.
+    fn ps5_preset(&self) -> bool { false }
     /// Create a lightweight handle sharing the same underlying GPU device/context for an auxiliary draft model.
     fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
         anyhow::bail!("backend {} does not support device sharing", self.name())

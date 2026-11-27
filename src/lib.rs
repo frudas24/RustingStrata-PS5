@@ -39,3 +39,5 @@ pub mod hy4;
 pub mod kolibri;
 pub mod inkling2;
 pub mod ngram;
+
+mod ps5_r4;

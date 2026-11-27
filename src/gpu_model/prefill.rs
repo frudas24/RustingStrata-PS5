@@ -635,11 +635,31 @@ impl GpuModel<'_> {
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let mut missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
-                    // A batch step: the CPU runs the missed experts (each read once for all rows, in RAM) beside the
-                    // resident GEMMs, instead of a PCIe copy of each that costs more than the CPU's pass.
-                    let cpu = if rows.is_some() && c.hadamard.is_none() && !missed.is_empty() {
+                    // PS5 R4: only prompt prefill, never decode/verify, Hadamard, LoRA or diagnostic traces.
+                    // Resident experts remain on GPU. Select complete missed experts, with a bounded CPU scratch estimate.
+                    let mut trial = None;
+                    let mut selected = Vec::new();
+                    if self.ps5_r4.is_some() && rows.is_none() && il < c.n_layer && !trace && c.hadamard.is_none() && self.m.loras.is_empty()
+                        && !missed.is_empty() && lx.mats.iter().all(|m| crate::cpu_moe::int_dot(m.ty).is_some()) {
+                        if let Some(policy) = self.ps5_r4.as_mut() {
+                            let start = std::time::Instant::now(); // router readback already waited for earlier GPU work
+                            let eligible = crate::ps5_r4::candidates(&missed, &off, t, ne, c.n_ff_exp, policy.max_rows, policy.budget());
+                            if !eligible.is_empty() {
+                                let miss_rows: usize = missed.iter().map(|&e| off[e + 1] - off[e]).sum();
+                                let key = crate::ps5_r4::Key::new(il, t, ids.len() - miss_rows, miss_rows, eligible.len());
+                                let arm = policy.choose(key, eligible.len());
+                                selected = crate::ps5_r4::split(&mut missed, &eligible, arm);
+                                trial = Some((key, arm, start));
+                            }
+                        }
+                    }
+                    // Preserve the existing batch-step route exactly when R4 is off or ineligible.
+                    if rows.is_some() && c.hadamard.is_none() && !missed.is_empty() {
+                        selected = std::mem::take(&mut missed);
+                    }
+                    let cpu = if !selected.is_empty() {
                         let hv = g.get::<f32>(&pf.slab, l.h, t * ne)?;
-                        Some((std::mem::take(&mut missed), hv.chunks_exact(ne).map(<[f32]>::to_vec).collect::<Vec<_>>()))
+                        Some((selected, hv.chunks_exact(ne).map(<[f32]>::to_vec).collect::<Vec<_>>()))
                     } else { None };
                     if let Some(pre) = &pre {
                         let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
@@ -736,33 +756,71 @@ impl GpuModel<'_> {
                     };
                     // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
                     // wait for the host to stage them.
-                    for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
-                        g.beside(&mut || {
-                            if gu[0].1 > 0 {
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
-                            }
-                            for &((s0, n0), lo, hi) in downs {
-                                let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
-                                if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
-                                g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
-                            }
-                            if let Some(j) = *cp { copy(j)?; }
-                            Ok(())
-                        })?;
-                    }
-                    if let Some((cm, hs)) = &cpu {
-                        // Slot s of expert e holds the pair of token xrow[s]; the rows go to `ye` in slot order.
-                        let pairs: Vec<(usize, usize, f32)> = { let (xr, of) = (&xrow, &off); cm.iter().flat_map(|&e| (of[e]..of[e + 1]).map(move |s| (xr[s] as usize, e, 0.0))).collect() };
-                        let o = crate::cpu_moe::expert_rows(&self.m, il, hs, &pairs);
+                    let dispatch = || -> anyhow::Result<()> {
+                        for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
+                            g.beside(&mut || {
+                                if gu[0].1 > 0 {
+                                    g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                    g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                }
+                                for &((s0, n0), lo, hi) in downs {
+                                    let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
+                                    if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
+                                    g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                                }
+                                if let Some(j) = *cp { copy(j)?; }
+                                Ok(())
+                            })?;
+                        }
+                        Ok(())
+                    };
+                    let pairs_for = |cm: &[usize]| -> Vec<(usize, usize, f32)> {
+                        let (xr, of) = (&xrow, &off);
+                        cm.iter().flat_map(|&e| (of[e]..of[e + 1]).map(move |s| (xr[s] as usize, e, 0.0))).collect()
+                    };
+                    let scatter = |cm: &[usize], o: &[f32]| -> anyhow::Result<()> {
                         let mut j = 0;
                         for &e in cm {
                             let len = (off[e + 1] - off[e]) * ne;
                             g.put(&o[j..j + len], &pf.slab, l.ye + off[e] * ne)?;
                             j += len;
                         }
-                    }
+                        debug_assert_eq!(j, o.len());
+                        Ok(())
+                    };
+                    if let Some((cm, hs)) = &cpu {
+                        let pairs = pairs_for(cm);
+                        if trial.is_some() {
+                            let model = self.m;
+                            // The scope joins even on a GPU error. No raw pointers or detached lifetime.
+                            // Keep all Vulkan calls on the submitting thread. kick() also submits on single-queue RADV.
+                            let o = std::thread::scope(|scope| -> anyhow::Result<Vec<f32>> {
+                                let task = std::thread::Builder::new().name("strata-ps5-prefill".into())
+                                    .spawn_scoped(scope, || crate::cpu_moe::expert_rows(model, il, hs, &pairs))?;
+                                let gpu_result = dispatch().and_then(|_| g.beside_join()).and_then(|_| g.kick());
+                                let result = task.join().map_err(|_| anyhow::anyhow!("PS5 R4 CPU expert task panicked"));
+                                gpu_result?;
+                                result
+                            })?;
+                            scatter(cm, &o)?;
+                        } else {
+                            dispatch()?;
+                            let o = crate::cpu_moe::expert_rows(self.m, il, hs, &pairs);
+                            scatter(cm, &o)?;
+                        }
+                    } else { dispatch()?; }
                     g.beside_join()?;
+                    if let Some((key, arm, start)) = trial {
+                        // Actual completion, including staging, CPU readback, overlap, contention and output upload.
+                        // The explicit synchronization is part of the experimental mode's overhead.
+                        g.sync()?;
+                        let ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        let cpu_rows: usize = cpu.as_ref().map_or(0, |(cm, _)| cm.iter().map(|&e| off[e + 1] - off[e]).sum());
+                        self.ps5_r4.as_mut().unwrap().observe(key, arm, ns, cpu_rows, ids.len() - cpu_rows);
+                        if std::env::var("STRATA_PS5_SCHED_LOG").is_ok_and(|v| v == "1") {
+                            crate::say!("PS5 R4 trial: layer={il} tokens={t} arm={arm} cpu_rows={cpu_rows} gpu_rows={} ns={ns}", ids.len() - cpu_rows);
+                        }
+                    }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
                     // Expert rows are slots (token, j) sorted by expert, not tokens.

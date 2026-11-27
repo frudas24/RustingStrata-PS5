@@ -7,6 +7,7 @@ case "$sub" in chat|generate|bench|serve|perplexity|score) ;; *) echo "Unsupport
 bin=${STRATA_PS5_BIN:-${CARGO_TARGET_DIR:-$root/target/ps5}/x86_64-unknown-linux-gnu/release/rustingstrata}
 [[ -x "$bin" ]] || { echo "Build first: $root/tools/ps5/build.sh" >&2; exit 1; }
 export STRATA_PS5=${STRATA_PS5:-1}
+export STRATA_PS5_SCHED=${STRATA_PS5_SCHED:-off}
 export STRATA_PS5_GTT=${STRATA_PS5_GTT:-1}
 export STRATA_PS5_DIRECT=${STRATA_PS5_DIRECT:-1}
 export STRATA_PS5_HOST_RESERVE_MB=${STRATA_PS5_HOST_RESERVE_MB:-1536}

@@ -1131,6 +1131,7 @@ fn gemv_cols(llama: u32, ty: GgmlType, cols: usize) -> anyhow::Result<u32> {
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
+    fn ps5_preset(&self) -> bool { self.0.ps5 }
     fn device(&self) -> String {
         let p = unsafe { self.0.instance.get_physical_device_properties(self.0.pd) };
         p.device_name_as_c_str().map_or(String::new(), |s| s.to_string_lossy().into_owned())

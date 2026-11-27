@@ -503,6 +503,7 @@ pub struct GpuModel<'a> {
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
+    ps5_r4: Option<crate::ps5_r4::Policy>,
     /// Swap experts every this many tokens (0 = fixed placement).
     pub adapt_every: usize,
     /// Experts one `adapt` may swap per pool (default 64; `STRATA_ADAPT_SWAPS`).
@@ -1145,15 +1146,19 @@ impl<'a> GpuModel<'a> {
                 mb(per), mb(ca.token_bytes(k)), ca.total_experts() / c.n_expert.max(1),
                 if prefetch { ", next-layer L2 prefetch on (STRATA_MOE_PREFETCH)" } else { "" });
         }
+        let ps5_r4 = crate::ps5_r4::Policy::from_env(gpu.ps5_preset())?;
         let mtp = mtp_head;
         let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, ps5_r4, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
+
+    /// R4 counters for validation: completed trials, CPU expert rows, mixed CPU/GPU trials.
+    pub fn ps5_r4_stats(&self) -> [u64; 3] { self.ps5_r4.as_ref().map_or([0; 3], |p| p.stats) }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
