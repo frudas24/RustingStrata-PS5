@@ -21,6 +21,7 @@ for flag in 0 32 64; do
       echo "unexpected IQ tile $tile dispatched in arm $flag" >&2; exit 1
     fi
   done
+  python3 tools/ps5/r13-campaign.py marks --log "$out/gpu-$flag.log" --test int --tile "$flag" --lut off
   cmp "$out/gpu-0.bin" "$out/gpu-$flag.bin"
 done
 sha256sum "$out"/gpu-*.bin > "$out/gpu.sha256"

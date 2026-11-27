@@ -38,6 +38,9 @@ if [[ $AUDIT_MOCK == size && $flag == 0 ]]; then size=4; fi
 truncate -s "$size" "$PS5_R12_GPU_FILE"
 echo 'R12 IQ integer GPU parity: 1296 cases'
 if [[ $flag != 0 ]]; then echo "PS5 R6 exercised: gemmi_dp_ps5_iq$flag"; fi
+tag=$flag; [[ $flag != 0 ]] || tag=base
+echo "PS5 R6 exercised: r13_int_${tag}_iq3xxs"
+echo "PS5 R6 exercised: r13_int_${tag}_iq4xs"
 if [[ $AUDIT_MOCK == leak && $flag == 0 ]]; then echo 'PS5 R6 exercised: gemmi_dp_ps5_iq32'; fi
 if [[ $AUDIT_MOCK == wrong && $flag == 32 ]]; then echo 'PS5 R6 exercised: gemmi_dp_ps5_iq64'; fi
 ''');cargo.chmod(0o755)

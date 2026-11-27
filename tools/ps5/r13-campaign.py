@@ -22,7 +22,14 @@ quality = load('quality', 'quality-r11.py')
 IQ2 = 'gemm_f_dp_ps5_iq32'
 INT = {0: 'gemmi_dp_ps5', 32: 'gemmi_dp_ps5_iq32', 64: 'gemmi_dp_ps5_iq64'}
 TYPES = {'r13_lut_iq3xxs', 'r13_lut_iq4xs'}
-KNOWN = {IQ2, IQ2 + '_lut', *TYPES, INT[32], INT[64], *(x + '_lut' for x in INT.values())}
+ROUTED = {t: {f'r13_int_{tag}_{fmt}' for fmt in ('iq3xxs', 'iq4xs')}
+          for t, tag in ((0, 'base'), (32, '32'), (64, '64'))}
+FALLBACK = {'r13_int_f16_iq3xxs', 'r13_int_f16_iq4xs'}
+KNOWN = {IQ2, IQ2 + '_lut', *TYPES, INT[32], INT[64], *(x + '_lut' for x in INT.values()),
+         *set().union(*ROUTED.values()), *FALLBACK}
+# GTT residence is the only other R6 mark permitted by these fixed workloads.
+# Reject unknown/other experimental markers rather than silently ignoring them.
+ALLOWED_OTHER = {'gtt_nonlocal'}
 
 
 def expected(tile, lut, test='model'):
@@ -32,16 +39,43 @@ def expected(tile, lut, test='model'):
     if test in ('int', 'model'):
         if lut in ('int', 'all'):
             marks.update({INT[tile] + '_lut', *TYPES})
-        elif tile:
-            marks.add(INT[tile])
+        else:
+            marks.update(ROUTED[tile])
+            if tile:
+                marks.add(INT[tile])
     return marks
 
 
 def check_marks(log, tile, lut, test='model'):
-    found = set(re.findall(r'^PS5 R6 exercised: (\w+)\s*$', log, re.M)) & KNOWN
+    all_marks = set(re.findall(r'^PS5 R6 exercised: (\w+)[ \t]*$', log, re.M))
+    r6.require(not all_marks - KNOWN - ALLOWED_OTHER, f'unexpected dispatch markers: {sorted(all_marks - KNOWN - ALLOWED_OTHER)}')
+    found = all_marks & KNOWN
     want = expected(tile, lut, test)
     r6.require(found == want, f'dispatch identity: expected {sorted(want)}, got {sorted(found)}')
     return sorted(found)
+
+
+def check_lds(log):
+    expected = {('IQ2', ''): 4096}
+    expected.update({(str(t), k): 1024 for t in (18, 23) for k in
+                     ('gemmi_dp_ps5_lut', 'gemmi_dp_ps5_iq32_lut', 'gemmi_dp_ps5_iq64_lut')})
+    seen = set()
+    for line in log.splitlines():
+        if not line.startswith('R13 LDS '):
+            continue
+        fields = line.split()
+        if len(fields) == 5 and fields[2] == 'IQ2':
+            key, numbers = ('IQ2', ''), fields[3:]
+        elif len(fields) == 6:
+            key, numbers = tuple(fields[2:4]), fields[4:]
+        else:
+            raise r6.Reject('malformed LDS record')
+        r6.require(key in expected and key not in seen, f'unexpected/duplicate LDS record: {key}')
+        base, new = map(int, numbers)
+        r6.require(0 < base and base + expected[key] <= new <= 65536, f'invalid LDS budget: {key}')
+        seen.add(key)
+    r6.require(seen == set(expected), 'missing LDS records')
+    return len(seen)
 
 
 def flags(tile, lut):
@@ -70,10 +104,13 @@ def compare(runs):
         r6.match_signatures(a1['signatures'], run['signatures'])
     a, b = r6.average([a1, a2]), r6.average([b1, b2])
     score, worst = r6.metrics(b, a)
-    worst = min(worst, r6.metrics(b1['rates'], a1['rates'])[1], r6.metrics(b2['rates'], a2['rates'])[1])
+    pairs = [r6.metrics(b1['rates'], a1['rates']), r6.metrics(b2['rates'], a2['rates'])]
+    worst = min(worst, *(p[1] for p in pairs))
+    paired_scores = [p[0] for p in pairs]
     import math, statistics
     phases = {name: math.exp(statistics.mean(math.log(b[pp][i] / a[pp][i]) for pp in a)) for i, name in enumerate(('prefill', 'decode'))}
-    return dict(score=score, worst=worst, phase_speedups=phases, baseline=a, candidate=b, accepted=score >= 1.03 and worst >= .95)
+    return dict(score=score, worst=worst, paired_scores=paired_scores, phase_speedups=phases, baseline=a, candidate=b,
+                accepted=score >= 1.03 and min(paired_scores) >= 1.03 and worst >= .95)
 
 
 def run_campaign(a):
@@ -82,7 +119,8 @@ def run_campaign(a):
     k = r6.knobs_ok({**r6.BASE, 'threads': a.threads, 'chunk': a.chunk})
     session = r6.Session(a.model, a.bin, s, a.out)
     ident = r6.identity(a.model, a.bin)
-    r6.atomic_json(session.out/'identity.json', ident)
+    holdout_id = r6.file_id(session.holdout)
+    r6.atomic_json(session.out/'identity.json', dict(environment=ident, holdout=holdout_id))
     reports = {}
     base_tile = a.tile if a.base_tile is None else a.base_tile
     try:
@@ -117,8 +155,10 @@ def run_campaign(a):
                 cmd=[str(session.binary),'bench',*r6.engine_args(a.model,k,s),'--pp',a.pp,'--tg',str(s['tg']),'--reps',str(s['reps']),'--json-out',str(result)]
                 if task=='holdout': cmd+=['--prompt-file',str(session.holdout)]
                 r6.atomic_json(session.out/(stem+'-request.json'),dict(cmd=cmd,knobs=k,flags=flags(tile,lut),profile_only=a.profile_only))
+                r6.require(r6.file_id(session.holdout)==holdout_id, 'holdout changed before measurement')
                 print(stem,flush=True)
                 memory=r6.run_child(cmd,env,log,s['timeout'],s['min_ram_mb'])
+                r6.require(r6.file_id(session.holdout)==holdout_id, 'holdout changed during measurement')
                 rates,signatures=r6.checked_rates(json.loads(result.read_text()),k,s,a.model)
                 r6.match_signatures(signatures,signatures)
                 text=log.read_text(errors='replace');evidence=r6.evidence(text,k);check_marks(text,tile,lut)
@@ -126,7 +166,7 @@ def run_campaign(a):
                 if a.profile_only: run['diagnostics']=profile_summary(text)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run);runs.append(run)
             reports[task]=dict(profile_only=True,accepted=False) if a.profile_only else compare(runs)
-        r6.require(r6.identity(a.model,a.bin)==ident,'identity changed')
+        r6.require(r6.identity(a.model,a.bin)==ident and r6.file_id(session.holdout)==holdout_id,'identity changed')
         accepted=not a.profile_only and all(x['accepted'] for x in reports.values())
         r6.atomic_json(session.out/'summary.json',dict(accepted=accepted,profile_only=a.profile_only,base_tile=base_tile,tile=a.tile,lut=a.lut,reports=reports,production_promotion=False))
         return 0 if accepted or a.profile_only else 1
@@ -139,6 +179,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     sub=p.add_subparsers(dest='action',required=True)
     m=sub.add_parser('marks');m.add_argument('--log',type=Path,required=True);m.add_argument('--test',choices=('iq2','int','model'),required=True)
+    ld=sub.add_parser('lds');ld.add_argument('--log',type=Path,required=True)
     b=sub.add_parser('run');b.add_argument('--model',type=Path,required=True);b.add_argument('--bin',type=Path,default=r6.DEFAULT_BIN);b.add_argument('--out',type=Path,required=True)
     for x in (m,b):
         x.add_argument('--tile',type=int,choices=(0,32,64),default=0);x.add_argument('--lut',choices=('off','iq2','int','all') if x is m else ('iq2','int','all'),required=True)
@@ -149,6 +190,9 @@ def main():
     group=b.add_mutually_exclusive_group();group.add_argument('--profile-only',action='store_true');group.add_argument('--corpus',type=Path)
     b.add_argument('--ctx-len',type=int,default=512);b.add_argument('--chunks',type=int,default=8)
     a=p.parse_args()
+    if a.action=='lds':
+        try: print('PASS LDS:',check_lds(a.log.read_text()));return 0
+        except (r6.Reject,OSError,ValueError) as exc: print(f'REJECT: {exc}',file=sys.stderr);return 1
     if a.action=='marks':
         try: print('PASS dispatch:',check_marks(a.log.read_text(),a.tile,a.lut,a.test));return 0
         except (r6.Reject,OSError) as exc: print(f'REJECT: {exc}',file=sys.stderr);return 1

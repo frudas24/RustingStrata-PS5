@@ -22,10 +22,13 @@ def compare(runs, mark):
         r6.match_signatures(a1['signatures'], run['signatures'])
     a, b = r6.average([a1, a2]), r6.average([b1, b2])
     score, worst = r6.metrics(b, a)
-    worst = min(worst, r6.metrics(b1['rates'], a1['rates'])[1], r6.metrics(b2['rates'], a2['rates'])[1])
+    pairs = [r6.metrics(b1['rates'], a1['rates']), r6.metrics(b2['rates'], a2['rates'])]
+    worst = min(worst, *(p[1] for p in pairs))
+    paired_scores = [p[0] for p in pairs]
     import math, statistics
     phases={name:math.exp(statistics.mean(math.log(b[pp][i]/a[pp][i]) for pp in a)) for i,name in enumerate(('prefill','decode'))}
-    return dict(score=score, worst=worst, phase_speedups=phases, baseline=a, candidate=b, accepted=score >= 1.03 and worst >= .95)
+    return dict(score=score, worst=worst, paired_scores=paired_scores, phase_speedups=phases, baseline=a, candidate=b,
+                accepted=score >= 1.03 and min(paired_scores) >= 1.03 and worst >= .95)
 
 
 def main():
@@ -77,6 +80,7 @@ def main():
                 r6.require((mark in evidence['marks'])==bool(tile), 'candidate dispatch absent or leaked')
                 if int_tile:
                     r6.require('gemm_f_dp_ps5_iq32' in evidence['marks'], 'validated IQ32 baseline absent')
+                    r6.require_routed_integer(evidence['marks'], int(value) if tile else 0)
                     r6.require(not (set(evidence['marks']) & ({'gemmi_dp_ps5_iq32','gemmi_dp_ps5_iq64'} - {mark})), 'other R12 tile leaked')
                 run = dict(rates=rates,signatures=signatures,evidence=evidence,memory=memory)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run)

@@ -58,6 +58,18 @@ def clean_env():
 def meminfo():
     return {k.rstrip(':'):int(v) for k,v,*_ in (line.split() for line in Path('/proc/meminfo').read_text().splitlines())}
 
+def swap_configuration():
+    # /proc/swaps Used fluctuates with pressure; fingerprint only configuration.
+    swaps = []
+    for line in Path('/proc/swaps').read_text().splitlines()[1:]:
+        path, kind, size, _used, priority = line.split()
+        swaps.append(dict(path=path, kind=kind, size_kib=int(size), priority=int(priority)))
+    return sorted(swaps, key=lambda s: s['path'])
+
+def swap_counters():
+    stats = dict(line.split() for line in Path('/proc/vmstat').read_text().splitlines())
+    return {k:int(stats[k]) for k in ('pswpin','pswpout') if k in stats}
+
 def identity(model, binary):
     env = clean_env()
     vk = subprocess.run(['vulkaninfo','--summary'],env=env,capture_output=True,text=True,timeout=60,check=True).stdout
@@ -70,7 +82,8 @@ def identity(model, binary):
     return dict(model=[file_id(p) for p in model_files(model)], binary=file_id(binary),
         vulkan=vk, kernel=os.uname().release, machine=os.uname().machine, cpu=cpu,
         affinity=sorted(os.sched_getaffinity(0)), governors=governors, ram_kib=meminfo()['MemTotal'],
-        cmdline=Path('/proc/cmdline').read_text().strip(),
+        cmdline=Path('/proc/cmdline').read_text().strip(), swap_devices=swap_configuration(),
+        swappiness=Path('/proc/sys/vm/swappiness').read_text().strip(),
         loader_env={k:v for k,v in env.items() if k.startswith(('VK_','AMD_','RADV_','MESA_','LD_','DRI_')) or k in ('XDG_DATA_HOME','XDG_DATA_DIRS','XDG_CONFIG_HOME','XDG_CONFIG_DIRS','PATH','HOME')})
 
 def knobs_ok(k):
@@ -106,14 +119,16 @@ def engine_args(model,k,s):
         '--fixed-experts','--vram-margin','768','--ram-margin','1536','--cache-ram','256']
 
 def run_child(cmd,env,log,timeout,min_ram):
-    start=time.monotonic(); low=meminfo()['MemAvailable']; peak=0
+    start=time.monotonic(); before=meminfo(); low=before['MemAvailable']; peak=0
+    used=lambda m: m['SwapTotal']-m['SwapFree']
+    swap_peak=used(before); swap_start=swap_counters()
     require(low>=min_ram*1024, 'available RAM below guard before launch')
     with open(log,'xb') as f:
         p=subprocess.Popen(cmd,env=env,stdout=f,stderr=subprocess.STDOUT,start_new_session=True,stdin=subprocess.DEVNULL)
         try:
             while p.poll() is None:
                 if time.monotonic()-start>timeout: raise Reject('timeout')
-                low=min(low,meminfo()['MemAvailable'])
+                current=meminfo(); low=min(low,current['MemAvailable']); swap_peak=max(swap_peak,used(current))
                 if low<min_ram*1024: raise Reject(f'available RAM fell below {min_ram} MiB')
                 try:
                     for line in Path(f'/proc/{p.pid}/status').read_text().splitlines():
@@ -121,6 +136,8 @@ def run_child(cmd,env,log,timeout,min_ram):
                 except (FileNotFoundError,ProcessLookupError): pass
                 time.sleep(.2)
             require(p.returncode==0, f'child exited {p.returncode}; see {log}')
+            after=meminfo(); low=min(low,after['MemAvailable']); swap_peak=max(swap_peak,used(after))
+            require(low>=min_ram*1024, 'available RAM below guard at completion')
         finally:
             if p.poll() is None:
                 try: os.killpg(p.pid,signal.SIGTERM)
@@ -130,7 +147,10 @@ def run_child(cmd,env,log,timeout,min_ram):
                     try: os.killpg(p.pid,signal.SIGKILL)
                     except ProcessLookupError: pass
                     p.wait()
-    return dict(elapsed_s=time.monotonic()-start,min_available_kib=low,sampled_peak_rss_kib=peak)
+    swap_end=swap_counters()
+    return dict(elapsed_s=time.monotonic()-start,min_available_kib=low,sampled_peak_rss_kib=peak,
+                system_swap_start_kib=used(before),system_swap_end_kib=used(after),system_swap_sampled_peak_kib=swap_peak,
+                system_swap_pages_delta={k:swap_end[k]-v for k,v in swap_start.items() if k in swap_end})
 
 def checked_rates(record, k, s, model):
     require(record.get('schema')=='strata.bench.v1' and record.get('backend')=='vulkan' and record.get('device')==[0], 'not the requested Vulkan backend')
@@ -179,6 +199,14 @@ def evidence(log,k):
     if not k['direct']: require(mapped==0,'mapped upload active despite being disabled')
     dot = re.findall(r'packed signed dot accelerated (true|false)',log)
     return dict(marks=sorted(marks),mapped=mapped,staged=staged,dot_accel=(all(x=='true' for x in dot) if dot else None))
+
+def require_routed_integer(marks, tile):
+    """R12 audit: both actual routed IQ formats, no other geometry or FP16 fallback."""
+    tag = {0:'base',32:'32',64:'64'}[tile]
+    all_marks = set(marks) - {'gtt_nonlocal'}
+    want = {'gemm_f_dp_ps5_iq32', *(f'r13_int_{tag}_{fmt}' for fmt in ('iq3xxs','iq4xs'))}
+    if tile: want.add(f'gemmi_dp_ps5_iq{tile}')
+    require(all_marks == want, f'routed integer identity: expected {sorted(want)}, got {sorted(all_marks)}')
 
 def useful_change(old,new,a,b):
     if old['gtt']!=new['gtt']: require('gtt_nonlocal' in (a if old['gtt'] else b)['marks'],'GTT comparison never exercised nonlocal heap')

@@ -66,6 +66,7 @@ def main():
             r6.require((mark in evidence['marks'])==bool(flag),'missing dispatch or leaked into control')
             if int_tile:
                 r6.require('gemm_f_dp_ps5_iq32' in evidence['marks'], 'validated IQ32 baseline absent')
+                r6.require_routed_integer(evidence['marks'], int(val) if flag else 0)
                 r6.require(not (set(evidence['marks']) & ({'gemmi_dp_ps5_iq32','gemmi_dp_ps5_iq64'} - {mark})), 'other R12 tile leaked')
             check_dump(dump,log.read_text(errors='replace'),a.ctx_len,a.chunks)
             hashes.append(r6.digest(dump))
