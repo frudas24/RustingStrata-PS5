@@ -401,6 +401,24 @@ impl GpuModel<'_> {
                 && !crate::cuda::llama_numerics() && std::env::var("STRATA_VK_NO_COOP").as_deref() == Ok("1"),
                 "R4 stage probe requires ordinary Vulkan R4 research prefill; no Venus trace, LoRA, Hadamard or overlapping staging");
         }
+        // R9 isolates one real GPU-routed expert row at one causal position. All other rows stay on GPU.
+        let r9_mode = std::env::var("STRATA_PS5_R9_MODE").unwrap_or_default();
+        let r9_enabled = !r9_mode.is_empty();
+        let (r9_layer, r9_pos, r9_token, r9_rank) = if r9_enabled {
+            anyhow::ensure!(matches!(r9_mode.as_str(), "shadow" | "legacy" | "contract") && r4_stage_probe
+                && std::env::var("STRATA_PS5_SCHED").as_deref() == Ok("gpu")
+                && std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() != Ok("1")
+                && c.hc_n == 0 && c.mhc_streams == 0 && self.mtp.is_none(),
+                "R9 requires the stage probe, GPU-only R4 research, no R8 execution, HC or MTP");
+            let number = |name: &str| -> anyhow::Result<usize> {
+                Ok(std::env::var(name).unwrap_or_else(|_| "0".into()).parse()?)
+            };
+            let target = (number("STRATA_PS5_R9_LAYER")?, number("STRATA_PS5_R9_POS")?,
+                number("STRATA_PS5_R9_TOKEN")?, number("STRATA_PS5_R9_RANK")?);
+            anyhow::ensure!(target.0 < c.n_layer && c.is_moe_layer(target.0) && target.3 < c.n_expert_used,
+                "R9 target must be a routed layer and valid expert rank");
+            target
+        } else { (0, 0, 0, 0) };
         let r8_contract = std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1");
         if r8_contract {
             anyhow::ensure!(self.ps5_r4.is_some() && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1")
@@ -827,8 +845,18 @@ impl GpuModel<'_> {
                     // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
                     // wait for the host to stage them.
                     // Research-only shadow comparison. Use an actual routed GPU row and the same hidden input.
-                    let stage_probe = r4_stage_probe && il < c.n_layer;
-                    let shadow = if stage_probe {
+                    let r9_here = r9_enabled && il == r9_layer && self.pos == r9_pos;
+                    let stage_probe = r4_stage_probe && il < c.n_layer && (!r9_enabled || r9_here);
+                    let shadow = if r9_here {
+                        anyhow::ensure!(cpu.is_none() && r9_token < t && r9_rank < k, "R9 target missing or CPU route active");
+                        let route = r9_token * k + r9_rank;
+                        let expert = ids[route] as usize;
+                        let slot = inv[route] as usize;
+                        anyhow::ensure!(xrow[slot] as usize == r9_token && slot >= off[expert] && slot < off[expert+1]
+                            && groups.iter().flatten().any(|r| r.0 == expert), "R9 route/slot mismatch");
+                        let hidden = g.get::<f32>(&pf.slab, l.h + r9_token * ne, ne)?;
+                        Some((expert, slot, r9_token, hidden))
+                    } else if stage_probe {
                         if let Some(&(expert, _)) = groups.iter().flatten().next() {
                             let slot = off[expert];
                             let token = xrow[slot] as usize;
@@ -854,6 +882,8 @@ impl GpuModel<'_> {
                     let gate_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[0])?) } else { None };
                     let up_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[1])?) } else { None };
                     let down_weight = if shadow.is_some() { Some(self.m.w.layer(il, MATS[2])?) } else { None };
+                    // The two CPU activations share the exact same GPU input and selected expert.
+                    let r9_acts = std::cell::RefCell::new(None::<(Vec<f32>, Vec<f32>)>);
                     let dispatch = || -> anyhow::Result<()> {
                         for ((gs, cp), (gu, downs)) in steps.iter().zip(&spans) {
                             g.beside(&mut || {
@@ -902,6 +932,14 @@ impl GpuModel<'_> {
                                         compare_stage("up_contract_oracle", &reference, &gpu_up[..reference.len()]);
                                         compare_stage("up_legacy_paired", &cu[..reference.len()], &gpu_up[..reference.len()]);
                                         eprintln!("r8_contract_stage,{il},{expert},up,{:?}", kinds[1]);
+                                        if r9_here {
+                                            let ga = crate::ps5_r8::projection(&gate, hidden, kinds[0], gate.rows)?;
+                                            let ua = crate::ps5_r8::projection(&up, hidden, kinds[1], up.rows)?;
+                                            compare_stage("r9_gate_full", &ga, &gpu_gate);
+                                            compare_stage("r9_up_full", &ua, &gpu_up);
+                                            let act = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(&a,&b)| crate::ops::silu(a)*b).collect::<Vec<_>>();
+                                            *r9_acts.borrow_mut() = Some((act(&gpu_gate, &gpu_up), act(&ga, &ua)));
+                                        }
                                         g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
                                         cpu_activation = cg.iter().zip(&cu).map(|(&a, &b)| crate::ops::silu(a) * b).collect();
                                         eprintln!("r7_r4_type,{il},{expert},{:?},{:?},{},{}", gate.ty, up.ty, gate.scale, up.scale);
@@ -998,6 +1036,7 @@ impl GpuModel<'_> {
                         let y0 = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
                         crate::venus_trace::capture(self.m, v, expert, slot, h0, a0, y0)?;
                     }
+                    let mut r9_replacement: Option<(usize, usize, Vec<f32>, Vec<f32>)> = None;
                     if let Some((expert, slot, token, hidden)) = shadow.as_ref() {
                         let activation = g.get::<f32>(&pf.slab, l.ge + slot * c.n_ff_exp, c.n_ff_exp)?;
                         let down = down_weight.as_ref().unwrap().expert(*expert, c.n_expert);
@@ -1013,6 +1052,27 @@ impl GpuModel<'_> {
                         let hs = vec![hidden.clone()];
                         let cpu_pipeline = crate::cpu_moe::expert_rows(self.m, il, &hs, &[(0, *expert, 0.0)]);
                         compare_stage("down_full_cpu_pipeline", &cpu_pipeline, &gpu_down);
+                        if r9_here {
+                            let acts = r9_acts.borrow();
+                            let (cross, own) = acts.as_ref().ok_or_else(|| anyhow::anyhow!("R9 missing gate/up capture"))?;
+                            compare_stage("r9_activation_gpu_inputs", cross, &activation);
+                            compare_stage("r9_activation_own", own, &activation);
+                            let cross_down = crate::ps5_r8::projection(&down, &activation, kind, down.rows)?;
+                            let silu_down = crate::ps5_r8::projection(&down, cross, kind, down.rows)?;
+                            let own_down = crate::ps5_r8::projection(&down, own, kind, down.rows)?;
+                            compare_stage("r9_down_gpu_activation", &cross_down, &gpu_down);
+                            compare_stage("r9_down_cpu_silu", &silu_down, &gpu_down);
+                            compare_stage("r9_down_own", &own_down, &gpu_down);
+                            // Exercise the exact full production research function, not just a local approximation.
+                            let actual = crate::ps5_r8::expert_rows(self.m, il, &hs, &[(0, *expert, 0.0)], r8_kinds.unwrap())?;
+                            compare_stage("r9_contract_self", &actual, &own_down);
+                            anyhow::ensure!(actual.iter().zip(&own_down).all(|(a,b)| a.to_bits()==b.to_bits()), "R9 contract pipeline differs from its decomposition");
+                            let wts = g.get::<f32>(&pf.slab, l.wts + *token*k, k)?;
+                            eprintln!("r9_fixed,{}", serde_json::json!({"layer":il,"pos":self.pos,"chunk":t,
+                                "token":token,"rank":r9_rank,"expert":expert,"slot":slot,"ids":&ids,
+                                "hidden":hidden,"gpu_down":&gpu_down,"weights":&wts}));
+                            r9_replacement = Some((*slot, *token, cpu_pipeline, actual));
+                        }
                         eprintln!("r7_r4_down_type,{il},{expert},{token},{:?},{}", down.ty, down.scale);
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
@@ -1027,7 +1087,25 @@ impl GpuModel<'_> {
                     }
                     // "mo" is zero: hc_write clears it after use.
                     let fx = if ly.hc.is_some() { at(l.mo) } else { x };
+                    // R9 optionally substitutes exactly one row AFTER its GPU computation, with no planner changes.
+                    // All preceding rows/layers are fixed by the all-GPU baseline. Measure combine on the real shader.
+                    if let Some((slot, _, legacy, contract)) = &r9_replacement {
+                        let candidate = match r9_mode.as_str() { "legacy" => Some(legacy), "contract" => Some(contract), _ => None };
+                        if let Some(row) = candidate {
+                            anyhow::ensure!(row.len() == ne && row.iter().all(|v| v.is_finite()), "R9 invalid replacement");
+                            g.put(row, &pf.slab, l.ye + *slot * ne)?;
+                            let actual = g.get::<f32>(&pf.slab, l.ye + *slot * ne, ne)?;
+                            anyhow::ensure!(actual.iter().zip(row).all(|(a,b)| a.to_bits()==b.to_bits()), "R9 replacement readback mismatch");
+                            eprintln!("r9_write,{r9_mode},{il},{},{slot},{}", self.pos, row.len());
+                        }
+                    }
                     g.moe_combine_seq(fx, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
+                    if let Some((_, token, _, _)) = &r9_replacement {
+                        let combined = g.get::<f32>(&pf.slab, *token * ne, ne)?;
+                        anyhow::ensure!(combined.iter().all(|v| v.is_finite()), "R9 nonfinite combine");
+                        // Full vector, not just a fingerprint: offline compares the exact GPU combine boundary.
+                        eprintln!("r9_combine,{il},{},{token},{}", self.pos, serde_json::to_string(&combined)?);
+                    }
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
