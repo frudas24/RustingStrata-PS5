@@ -15,7 +15,12 @@ def proc_fields(path, keys):
         lines = path.read_text().splitlines()
     except (FileNotFoundError, ProcessLookupError, PermissionError):
         return dict.fromkeys(keys,'')
-    values = {line.split(':',1)[0]:line.split(':',1)[1].split()[0] for line in lines if ':' in line}
+    values = {}
+    for line in lines:
+        key, sep, value = line.partition(':')
+        if sep and key in keys:
+            fields=value.split()
+            values[key]=fields[0] if fields else ''
     return {key:values.get(key,'') for key in keys}
 
 def read(path):
@@ -26,12 +31,18 @@ def read(path):
 
 def stop(child):
     if child.poll() is None:
-        os.killpg(child.pid,signal.SIGTERM)
+        try: os.killpg(child.pid,signal.SIGTERM)
+        except ProcessLookupError: pass
         try:
             child.wait(timeout=4)
         except subprocess.TimeoutExpired:
-            os.killpg(child.pid,signal.SIGKILL)
+            try: os.killpg(child.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
             child.wait()
+
+def memory_ok(value,minimum):
+    try: return int(value)>=minimum
+    except (TypeError,ValueError): return False
 
 def main():
     parser=argparse.ArgumentParser()
@@ -41,9 +52,10 @@ def main():
     parser.add_argument('command',nargs=argparse.REMAINDER)
     args=parser.parse_args()
     command=args.command[1:] if args.command[:1]==['--'] else args.command
+    if not command or args.timeout<=0 or args.min_kib<=0: parser.error('command, timeout and memory guard required')
     args.out.parent.mkdir(parents=True,exist_ok=True)
     mem=Path('/proc/meminfo')
-    if int(proc_fields(mem,('MemAvailable',))['MemAvailable'])<args.min_kib:
+    if not memory_ok(proc_fields(mem,('MemAvailable',))['MemAvailable'],args.min_kib):
         raise SystemExit(75)
     device=Path('/sys/class/drm/card0/device')
     hwmon=next((device/'hwmon').glob('hwmon*'),device)
@@ -67,7 +79,7 @@ def main():
                     gpu_freq_hz=read(hwmon/'freq1_input'))
                 writer.writerow(row)
                 data.flush()
-                if int(row['MemAvailable'])<args.min_kib:
+                if not memory_ok(row['MemAvailable'],args.min_kib):
                     reason='memory guard'
                     break
                 if row['elapsed_s']>=args.timeout:
@@ -81,7 +93,7 @@ def main():
         max_rss_kib=use.ru_maxrss,minor_faults=use.ru_minflt,major_faults=use.ru_majflt,
         voluntary_cs=use.ru_nvcsw,involuntary_cs=use.ru_nivcsw,user_s=use.ru_utime,sys_s=use.ru_stime)
     args.out.with_suffix('.usage.json').write_text(json.dumps(result,indent=2)+'\n')
-    return 75 if reason else child.returncode
+    return 75 if reason else (128-child.returncode if child.returncode<0 else child.returncode)
 
 if __name__=='__main__':
     raise SystemExit(main())

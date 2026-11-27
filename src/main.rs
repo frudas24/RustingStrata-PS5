@@ -768,7 +768,9 @@ fn log_probs(logits: &[f32], tok: u32, row: &mut Vec<u16>) -> anyhow::Result<f64
     let lse = logits.iter().map(|&x| (x - max).exp() as f64).sum::<f64>().ln() as f32;
     let scale = (max - min) / 65535.0;
     let offset = min - max - lse;
-    let loss = (max + lse - logits[tok as usize]) as f64;
+    // Subtract the common logit offset first, in f64; max+lse in f32 can
+    // lose the entire normalization term even for finite logits.
+    let loss = (max as f64 - logits[tok as usize] as f64) + lse as f64;
     anyhow::ensure!(scale.is_finite() && offset.is_finite() && loss.is_finite(), "non-finite log probability encoding");
     row.clear();
     for f in [scale, offset] { let b = f.to_bits(); row.extend([b as u16, (b >> 16) as u16]); }
@@ -785,6 +787,8 @@ fn audit_log_probs_rejects_invalid_input() {
     }
     assert!(log_probs(&[1.0, 0.0], 0, &mut row).unwrap() > 0.0);
     assert_eq!(row.len(), 6);
+    let loss = log_probs(&[1e20, 1e20], 0, &mut row).unwrap();
+    assert!((loss.exp() - 2.0).abs() < 1e-6);
 }
 
 /// A nonzero xorshift state from `s`, or from the clock.

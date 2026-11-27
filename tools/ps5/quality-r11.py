@@ -3,6 +3,7 @@
 Strict identity of encoded KLD dumps; not a proof of unquantized logits identity.
 """
 import argparse, importlib.util, json, pathlib, sys, struct, re, math
+from array import array
 spec=importlib.util.spec_from_file_location('r6',pathlib.Path(__file__).with_name('autotune-r6.py'));r6=importlib.util.module_from_spec(spec);spec.loader.exec_module(r6)
 def check_dump(dump, log_text, ctx_len, chunks):
     with dump.open('rb') as f:
@@ -20,11 +21,18 @@ def check_dump(dump, log_text, ctx_len, chunks):
         for _ in range(scored):
             scale,offset=struct.unpack('<ff',f.read(8))
             r6.require(math.isfinite(scale) and scale>=0 and math.isfinite(offset) and offset<=0, 'invalid KLD row encoding')
-            f.seek(row_bytes-8,1)
+            # Validate payload, not just the header. Identical corrupt dumps are not parity.
+            codes=array('H');codes.frombytes(f.read(row_bytes-8))
+            if sys.byteorder!='little': codes.byteswap()
+            r6.require(len(codes)==nv+(nv&1) and (not nv&1 or codes[-1]==0), 'invalid KLD padding')
+            if nv&1: codes.pop()
+            lo,hi=min(codes),max(codes)
+            r6.require(lo==0 and (hi==0 if scale==0 else hi>=65534), 'inconsistent KLD code range')
+            r6.require(offset+scale*hi<=1e-5, 'positive decoded log probability')
     matches=re.findall(r'^PPL = (\S+) over (\d+) chunks of (\d+) tokens \((\d+) scored\)$',log_text,re.M)
     r6.require(len(matches)==1,'missing or ambiguous PPL summary')
     ppl,nc_log,n_log,scored_log=matches[0]
-    r6.require(math.isfinite(float(ppl)) and float(ppl)>0 and (int(nc_log),int(n_log),int(scored_log))==(nc,n,scored),'invalid PPL or coverage')
+    r6.require(math.isfinite(float(ppl)) and float(ppl)>=1 and (int(nc_log),int(n_log),int(scored_log))==(nc,n,scored),'invalid PPL or coverage')
     return n,nv,nc
 
 def main():

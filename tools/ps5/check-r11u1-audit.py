@@ -49,7 +49,7 @@ class Audit(unittest.TestCase):
         n, nv, nc = 4, 3, 2
         header = b'_logits_' + struct.pack('<III', n, nv, nc)
         tokens = struct.pack('<8I', *([0, 1, 2, 0] * 2))
-        row = struct.pack('<ff4H', 0.001, -3.0, 0, 7, 12, 0)
+        row = struct.pack('<ff4H', 16/65535, -17.0, 0, 7, 65535, 0)
         valid = header + tokens + row * 2
         log = 'PPL = 2.0 over 2 chunks of 4 tokens (2 scored)\n'
         with tempfile.TemporaryDirectory() as d:
@@ -64,6 +64,11 @@ class Audit(unittest.TestCase):
                 (header+tokens+row[:4]+struct.pack('<f', float('-inf'))+row[8:]+row, log),
                 (valid, log.replace('2 scored', '1 scored')),
                 (valid, log.replace('2.0', 'nan')), (valid, log+log), (valid, ''),
+                (header+tokens+row[:8]+struct.pack('<4H',0,7,12,0)+row,log),
+                (header+tokens+struct.pack('<f',0.0)+row[4:]+row,log),
+                (header+tokens+row[:4]+struct.pack('<f',-1.0)+row[8:]+row,log),
+                (header+tokens+row[:-2]+struct.pack('<H',1)+row,log),
+                (valid,log.replace('2.0','0.9')),
             ]
             for data, text in cases:
                 p.write_bytes(data)
