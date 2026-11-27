@@ -98,7 +98,7 @@ impl Vk {
             if !float {
                 if self.0.coop_i8 == 32 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); push("gemmi_s2", ws.clone()); }
                 else if self.0.coop_i8 == 16 { push("gemmi_16", ws.clone()); push("gemmi_s_16", ws.clone()); push("gemmi_s2_16", ws.clone()); }
-                else { push("gemmi_dp", ws.clone()); if self.0.r2.small { push("gemmi_dp_ps5_32", ws.clone()); } }
+                else { push("gemmi_dp", ws.clone()); if self.0.r2.small { push("gemmi_dp_ps5_32", ws.clone()); } if self.0.r2.dense64 { push("gemmi_dp_ps5_64", ws.clone()); } }
                 for nt in 1..=crate::cpu_worker::TMAX as u32 { let (kernel, _) = self.0.r2.gemv(nt as usize, false); push(kernel, [&ws[..], &[nt]].concat()); }
                 for nm in [1u32, 4, 8, 17] { push("moe_gemv_q", [&ws[..], &[nm]].concat()); }
                 let (kernel, _) = self.0.r2.gemv(1, true); push(kernel, [&ws[..], &[1]].concat());

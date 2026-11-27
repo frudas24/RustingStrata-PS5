@@ -18,6 +18,7 @@ fn main() {
         ("gemv_q_ps5_128", "gemv_q.comp", &["-DSTRATA_GEMV_WG=128"][..]),
         ("moe_gemv_q_ps5_64", "moe_gemv_q.comp", &["-DSTRATA_GEMV_WG=64"][..]),
         ("moe_gemv_q_ps5_128", "moe_gemv_q.comp", &["-DSTRATA_GEMV_WG=128"][..]),
+        ("gemmi_dp_ps5_64", "gemmi_dp.comp", &["-DSM=2"][..]),
         ("gemmi_dp_ps5_32", "gemmi_dp.comp", &["-DSM=1", "-DSTRATA_PS5_SMALL=1"][..]),
     ] {
         let file = out.join(format!("{name}.spv"));

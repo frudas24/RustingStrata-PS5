@@ -71,6 +71,8 @@ const SPV: &[(&str, &[u8])] = &[
     #[cfg(feature = "ps5-r2")]
     ("moe_gemv_q_ps5_128", include_bytes!(concat!(env!("OUT_DIR"), "/moe_gemv_q_ps5_128.spv"))),
     #[cfg(feature = "ps5-r2")]
+    ("gemmi_dp_ps5_64", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_64.spv"))),
+    #[cfg(feature = "ps5-r2")]
     ("gemmi_dp_ps5_32", include_bytes!(concat!(env!("OUT_DIR"), "/gemmi_dp_ps5_32.spv"))),
     ("hadamard", include_bytes!("spv/hadamard.spv")),
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
@@ -1116,6 +1118,7 @@ impl Vk {
                 "gemv_q_ps5_64" | "moe_gemv_q_ps5_64" => 1,
                 "gemv_q_ps5_128" | "moe_gemv_q_ps5_128" => 2,
                 "gemmi_dp_ps5_32" => 4,
+                "gemmi_dp_ps5_64" => 1 << 8,
                 "attn_prefill_ps5_256" => 8,
                 "attn_prefill_ps5_512" => 16,
                 "attn_prefill_ps5_1024" => 32,
@@ -1257,6 +1260,11 @@ impl Vk {
         }
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
+        if self.0.r2.tiled64(self.0.coop_i8, tiles, nd) {
+            // SM=2 uses two 16-column fragments per logical wave and 64 dense positions.
+            // No split-K (z=1); original tile-list and cooperative routes remain untouched.
+            return self.run("gemmi_dp_ps5_64", &spec, [grid[0], nd.div_ceil(64), 1], &args);
+        }
         if self.0.r2.small_dense(self.0.coop_i8, tiles, nd) {
             return self.run("gemmi_dp_ps5_32", &spec, [grid[0], nd.div_ceil(32), 1], &args);
         }
