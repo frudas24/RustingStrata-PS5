@@ -20,8 +20,12 @@ fn fingerprint(){
         let data:Vec<u8>=include_bytes!("fixtures/IQ2_XS.raw").iter().copied().cycle().take(rb*rows).collect();
         let w=g.upload(&Tensor{ty,rows,cols,data:&data,scale:1.}).unwrap();
         let xs=cols+32;let ys=rows+3;let n=132usize;
-        let x=common::up(&g,&(0..n*xs).map(|i|((i*37%251) as f32-125.)/127.).collect::<Vec<_>>());
-        let ix=common::up(&g,&(0..n).map(|i|((i*17+3)%n) as i32).collect::<Vec<_>>());
+        let host_x=(0..n*xs).map(|i|((i*37%251) as f32-125.)/127.).collect::<Vec<_>>();
+        let order=(0..n).map(|i|((i*17+3)%n) as i32).collect::<Vec<_>>();
+        let x=common::up(&g,&host_x);
+        let ix=common::up(&g,&order);
+        let gathered:Vec<f32>=order.iter().flat_map(|&i| host_x[i as usize*xs..(i as usize+1)*xs].iter().copied()).collect();
+        let x_indexed=common::up(&g,&gathered);
         for cnt in [1usize,15,16,17,31,32,33,63,64,65,127,128] {
             // Nonzero base, exactly one tile; use same tile list ABI as routed prefill.
             let tile=common::up(&g,&[w.ptr,2u64|((cnt as u64)<<32)]);
@@ -29,6 +33,12 @@ fn fingerprint(){
                 let y=common::up(&g,&vec![0.125f32;n*ys]);
                 g.gemm(ty,rows,cols,tile.addr(),1,x.addr(),xs,n,if indexed{ix.addr()}else{0},y.addr(),ys,act).unwrap();
                 let v=common::down::<f32>(&g,&y);
+                let oracle=common::up(&g,&vec![0.125f32;n*ys]);
+                let xr=if indexed {x_indexed.addr()} else {x.addr()};
+                g.gemm_dense(&w,cnt,xr+(4*2*xs) as u64,xs,oracle.addr()+(4*2*ys) as u64,ys,act).unwrap();
+                let expected=common::down::<f32>(&g,&oracle);
+                assert_eq!(v.len(),expected.len());
+                assert!(v.iter().zip(&expected).all(|(a,b)| a.to_bits()==b.to_bits()), "IQ2 routed vs dense {rows}x{cols} cnt={cnt} indexed={indexed} act={act}");
                 for (r,row) in v.chunks_exact(ys).enumerate(){
                     assert!(row.iter().all(|v|v.is_finite()));
                     assert!(row[rows..].iter().all(|&v|v==0.125));
