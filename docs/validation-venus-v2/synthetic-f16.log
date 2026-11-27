@@ -1,0 +1,1 @@
+PASS 5000 tiles, 60000 GEMM outputs and 60000 GEMV outputs; max absolute error 3.15010548e-05
