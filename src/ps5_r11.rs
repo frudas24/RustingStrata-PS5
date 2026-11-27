@@ -115,6 +115,10 @@ fn f16_rows(t:&Tensor,x:&[f32],rows:usize)->anyhow::Result<Option<Vec<f32>>> {
 pub(crate) fn candidate(t:&Tensor,x:&[f32],kind:crate::ps5_r8::Contract,rows:usize)->anyhow::Result<Option<Vec<f32>>> {
     use crate::ps5_r8::Contract;
     if std::env::var_os("STRATA_SCALAR").is_some(){return Ok(None);}
+    #[cfg(target_arch="x86_64")]
+    if !std::is_x86_feature_detected!("avx2"){return Ok(None);}
+    #[cfg(not(target_arch="x86_64"))]
+    return Ok(None);
     let out=match (kind,t.ty) {
         (Contract::F16,GgmlType::IQ2XS) if std::env::var("STRATA_PS5_R11_IQ_F16").as_deref()==Ok("1")=>f16_rows(t,x,rows)?,
         (Contract::Q8_32,GgmlType::IQ3XXS|GgmlType::IQ4XS) if std::env::var("STRATA_PS5_R11_IQ_Q32").as_deref()==Ok("1")=>Some(q32(t,x,rows,true)?),
@@ -142,18 +146,65 @@ mod tests {
             }else{let a=q32(&t,&x,19,false).unwrap();let b=q32(&t,&x,19,true).unwrap();assert_eq!(a.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),b.iter().map(|x|x.to_bits()).collect::<Vec<_>>());}
         }
     }
+    fn measure(t:&Tensor,x:&[f32],il:usize,expert:usize,name:&str,source:&str){
+        let fp=t.ty==GgmlType::IQ2XS;
+        assert!(matches!(t.ty,GgmlType::IQ2XS|GgmlType::IQ3XXS|GgmlType::IQ4XS));
+        let mut legacy=vec![0.;t.rows];
+        let run=|mode:bool|{
+            let now=std::time::Instant::now();
+            let y=if fp {
+                if mode {f16_rows(t,x,t.rows).unwrap().expect("F16C required")}
+                else {
+                    let xr=crate::ps5_r8::activation(x,crate::ps5_r8::Contract::F16).unwrap();
+                    let mut y=vec![0.;t.rows];
+                    y.par_iter_mut().enumerate().for_each_init(||vec![0.;t.cols],|b,(r,v)|{
+                        t.row(r,b);*v=b.iter().zip(&xr).fold(0f32,|a,(&w,&x)|f16::from_f32(w).to_f32().mul_add(x,a));
+                    });y
+                }
+            }else{q32(t,x,t.rows,mode).unwrap()};
+            (y,now.elapsed().as_secs_f64())
+        };
+        let (reference,_)=run(false);let _=run(true);
+        crate::cpu_moe::matvec(t,x,&mut legacy);
+        let mut a=vec![];let mut b=vec![];let mut z=vec![];
+        for mode in [false,true,true,false,false,true,true,false] {
+            let (y,dt)=run(mode);
+            assert!(y.iter().zip(&reference).all(|(a,b)|a.to_bits()==b.to_bits()));
+            if mode{b.push(dt)}else{a.push(dt)};
+            let now=std::time::Instant::now();crate::cpu_moe::matvec(t,x,&mut legacy);z.push(now.elapsed().as_secs_f64());std::hint::black_box(&legacy);
+        }
+        eprintln!("R11_IQ_BENCH {}",serde_json::json!({"layer":il,"expert":expert,"tensor":name,"source":source,"type":t.ty.name(),"rows":t.rows,"cols":t.cols,"bytes":t.data.len(),"reference_seconds":a,"candidate_seconds":b,"legacy_q8k_seconds":z}));
+    }
     #[test]
     #[ignore="requires real Qwen MoE GGUF"]
     fn real_iq_bench(){
-        let path=std::env::var("PS5_R11_MODEL").unwrap();let gg=crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();let w=crate::weights::Weights::new(&gg).unwrap();let c=crate::config::ModelConfig::from_gguf(&gg).unwrap();
+        let path=std::env::var("PS5_R11_MODEL").unwrap();
+        let gg=crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+        let w=crate::weights::Weights::new(&gg).unwrap();let c=crate::config::ModelConfig::from_gguf(&gg).unwrap();
         assert!(c.n_expert>0);let mut seen=[false;3];
         for il in 0..c.n_layer {for name in ["ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"] {
-            let Ok(t)=w.layer(il,name) else{continue};let i=match t.ty{GgmlType::IQ2XS=>0,GgmlType::IQ3XXS=>1,GgmlType::IQ4XS=>2,_=>continue};if seen[i]{continue;}seen[i]=true;
-            let t=t.expert(0,c.n_expert);let x:Vec<_>=(0..t.cols).map(|i|((i*37%251) as f32-125.)/127.).collect();let mut legacy=vec![0.;t.rows];
-            let run=|mode|{let now=std::time::Instant::now();let y=if i==0 {if mode {f16_rows(&t,&x,t.rows).unwrap().expect("F16C required")}else{let xr=crate::ps5_r8::activation(&x,crate::ps5_r8::Contract::F16).unwrap();let mut y=vec![0.;t.rows];y.par_iter_mut().enumerate().for_each_init(||vec![0.;t.cols],|b,(r,v)|{t.row(r,b);*v=b.iter().zip(&xr).fold(0f32,|a,(&w,&x)|f16::from_f32(w).to_f32().mul_add(x,a));});y}}else{q32(&t,&x,t.rows,mode).unwrap()};(y,now.elapsed().as_secs_f64())};
-            let _=run(false);let _=run(true);crate::cpu_moe::matvec(&t,&x,&mut legacy);let mut a=vec![];let mut b=vec![];let mut z=vec![];
-            for mode in [false,true,true,false,false,true,true,false] {let (y,dt)=run(mode);let (r,_) = run(false);assert!(y.iter().zip(&r).all(|(a,b)|a.to_bits()==b.to_bits()));if mode{b.push(dt)}else{a.push(dt)};let now=std::time::Instant::now();crate::cpu_moe::matvec(&t,&x,&mut legacy);z.push(now.elapsed().as_secs_f64());std::hint::black_box(&legacy);}
-            eprintln!("R11_IQ_BENCH {}",serde_json::json!({"layer":il,"tensor":name,"type":t.ty.name(),"rows":t.rows,"cols":t.cols,"bytes":t.data.len(),"reference_seconds":a,"candidate_seconds":b,"legacy_q8k_seconds":z}));
+            let Ok(t)=w.layer(il,name) else{continue};let i=match t.ty{GgmlType::IQ2XS=>0,GgmlType::IQ3XXS=>1,GgmlType::IQ4XS=>2,_=>continue};
+            if seen[i]{continue;}seen[i]=true;
+            let t=t.expert(0,c.n_expert);let x:Vec<_>=(0..t.cols).map(|i|((i*37%251) as f32-125.)/127.).collect();
+            measure(&t,&x,il,0,name,"deterministic");
         }}assert!(seen.into_iter().all(|v|v),"required IQ format missing");
+    }
+    #[test]
+    #[ignore="requires real GGUF and R9/R10 shadow log"]
+    fn captured_iq_bench(){
+        let path=std::env::var("PS5_R11_MODEL").unwrap();
+        let gg=crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+        let w=crate::weights::Weights::new(&gg).unwrap();let c=crate::config::ModelConfig::from_gguf(&gg).unwrap();
+        let log=std::fs::read_to_string(std::env::var("PS5_R11_SHADOW").unwrap()).unwrap();
+        let read=|prefix:&str|log.lines().filter_map(|s|s.strip_prefix(prefix)).map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap()).collect::<Vec<_>>();
+        let fixed=read("r9_fixed,");let acts=read("r9_q8_inputs,");assert!(!fixed.is_empty() && !acts.is_empty());
+        let f=&fixed[0];let a=acts.iter().find(|a|["layer","pos","token","rank","expert"].iter().all(|k|a[*k]==f[*k])).expect("matched Q8 down capture required");
+        let il=f["layer"].as_u64().unwrap() as usize;let expert=f["expert"].as_u64().unwrap() as usize;
+        assert!(il<c.n_layer && expert<c.n_expert);
+        for (name,v) in [("ffn_gate_exps.weight",&f["hidden"]),("ffn_up_exps.weight",&f["hidden"]),("ffn_down_exps.weight",&a["gpu"])] {
+            let t=w.layer(il,name).unwrap().expert(expert,c.n_expert);
+            let x:Vec<f32>=serde_json::from_value(v.clone()).unwrap();
+            measure(&t,&x,il,expert,name,"matched-r9-shadow");
+        }
     }
 }

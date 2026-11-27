@@ -1202,15 +1202,19 @@ impl Vk {
     // Shape-only tuning; the shader's per-row reduction and combine order do not change.
     fn r11_rpw(&self, ty: GgmlType, key: &str, baseline: usize) -> anyhow::Result<usize> {
         if !self.0.ps5 || self.0.wave64 || !matches!(ty, GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ4XS) { return Ok(baseline); }
-        match std::env::var(key).as_deref().unwrap_or("0") {
+        static GEMV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static DOWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let setting = if key == "STRATA_PS5_R11_GEMV_RPW" { &GEMV } else { &DOWN };
+        match setting.get_or_init(|| std::env::var(key).ok()).as_deref().unwrap_or("0") {
             "0" => Ok(baseline), "1" => Ok(1), "2" => Ok(2), "4" => Ok(4), "8" => Ok(8),
             v => anyhow::bail!("{key}: expected 0, 1, 2, 4 or 8, got {v}"),
         }
     }
 
     fn r11_iq32(&self, ty: GgmlType) -> bool {
-        cfg!(feature = "ps5-r2") && self.0.ps5 && !self.0.coop && ty == GgmlType::IQ2XS
-            && std::env::var("STRATA_PS5_R11_IQ32").as_deref() == Ok("1")
+        static ENABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        cfg!(feature = "ps5-r2") && self.0.ps5 && !self.0.wave64 && !self.0.coop && ty == GgmlType::IQ2XS
+            && *ENABLE.get_or_init(|| std::env::var("STRATA_PS5_R11_IQ32").as_deref() == Ok("1"))
     }
 
     fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
@@ -1247,6 +1251,12 @@ impl Vk {
         // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
         let f = !int8 || (!reuse && self.0.st().batch);
+        static R11_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *R11_PROFILE.get_or_init(|| std::env::var("STRATA_PS5_R11_PROFILE").as_deref() == Ok("1")) {
+            // Nominal compressed weight bytes per listed tile, not measured bus traffic (short tiles may re-read).
+            eprintln!("r11_gemm_shape,{},rows={},cols={},tiles={},routed={},x_rows={},contract={},weight_bytes_per_tile={}",
+                ty.name(),rows,cols,n_tiles,tiles!=0,n_x,if f {"f16"} else {"q8"},rows.saturating_mul(ty.row_bytes(cols as u64)));
+        }
         // The R8 oracle selects a contract from type and columns. Reject any routed fallback caused by batching.
         static R8_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if tiles != 0 && *R8_PROBE.get_or_init(|| std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1")
