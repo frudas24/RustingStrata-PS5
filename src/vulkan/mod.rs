@@ -27,6 +27,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
     ("attn_decode", include_bytes!("spv/attn_decode.spv")),
     ("attn_decode_llama", include_bytes!("spv/attn_decode_llama.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("attn_merge", include_bytes!(concat!(env!("OUT_DIR"), "/attn_merge_r7.spv"))),
+    #[cfg(not(feature = "ps5-r2"))]
     ("attn_merge", include_bytes!("spv/attn_merge.spv")),
     ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
     ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
@@ -93,6 +96,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
+    #[cfg(feature = "ps5-r2")]
+    ("moe_route", include_bytes!(concat!(env!("OUT_DIR"), "/moe_route_r7.spv"))),
+    #[cfg(not(feature = "ps5-r2"))]
     ("moe_route", include_bytes!("spv/moe_route.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("ple_conv", include_bytes!("spv/ple_conv.spv")),

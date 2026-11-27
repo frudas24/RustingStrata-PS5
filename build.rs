@@ -9,6 +9,8 @@ fn main() {
     let compiler = env::var_os("GLSLC").unwrap_or_else(|| "glslc".into());
     let validator = env::var_os("SPIRV_VAL").unwrap_or_else(|| "spirv-val".into());
     for (name, source, defs) in [
+        ("attn_merge_r7", "attn_merge.comp", &["-DSTRATA_R7_FIX=1"][..]),
+        ("moe_route_r7", "moe_route.comp", &["-DSTRATA_R7_FIX=1"][..]),
         ("attn_prefill_ps5_256", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=256"][..]),
         ("attn_prefill_ps5_512", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=512"][..]),
         ("attn_prefill_ps5_1024", "attn_prefill_ps5.comp", &["-DSTRATA_R5_WG=1024"][..]),

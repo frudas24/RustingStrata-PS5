@@ -19,14 +19,27 @@ void main() {
     for (uint s = 0; s < ns; s++) M = max(M, ws[s]);
     M = max(M, sk);
     barrier();
+#ifdef STRATA_R7_FIX
+    // All splits may be empty (sparse attention); -inf - -inf is undefined.
+    if (tid < ns) ws[tid] = M == uintBitsToFloat(0xff800000u) ? 0.0 : expf_(ws[tid] - M);
+#else
     if (tid < ns) ws[tid] = expf_(ws[tid] - M);
+#endif
     barrier();
     for (uint s = 0; s < ns; s++) L = fma(p.part.v[pp + s * (hd + 2) + hd + 1], ws[s], L);
+#ifdef STRATA_R7_FIX
+    if (sk != uintBitsToFloat(0xff800000u)) L += expf_(sk - M);
+#else
     if (uint64_t(p.sink) != 0) L += expf_(sk - M);
+#endif
     for (uint d = tid; d < hd; d += 256) {
         precise float o = 0.0;
         for (uint s = 0; s < ns; s++) o = fma(p.part.v[pp + s * (hd + 2) + d], ws[s], o);
+#ifdef STRATA_R7_FIX
+        ro[d] = L == 0.0 ? 0.0 : fdiv(o, L);
+#else
         ro[d] = fdiv(o, L);
+#endif
     }
     barrier();
     if (TQ_V) {
