@@ -12,6 +12,21 @@ use crate::weights::Prefetch;
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
 const STAGE: usize = 16;
 
+/// The 1.4.1 batch scheduler is a separate route from the R4 prompt scheduler.
+/// Never select CPU batch rows on the PS5 profile until a dedicated parity gate passes.
+/// Fixed shares (including zero) are exact; adaptive shares sample at least one expert
+/// whenever misses exist, so rounding to zero cannot permanently stop feedback.
+fn batch_cpu_count(ps5: bool, missed: usize, fixed: Option<&str>, adaptive: f64) -> anyhow::Result<(usize, bool)> {
+    if ps5 || missed == 0 { return Ok((0, false)); }
+    let frac = match fixed {
+        Some(s) => s.parse::<f64>().map_err(|_| anyhow::anyhow!("STRATA_CPU_FRAC must be a finite number in [0, 1]"))?,
+        None => adaptive,
+    };
+    anyhow::ensure!(frac.is_finite() && (0.0..=1.0).contains(&frac), "STRATA_CPU_FRAC must be a finite number in [0, 1]");
+    let n = ((missed as f64 * frac).round() as usize).min(missed);
+    Ok((if fixed.is_some() { n } else { n.max(1) }, fixed.is_none()))
+}
+
 /// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
 /// hyper-connection read and PLE temporaries (`xn` .. `pv`), which run outside both.
 struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize, hr: usize,
@@ -788,9 +803,15 @@ impl GpuModel<'_> {
                             }
                         }
                     }
-                    // Preserve the existing batch-step route exactly when R4 is off or ineligible.
+                    // Upstream 1.4.1 balances batch misses independently of R4. The PS5 profile
+                    // stages every batch miss on GPU, even with STRATA_CPU_FRAC set: legacy CPU
+                    // batch arithmetic has not passed the physical hybrid quality gate.
+                    let mut batch_adaptive = false;
                     if rows.is_some() && c.hadamard.is_none() && !missed.is_empty() {
-                        selected = std::mem::take(&mut missed);
+                        let fixed = std::env::var("STRATA_CPU_FRAC").ok();
+                        let (count, adaptive) = batch_cpu_count(g.ps5_preset(), missed.len(), fixed.as_deref(), self.cpu_frac)?;
+                        batch_adaptive = adaptive;
+                        selected = missed.split_off(missed.len() - count);
                     }
                     let cpu = if !selected.is_empty() {
                         let hv = g.get::<f32>(&pf.slab, l.h, t * ne)?;
@@ -1053,9 +1074,28 @@ impl GpuModel<'_> {
                             if r8_contract { eprintln!("PS5 R8 exercised: layer={il} pairs={} contracts={:?}", pairs.len(), r8_kinds.unwrap()); }
                             scatter(cm, &o)?;
                         } else {
-                            dispatch()?;
-                            let o = crate::cpu_moe::expert_rows(self.m, il, hs, &pairs);
+                            // 1.4.1 batch path (non-PS5). Keep GPU calls on the submitting
+                            // thread, and measure actual completion rather than submission latency.
+                            let model = self.m;
+                            let (o, cpu_elapsed, gpu_elapsed) = std::thread::scope(|scope| -> anyhow::Result<_> {
+                                let task = std::thread::Builder::new().name("strata-batch-experts".into())
+                                    .spawn_scoped(scope, || {
+                                        let start = std::time::Instant::now();
+                                        let o = crate::cpu_moe::expert_rows(model, il, hs, &pairs);
+                                        (o, start.elapsed())
+                                    })?;
+                                let start = std::time::Instant::now();
+                                let gpu_result = dispatch().and_then(|_| g.beside_join()).and_then(|_| g.kick()).and_then(|_| g.sync());
+                                let gpu_elapsed = start.elapsed();
+                                let result = task.join().map_err(|_| anyhow::anyhow!("batch CPU expert task panicked"));
+                                gpu_result?;
+                                let (o, cpu_elapsed) = result?;
+                                Ok((o, cpu_elapsed, gpu_elapsed))
+                            })?;
                             scatter(cm, &o)?;
+                            if batch_adaptive {
+                                self.cpu_frac = (self.cpu_frac + if cpu_elapsed > gpu_elapsed { -0.02 } else { 0.02 }).clamp(0.0, 1.0);
+                            }
                         }
                     } else { dispatch()?; }
                     g.beside_join()?;
@@ -1360,5 +1400,48 @@ impl GpuModel<'_> {
         self.row_tokens += t;
         self.after_experts(t, self.row_tokens)?;
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod u1_batch_tests {
+    use super::batch_cpu_count;
+
+    #[test]
+    fn ps5_batch_cannot_bypass_hybrid_quarantine() {
+        for n in [0, 1, 17, 256] {
+            for fixed in [None, Some("0"), Some("0.5"), Some("1"), Some("NaN")] {
+                assert_eq!(batch_cpu_count(true, n, fixed, 0.5).unwrap(), (0, false));
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_share_is_bounded_and_zero_is_exact() {
+        for n in 1..=256 {
+            assert_eq!(batch_cpu_count(false, n, Some("0"), 0.5).unwrap(), (0, false));
+            assert_eq!(batch_cpu_count(false, n, Some("1"), 0.5).unwrap(), (n, false));
+            let (k, adaptive) = batch_cpu_count(false, n, Some("0.5"), 0.5).unwrap();
+            assert_eq!(k, n.div_ceil(2));
+            assert!(!adaptive);
+        }
+        for invalid in ["NaN", "inf", "-0.1", "1.1", "garbage"] {
+            assert!(batch_cpu_count(false, 3, Some(invalid), 0.5).is_err());
+        }
+    }
+
+    #[test]
+    fn adaptive_share_keeps_feedback_and_partition() {
+        for n in 1..=256 {
+            for frac in [0.0, 0.02, 0.5, 0.98, 1.0] {
+                let (count, adaptive) = batch_cpu_count(false, n, None, frac).unwrap();
+                assert!(adaptive && (1..=n).contains(&count));
+                let mut gpu: Vec<_> = (0..n).collect();
+                let cpu = gpu.split_off(n - count);
+                gpu.extend(cpu);
+                assert_eq!(gpu, (0..n).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(batch_cpu_count(false, 0, None, 0.5).unwrap(), (0, false));
     }
 }
