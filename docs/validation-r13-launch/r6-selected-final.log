@@ -1,0 +1,15 @@
+test_record (__main__.Tests.test_record) ... ok
+test_metadata_and_fingerprint_rejections (__main__.Tests.test_metadata_and_fingerprint_rejections) ... ok
+test_numerics (__main__.Tests.test_numerics) ... ok
+test_dispatch_noop (__main__.Tests.test_dispatch_noop) ... ok
+test_metrics_guard (__main__.Tests.test_metrics_guard) ... ok
+test_settings_and_env (__main__.Tests.test_settings_and_env) ... ok
+test_r7_quarantine (__main__.Tests.test_r7_quarantine) ... ok
+test_shards_and_atomic (__main__.Tests.test_shards_and_atomic) ... ok
+test_timeout_and_child_failure (__main__.Tests.test_timeout_and_child_failure) ... ok
+test_random_metrics (__main__.Tests.test_random_metrics) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.562s
+
+OK

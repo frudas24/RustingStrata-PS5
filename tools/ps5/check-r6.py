@@ -85,7 +85,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             with self.assertRaisesRegex(r6.Reject,'timeout'):r6.run_child([sys.executable,'-c','import time;time.sleep(5)'],os.environ.copy(),root/'timeout.log',.1,0)
-            with self.assertRaisesRegex(r6.Reject,'exited 7'):r6.run_child([sys.executable,'-c','raise SystemExit(7)'],os.environ.copy(),root/'fail.log',2,0)
+            with self.assertRaisesRegex(r6.Reject,'exited 7'):r6.run_child(['sh','-c','exit 7'],os.environ.copy(),root/'fail.log',10,0)
     def test_cli_mock_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); model=root/'model.gguf';model.write_bytes(b'synthetic fixture only'); binary=root/'mock-engine';binary.write_text(FAKE);binary.chmod(0o755)

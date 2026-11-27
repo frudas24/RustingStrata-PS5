@@ -1,0 +1,16 @@
+test_all_legal_dispatch_sets (__main__.Gates.test_all_legal_dispatch_sets) ... ok
+test_distinct_marker_arms (__main__.Gates.test_distinct_marker_arms) ... ok
+test_profile_flags_do_not_leak (__main__.Gates.test_profile_flags_do_not_leak) ... ok
+test_profile_summary (__main__.Gates.test_profile_summary) ... ok
+test_cooperative_initialization (__main__.Lookup.test_cooperative_initialization) ... ok
+test_grid_data_and_indices (__main__.Lookup.test_grid_data_and_indices) ... ok
+test_iq4_packed_bytes (__main__.Lookup.test_iq4_packed_bytes) ... ok
+test_shader_wiring (__main__.Lookup.test_shader_wiring) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.233s
+
+OK
+R13 model arm combinations: 12 single-marker corruptions: 204
+R13 independent IQ grid index cases: 65792
+R13 independent IQ4 packed cases: 65536

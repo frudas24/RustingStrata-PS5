@@ -1,0 +1,44 @@
+test_alignment_counterexample (__main__.Gates.test_alignment_counterexample) ... ok
+test_each_format_and_fallback (__main__.Gates.test_each_format_and_fallback) ... ok
+test_lds_records (__main__.Gates.test_lds_records) ... ok
+test_pairwise_return_gate (__main__.Gates.test_pairwise_return_gate) ... ok
+test_r12_exact_route_markers (__main__.Gates.test_r12_exact_route_markers) ... ok
+test_swap_telemetry (__main__.Gates.test_swap_telemetry) ... ok
+test_zero_write_poison_wiring (__main__.Gates.test_zero_write_poison_wiring) ... ok
+test_bad_size (__main__.MockCampaign.test_bad_size) ... ok
+test_duplicate_lds (__main__.MockCampaign.test_duplicate_lds) ... ok
+test_missing_format (__main__.MockCampaign.test_missing_format) ... ok
+test_mixed_fallback (__main__.MockCampaign.test_mixed_fallback) ... ok
+test_valid_mock (__main__.MockCampaign.test_valid_mock) ... ERROR
+test_wrong_arm (__main__.MockCampaign.test_wrong_arm) ... ok
+test_zero_tests (__main__.MockCampaign.test_zero_tests) ... ok
+
+======================================================================
+ERROR: test_valid_mock (__main__.MockCampaign.test_valid_mock)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/r13audit/tools/ps5/check-r13-audit.py", line 127, in test_valid_mock
+    p=self.run_mock('valid');self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+  File "/tmp/r13audit/tools/ps5/check-r13-audit.py", line 125, in run_mock
+    return subprocess.run(['bash',str(HERE/'test-r13-lut.sh'),str(p/'out')],env=env,capture_output=True,text=True,timeout=30)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 2129, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['bash', '/tmp/r13audit/tools/ps5/test-r13-lut.sh', '/tmp/tmpuf0q0fsq/out']' timed out after 30 seconds
+
+----------------------------------------------------------------------
+Ran 14 tests in 92.501s
+
+FAILED (errors=1)
+R13 adversarial dispatch mutations rejected: 756
