@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Full-chunk, raw-FP32 boundary comparison after the independent R10 controls pass."""
 import argparse
+import importlib.util
 import json
-import math
 from pathlib import Path
 import struct
 
@@ -51,23 +51,36 @@ def compare(ref, other):
 
 
 def evaluate(root):
-    # Require successful prior R10 comparison (including raw GPU/Shadow/Sham controls).
-    prior=json.loads((root/'summary.json').read_text())
+    # Revalidate the R10 controls rather than trusting a possibly stale summary.
+    spec=importlib.util.spec_from_file_location('r10',Path(__file__).with_name('compare-r10.py'))
+    r10=importlib.util.module_from_spec(spec);spec.loader.exec_module(r10)
+    prior=r10.evaluate(root)
+    fixed,_,_=r10.r9.read_arm(root,'shadow',1)
+    target=fixed[0]
     require(prior.get('production_promotion') is False and set(prior['arms'])=={'shadow','sham','replay-shadow','contract','replay-contract'},'R10 summary missing')
     ref=read(root/'shadow.log'); keys=list(ref)
-    pos,layer,_=keys[0]
+    pos,layer=target['pos'],target['layer']
+    width=len(target['hidden'])
     meta=json.loads((root/'gpu.json').read_text())['r10']
     # R10 fixture reports all MoE layers; Qwen3.6 uses a MoE in each traced layer.
     end=min(layer+8,max(meta['layers']))
     require(keys==[(pos,l,s) for l in range(layer,end+1) for s in STAGES],'incomplete reference stage coverage')
-    require(all(t==len(meta['tokens'][pos:pos+meta['chunk']]) for t,_,_ in ref.values()),'trace prompt shape differs')
+    require(all((t,w)==(target['chunk'],width) for t,w,_ in ref.values()),'trace prompt shape differs')
     for arm in CONTROLS:
         require(not any(r['changed'] for r in compare(ref,read(root/f'{arm}.log'))),arm+' changed raw boundary bits')
     result={}
+    initial={}
     for arm in CANDIDATES:
-        rows=compare(ref,read(root/f'{arm}.log'))
+        captured=read(root/f'{arm}.log')
+        rows=compare(ref,captured)
         require(not any(r['changed'] for r in rows[:4]),arm+' changed before intervention')
+        key=(pos,layer,'layer_output')
+        a,b=ref[key][2],captured[key][2]
+        start=target['token']*width;end=start+width
+        require(a[:start]==b[:start] and a[end:]==b[end:],arm+' changed an unselected token at intervention')
+        initial[arm]=b
         result[arm]=rows
+    require(initial['contract']==initial['replay-contract'],'initial full chunk differs under replay')
     return {'production_promotion':False,'controls':'bitwise identical','scope':'all tokens, intervention chunk only', 'arms':result}
 
 
