@@ -1224,6 +1224,11 @@ impl Vk {
         // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
         let f = !int8 || (!reuse && self.0.st().batch);
+        // The R8 oracle selects a contract from type and columns. Reject any routed fallback caused by batching.
+        if tiles != 0 && (std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1")
+            || std::env::var("STRATA_R7_R4_STAGE_PROBE").as_deref() == Ok("1")) {
+            ensure!(!self.0.st().batch, "R8 routed numerical probe excludes batched GEMM");
+        }
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 != 0 };

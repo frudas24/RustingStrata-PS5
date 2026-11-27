@@ -397,8 +397,17 @@ impl GpuModel<'_> {
         if r4_stage_probe {
             anyhow::ensure!(venus.is_none() && self.ps5_r4.is_some() && rows.is_none() && input.is_none()
                 && c.hadamard.is_none() && self.m.loras.is_empty() && g.name() == "vulkan" && !g.beside_overlaps()
-                && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1"),
+                && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1")
+                && !crate::cuda::llama_numerics() && std::env::var("STRATA_VK_NO_COOP").as_deref() == Ok("1"),
                 "R4 stage probe requires ordinary Vulkan R4 research prefill; no Venus trace, LoRA, Hadamard or overlapping staging");
+        }
+        let r8_contract = std::env::var("STRATA_PS5_R8_CONTRACT").as_deref() == Ok("1");
+        if r8_contract {
+            anyhow::ensure!(self.ps5_r4.is_some() && std::env::var("STRATA_PS5_R4_RESEARCH").as_deref() == Ok("1")
+                && venus.is_none() && rows.is_none() && input.is_none() && c.hadamard.is_none() && self.m.loras.is_empty()
+                && g.name() == "vulkan" && !g.beside_overlaps() && !crate::cuda::llama_numerics()
+                && std::env::var("STRATA_VK_NO_COOP").as_deref() == Ok("1"),
+                "R8 contract requires R4 research, ordinary Vulkan prefill, no cooperative matrices/llama numerics/LoRA/Hadamard");
         }
         if let Some(v) = venus {
             anyhow::ensure!(rows.is_none() && input.is_none() && self.ps5_r4.is_none() && c.hadamard.is_none()
@@ -692,6 +701,12 @@ impl GpuModel<'_> {
                     let mut missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
                     // PS5 R4: only prompt prefill, never decode/verify, Hadamard, LoRA or diagnostic traces.
                     // Resident experts remain on GPU. Select complete missed experts, with a bounded CPU scratch estimate.
+                    // Match the type/column policy of Vulkan gemm_raw for normal (non-batched) prefill.
+                    // Explicitly exclude other arithmetic modes rather than silently falling back in research.
+                    let contract = |ty, cols: usize| if g.int8_gemm(ty) && cols % 128 == 0 {
+                        crate::ps5_r8::Contract::Q8_32
+                    } else { crate::ps5_r8::Contract::F16 };
+                    let r8_kinds = (r8_contract || r4_stage_probe).then(|| [contract(lx.mats[0].ty, lx.mats[0].cols), contract(lx.mats[1].ty, lx.mats[1].cols), contract(lx.mats[2].ty, lx.mats[2].cols)]);
                     let mut trial = None;
                     let mut selected = Vec::new();
                     if self.ps5_r4.is_some() && rows.is_none() && il < c.n_layer && !trace && c.hadamard.is_none() && self.m.loras.is_empty()
@@ -856,6 +871,10 @@ impl GpuModel<'_> {
                                         let pos = l.ge + slot * c.n_ff_exp;
                                         let gpu_gate = g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?;
                                         compare_stage("gate", &cg, &gpu_gate);
+                                        let kinds = r8_kinds.unwrap();
+                                        let reference = crate::ps5_r8::projection(&gate, hidden, kinds[0], 16.min(gpu_gate.len()))?;
+                                        compare_stage("gate_contract_oracle", &reference, &gpu_gate[..reference.len()]);
+                                        eprintln!("r8_contract_stage,{il},{expert},gate,{:?}", kinds[0]);
                                         // Dequantized f64 reference for the first 16 rows. Both arms use the
                                         // same decoded weight and reduction order, changing only the input Q8 grouping.
                                         for (group, stage) in [(32, "gate_q8_32_oracle"), (256, "gate_q8k_256_oracle")] {
@@ -876,7 +895,11 @@ impl GpuModel<'_> {
                                             compare_stage(stage, &oracle, &gpu_gate[..n]);
                                         }
                                         g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                                        compare_stage("up", &cu, &g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?);
+                                        let gpu_up = g.get::<f32>(&pf.slab, pos, c.n_ff_exp)?;
+                                        compare_stage("up", &cu, &gpu_up);
+                                        let reference = crate::ps5_r8::projection(&up, hidden, kinds[1], 16.min(gpu_up.len()))?;
+                                        compare_stage("up_contract_oracle", &reference, &gpu_up[..reference.len()]);
+                                        eprintln!("r8_contract_stage,{il},{expert},up,{:?}", kinds[1]);
                                         g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
                                         cpu_activation = cg.iter().zip(&cu).map(|(&a, &b)| crate::ops::silu(a) * b).collect();
                                         eprintln!("r7_r4_type,{il},{expert},{:?},{:?},{},{}", gate.ty, up.ty, gate.scale, up.scale);
@@ -925,12 +948,16 @@ impl GpuModel<'_> {
                             // Keep all Vulkan calls on the submitting thread. kick() also submits on single-queue RADV.
                             let o = std::thread::scope(|scope| -> anyhow::Result<Vec<f32>> {
                                 let task = std::thread::Builder::new().name("strata-ps5-prefill".into())
-                                    .spawn_scoped(scope, || crate::cpu_moe::expert_rows(model, il, hs, &pairs))?;
+                                    .spawn_scoped(scope, || -> anyhow::Result<Vec<f32>> {
+                                        if r8_contract { crate::ps5_r8::expert_rows(model, il, hs, &pairs, r8_kinds.unwrap()) }
+                                        else { Ok(crate::cpu_moe::expert_rows(model, il, hs, &pairs)) }
+                                    })?;
                                 let gpu_result = dispatch().and_then(|_| g.beside_join()).and_then(|_| g.kick());
                                 let result = task.join().map_err(|_| anyhow::anyhow!("PS5 R4 CPU expert task panicked"));
                                 gpu_result?;
-                                result
+                                result?
                             })?;
+                            if r8_contract { eprintln!("PS5 R8 exercised: layer={il} pairs={} contracts={:?}", pairs.len(), r8_kinds.unwrap()); }
                             scatter(cm, &o)?;
                         } else {
                             dispatch()?;
@@ -976,6 +1003,10 @@ impl GpuModel<'_> {
                         crate::cpu_moe::matvec(&down, &activation, &mut cpu_down);
                         let gpu_down = g.get::<f32>(&pf.slab, l.ye + slot * ne, ne)?;
                         compare_stage("down_same_gpu_activation", &cpu_down, &gpu_down);
+                        let kind = r8_kinds.unwrap()[2];
+                        let reference = crate::ps5_r8::projection(&down, &activation, kind, 16.min(gpu_down.len()))?;
+                        compare_stage("down_contract_oracle", &reference, &gpu_down[..reference.len()]);
+                        eprintln!("r8_contract_stage,{il},{expert},down,{kind:?}");
                         let hs = vec![hidden.clone()];
                         let cpu_pipeline = crate::cpu_moe::expert_rows(self.m, il, &hs, &[(0, *expert, 0.0)]);
                         compare_stage("down_full_cpu_pipeline", &cpu_pipeline, &gpu_down);
