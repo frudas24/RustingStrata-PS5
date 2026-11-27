@@ -177,7 +177,8 @@ def evidence(log,k):
     require(uploads,'missing upload report')
     mapped=sum(int(a) for a,b in uploads); staged=sum(int(b) for a,b in uploads)
     if not k['direct']: require(mapped==0,'mapped upload active despite being disabled')
-    return dict(marks=sorted(marks),mapped=mapped,staged=staged)
+    dot = re.findall(r'packed signed dot accelerated (true|false)',log)
+    return dict(marks=sorted(marks),mapped=mapped,staged=staged,dot_accel=(all(x=='true' for x in dot) if dot else None))
 
 def useful_change(old,new,a,b):
     if old['gtt']!=new['gtt']: require('gtt_nonlocal' in (a if old['gtt'] else b)['marks'],'GTT comparison never exercised nonlocal heap')
@@ -253,6 +254,9 @@ def search(session,budget,experimental):
     # Retain CLI compatibility; physical research failed both R3 and R4 deployment gates.
     if experimental: print('R7: R3/R4 remain isolated research; not searched or promoted', file=sys.stderr, flush=True)
     order=('gemv','small','attn','threads','chunk','gtt','direct')
+    if baseline_run['evidence'].get('dot_accel') is False:
+        order=order[2:]
+        print('R7: packed signed dot not accelerated; skipping R2 accelerated candidates',flush=True)
     for key in order:
         original=best[key]
         for value in SPACE[key]:

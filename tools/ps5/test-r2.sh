@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fail closed: no GPU, failed build, or even one differing output bit fails this gate.
 set -euo pipefail
+export STRATA_PS5_R7_GEMM_TILE=0
 source "$(dirname -- "$0")/env.sh"
 cd "$PS5_ROOT"
 out=${1:-$PS5_ROOT/results/ps5-r2-parity}

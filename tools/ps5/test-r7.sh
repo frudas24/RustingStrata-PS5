@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Physical regression gates; never report success on a skipped test.
 set -euo pipefail
+export STRATA_PS5_R7_GEMM_TILE=0
 source "$(dirname -- "$0")/env.sh"
 cd "$PS5_ROOT"
 export STRATA_PS5=1 STRATA_TEST_BACKENDS=vulkan STRATA_PS5_ZERO_COPY=0 STRATA_PS5_SCHED=off

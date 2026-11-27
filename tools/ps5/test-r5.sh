@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compare exact output bits for each KV mode (including 64K synthetic attention).
 set -euo pipefail
+export STRATA_PS5_R7_GEMM_TILE=0
 source "$(dirname -- "$0")/env.sh"
 cd "$PS5_ROOT"
 out=${1:-$PS5_ROOT/results/ps5-r5-parity}

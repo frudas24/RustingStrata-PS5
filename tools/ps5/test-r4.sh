@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export STRATA_PS5_R7_GEMM_TILE=0
 [[ $# == 1 && -r $1 ]] || { echo 'usage: test-r4.sh GENERIC-MOE.gguf' >&2; exit 2; }
 export STRATA_MODEL=$(realpath "$1")
 source "$(dirname -- "$0")/env.sh"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export STRATA_PS5_R7_GEMM_TILE=0
 export STRATA_PS5_ZERO_COPY=0
 source "$(dirname -- "$0")/env.sh"
 cd "$PS5_ROOT"

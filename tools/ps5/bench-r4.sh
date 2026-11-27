@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Use only after test-r4.sh passes. The off arm preserves R3; gpu isolates synchronization overhead.
 set -euo pipefail
+export STRATA_PS5_R4_RESEARCH=1 STRATA_PS5_R7_GEMM_TILE=0
+echo "R7: R4 hybrid parity failed on PS5; research only" >&2
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 [[ $# -ge 1 && -r $1 ]] || { echo 'usage: bench-r4.sh MODEL.gguf [OUTPUT_DIR] [extra bench flags]' >&2; exit 2; }
 model=$(realpath "$1"); shift; out=${1:-ps5-r4-$(date +%Y%m%d-%H%M%S)}; if (($#)); then shift; fi
