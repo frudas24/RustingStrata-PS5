@@ -5,14 +5,13 @@ Linux.** Original author Vasyl Trefilov, same [LICENSE.md](LICENSE.md), no endor
 docs and numbers further down are unchanged and still describe upstream; this fork keeps an opt-in PS5 path on top of
 them.
 
-Current tip: **R9** — R6U1 (R1–R6 merged with upstream 1.4.0) plus five later deltas, all of them research or
-diagnostic work whose flags are off by default: R7 (two shader fixes ported from a physical R6 campaign, opt-in Vulkan
-counters, experimental dense64 GEMM), R7-V1 and R7-V2 ("Venus": opt-in CPU F16/BF16 kernels and a one-row GPU MoE
-trace), R8 (routed-arithmetic contract oracle) and R9 (matched single-expert causal replay). **None of them is a
-measured speedup and none changes a default**; the only tok/s this fork owns are still the R1 rows below. Upstream has
-not moved past 1.4.0 (`260a11c9`), so nothing of upstream is missing here. Details:
-[docs/PS5-R7.md](docs/PS5-R7.md), [docs/PS5-R7-VENUS.md](docs/PS5-R7-VENUS.md), [docs/PS5-R7-V2.md](docs/PS5-R7-V2.md),
-[docs/PS5-R8.md](docs/PS5-R8.md), [docs/PS5-R9.md](docs/PS5-R9.md).
+Integration branch: **R11U1** — R11 (`c2cacb3`) plus a selective content integration of upstream 1.4.1
+(`956904f`). The frozen R11 physical campaign remains separate. R10 adds controlled routing and Venus tail;
+R11 adds experimental IQ kernels for Qwen3.6-35B-A3B. R11U1 preserves these flags, adopts backend fixes and
+blocks the separate CPU batch-miss path on the active PS5 profile until validated. Multi-device batching and
+upstream's relaxed MoE test tolerances are deferred. No new physical performance is claimed for R11U1.
+See [docs/PS5-R10.md](docs/PS5-R10.md), [docs/PS5-R11.md](docs/PS5-R11.md) and
+[docs/PS5-R11U1.md](docs/PS5-R11U1.md) for exact evidence, scope and gates.
 
 ## This fork is meant for the PS5
 
@@ -130,14 +129,15 @@ quarantined R4 hybrid scheduler and the file-backed import. The tags below rebui
 
 | ref | what it is |
 |---|---|
-| `main` | the tip: R9 = R1–R6 + upstream 1.4.0 (R6U1) + the R7, R7-V1, R7-V2, R8 and R9 deltas + this README |
+| `main` (received) | frozen R11, `c2cacb3`; do not interrupt its physical campaign |
+| `ps5/r11u1` | selective upstream 1.4.1 integration, not yet physically validated |
 | `ps5-r1` … `ps5-r6` | one tag per PS5 version; each checkpoint stays reconstructible without being re-derived |
 | `ps5-r6u1` | the R6U1 merge |
 | `ps5-r7`, `ps5-r7-venus`, `ps5-r7-venus-v2`, `ps5-r8`, `ps5-r9` | one tag per later delta, each with its own branch (`ps5/r7` … `ps5/r9`) and its own document; they arrived as git bundles and were merged fast-forward, so their commit hashes are the authors' |
 | `feat/expert-cache-prefill-protect` | `b7b832b`, the prefill-protect change alone (the upstream PR branch, pushed as `upstream/pr-108`), kept free of the PS5 port so the PR does not carry it |
-| `upstream/main` | `260a11c9`, upstream 1.4.0 — the merge base R6U1 was built on; R1–R6 were cut from `8df1c22` (1.3.7) |
+| upstream source archives | `260a11c9` (1.4.0), R6U1 merge base; `956904f` (1.4.1), R11U1 comparison target |
 
-### PS5 versions R1–R9
+### PS5 versions R1–R11U1
 
 | version | tag | what it adds | opt-in switches |
 |---|---|---|---|
@@ -153,13 +153,12 @@ quarantined R4 hybrid scheduler and the file-backed import. The tags below rebui
 | R7-V2 | `ps5-r7-venus-v2` | native BF16 CPU GEMV for exact 2-byte rows, and an independent BF16/F16 parity harness over real Qwen3-0.6B weights; needs a GGUF converted with `--outtype bf16` | `STRATA_PS5_VENUS_BF16` |
 | R8 | `ps5-r8` | routed-arithmetic contract investigation: a deliberately slow CPU oracle that follows Vulkan's own type/column selection, route-aware gate/up/down probes, and a guarded four-arm campaign; an accuracy experiment, never a production path | `STRATA_PS5_R8_CONTRACT`, `STRATA_R7_R4_STAGE_PROBE`, `PS5_R8_TIMEOUT` |
 | R9 | `ps5-r9` | matched single-expert causal replay: replaces exactly one GPU-routed expert row just before the Vulkan combine, reads the combined row back, and fails closed on a missing target or a mismatch | `STRATA_PS5_R9_MODE` (`shadow`, `legacy`, `contract`), `PS5_R9_LAYER`, `PS5_R9_POS`, `PS5_R9_TOKEN`, `PS5_R9_RANK` |
+| R10 | `ps5/r10` (branch) | sham write control, frozen routing and Venus tail | see [R10](docs/PS5-R10.md) |
+| R11 | `ps5/r11` (branch) | IQ32 GPU, IQ CPU contracts and GEMV/down wave candidates | see [R11](docs/PS5-R11.md) |
+| R11U1 | `ps5/r11u1` (branch) | selective upstream 1.4.1; PS5 batch CPU quarantine | `STRATA_PS5_U1_BATCH_LOG` (diagnostic only) |
 
-**`main` is the version to run**, with two nuances. The code line is cumulative: R6 contains R1–R5, R6U1 adds upstream
-1.4.0, and R7–R9 keep every earlier file and every earlier switch, so moving forward drops nothing — across R1→R6,
-R6→R6U1 and R6U1→R9 the count of deleted files is zero. But cumulative in code is not cumulative in evidence: R7–R9 are
-research deltas whose flags default to off and whose own documents report no console and no toolchain, so the tags are
-kept to compare each successor against its predecessor A/B/B/A and to keep every checkpoint reconstructible without
-being re-derived.
+Keep the frozen R11 worktree for its running physical campaign. R11U1 is cumulative in code, not in evidence;
+validate it in a separate worktree before adopting it. Earlier checkpoints remain reconstructible.
 
 Per-version documentation: [docs/PS5.md](docs/PS5.md) (R1), [docs/PS5-R2.md](docs/PS5-R2.md),
 [docs/PS5-R3.md](docs/PS5-R3.md), [docs/PS5-R4.md](docs/PS5-R4.md), [docs/PS5-R5.md](docs/PS5-R5.md),
@@ -191,7 +190,11 @@ behaviour:
 
 ### Validation status
 
-Honest summary, because the distinction matters:
+R11U1: independent R9/R10/R11 and KLD checks passed locally; Rust compilation and physical batch guard are pending.
+R10's document records later R9 physical Venus F16/BF16 performance and causal findings. R11 physical results remain
+pending at this integration point. The following bullets describe earlier reports at their original preparation dates,
+not the current cumulative physical status:
+
 
 - **R6U1 was not compiled, not GLSL/SPIR-V validated, not run and not benchmarked** in the environment that prepared
   it. Its own logs (`docs/validation-r6u1/`) record PASS for the independent C SIMD check, the R2–R5 Python
@@ -221,7 +224,7 @@ documents, not this README, are the acceptance criteria. The historical fork rep
 own report in `docs/archive/PS5-fork-612c3c9-R1-report.md`.
 
 The licence and the credit are unchanged: original RustingStrata by Vasyl Trefilov, distributed under the same
-[LICENSE.md](LICENSE.md), no endorsement implied. **Upstream's own README follows, verbatim.**
+[LICENSE.md](LICENSE.md), no endorsement implied. **Upstream's own README follows (version updated to 1.4.1).**
 
 ---
 
@@ -237,7 +240,7 @@ Supported models: Qwen3, Qwen3-Next, Qwen3.5/3.6, Qwen3.8-Flash-Next, Recursive 
 GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the GGUF types and the notes for each model are in
 [docs/MODELS.md](docs/MODELS.md).
 
-Version 1.4.0.
+Version 1.4.1.
 
 ## Numbers
 

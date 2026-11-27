@@ -1,0 +1,12 @@
+test_good (__main__.Gates.test_good) ... ok
+test_input_change (__main__.Gates.test_input_change) ... ok
+test_missing_stage (__main__.Gates.test_missing_stage) ... ok
+test_missing_write (__main__.Gates.test_missing_write) ... ok
+test_nonfinite (__main__.Gates.test_nonfinite) ... ok
+test_route_change (__main__.Gates.test_route_change) ... ok
+test_shadow_changed (__main__.Gates.test_shadow_changed) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.015s
+
+OK
