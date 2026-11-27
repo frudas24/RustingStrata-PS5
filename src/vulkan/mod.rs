@@ -16,6 +16,22 @@ mod ps5_r2;
 mod ps5_r3;
 mod ps5_r5;
 
+// Diagnostic only: no clock reads, allocation logs or extra synchronization when off.
+fn r13_mem_trace() -> bool {
+    static ENABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLE.get_or_init(|| std::env::var("STRATA_PS5_R13_MEM_TRACE").as_deref() == Ok("1"))
+}
+fn r13_quant_trace() -> bool {
+    static ENABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLE.get_or_init(|| std::env::var("STRATA_PS5_R13_QUANT_TRACE").as_deref() == Ok("1"))
+}
+// Callers retain the existing mapping, range and synchronization contracts.
+unsafe fn r13_host_copy(src: *const u8, dst: *mut u8, bytes: usize, role: &str) {
+    let start = r13_mem_trace().then(std::time::Instant::now);
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, bytes) };
+    if let Some(t) = start { eprintln!("r13_mem_copy,{role},bytes={bytes},ns={}", t.elapsed().as_nanos()); }
+}
+
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
@@ -749,7 +765,7 @@ impl Inner {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | if self.cr.is_some() { vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT } else { vk::BufferUsageFlags::empty() };
-        let size = bytes.max(1).next_multiple_of(4) as u64;
+        let size = bytes.max(1).checked_next_multiple_of(4).context("Vulkan buffer size overflow")? as u64;
         let mut bi = vk::BufferCreateInfo::default().size(size).usage(usage);
         if self.tq.is_some() { bi = bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&self.qfs); }
         let buf = unsafe { self.dev.create_buffer(&bi, None) }?;
@@ -791,17 +807,24 @@ impl Inner {
                     } {
                         Ok(m) => {
                             nonlocal = wants == DEVICE && !self.mem.memory_heaps[h].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
-                            mem_ok = Some(m); break 'outer;
+                            mem_ok = Some((m, i)); break 'outer;
                         }
                         Err(e) => last_err = anyhow::Error::from(e).context(format!("allocate {bytes} bytes")),
                     }
                 }
             }
         }
-        let mem = match mem_ok { Some(m) => m, None => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(last_err); } };
+        let (mem, memory_type) = match mem_ok { Some(m) => m, None => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(last_err); } };
         if let Err(e) = unsafe { self.dev.bind_buffer_memory(buf, mem, 0) } {
             unsafe { self.dev.destroy_buffer(buf, None); self.dev.free_memory(mem, None); }
             return Err(e.into());
+        }
+        if self.ps5 && r13_mem_trace() {
+            let mt = self.mem.memory_types[memory_type as usize];
+            let role = if wants == DEVICE { "device" } else if wants == MAPPED_DEVICE { "immutable_upload" }
+                else if wants == HOST { "host_staging" } else if wants == BAR_AMD || wants == BAR { "mailbox" } else { "other" };
+            eprintln!("r13_mem_alloc,{role},requested={bytes},allocated={},type={memory_type},heap={},flags={:#x},host_cached={}",
+                req.size, mt.heap_index, mt.property_flags.as_raw(), mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_CACHED));
         }
         if nonlocal { self.r6_mark(1 << 7, "gtt_nonlocal"); }
         Ok((buf, mem))
@@ -1303,11 +1326,15 @@ impl Vk {
         if !self.gemm_q8_supported(ty, cols) { return Ok(None); }
         let need = q8_gemm_bytes(n_x, cols, x_stride)?;
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
-        if q8.1 == key { return Ok(Some(q8.0.addr())); }
+        if q8.1 == key {
+            if self.0.ps5 && r13_quant_trace() { eprintln!("r13_q8,hit,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name()); }
+            return Ok(Some(q8.0.addr()));
+        }
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.0.addr();
         self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
         q8.1 = key;
+        if self.0.ps5 && r13_quant_trace() { eprintln!("r13_q8,miss,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name()); }
         Ok(Some(xq))
     }
 
@@ -1336,6 +1363,9 @@ impl Vk {
         // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
         let int8 = self.gemm_q8_supported(ty, cols);
         let f = !int8 || (!reuse && self.0.st().batch);
+        if self.0.ps5 && r13_quant_trace() && int8 && f {
+            eprintln!("r13_q8,batch_fallback,rows={n_x},cols={cols},stride={x_stride},type={}", ty.name());
+        }
         static R11_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *R11_PROFILE.get_or_init(|| std::env::var("STRATA_PS5_R11_PROFILE").as_deref() == Ok("1")) {
             // Nominal compressed weight bytes per listed tile, not measured bus traffic (short tiles may re-read).
@@ -1479,7 +1509,7 @@ impl Backend for Vk {
                     Ok(p) => {
                         unsafe {
                             let p = p.cast::<u8>();
-                            std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+                            r13_host_copy(src.as_ptr(), p, src.len(), "immutable_upload");
                             // Match the old zeroed allocation's tail, up to Vulkan's 4-byte alignment.
                             p.add(src.len()).write_bytes(0, src.len().next_multiple_of(4) - src.len());
                             self.0.dev.unmap_memory(mem);
@@ -1529,7 +1559,7 @@ impl Backend for Vk {
                 let at = st.staged;
                 self.0.ring_wait(&mut st, at, c.len())?;
                 let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
-                unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
+                unsafe { r13_host_copy(c.as_ptr(), (st.map + at) as *mut u8, c.len(), "staging_write") };
                 let cb = self.0.topen(&mut st)?;
                 let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
                 unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
@@ -1546,7 +1576,7 @@ impl Backend for Vk {
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
             let at = st.staged;
             self.0.ring_wait(&mut st, at, c.len())?;
-            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
+            unsafe { r13_host_copy(c.as_ptr(), (st.map + at) as *mut u8, c.len(), "staging_write") };
             let cb = self.0.open_cb(&mut st)?;
             let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
             unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
@@ -1572,7 +1602,7 @@ impl Backend for Vk {
             unsafe { self.0.dev.cmd_copy_buffer(cb, b, st.staging.0, &[r]) };
             self.0.barrier(cb, true);
             self.0.flush(&mut st)?;
-            unsafe { std::ptr::copy_nonoverlapping(st.map as *const u8, c.as_mut_ptr(), c.len()) };
+            unsafe { r13_host_copy(st.map as *const u8, c.as_mut_ptr(), c.len(), "staging_read") };
         }
         Ok(())
     }
