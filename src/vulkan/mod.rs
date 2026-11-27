@@ -1239,6 +1239,12 @@ impl Vk {
         })
     }
 
+    fn gemm_q8_supported(&self, ty: GgmlType, cols: usize) -> bool {
+        // LLAMA_Q8 reduces over all 16 lanes of a 256-element block. A trailing
+        // half block would shuffle from inactive invocations in quant_q8.comp.
+        crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(if self.0.llama != 0 { 256 } else { 128 })
+    }
+
     fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
         let need = n_x.saturating_mul(cols.saturating_add(cols / 8).saturating_add(cols / 4));
         if n_x <= crate::cpu_worker::TMAX && need <= (1 << 20) { &self.4 } else { &self.3 }
@@ -1247,7 +1253,7 @@ impl Vk {
     /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
     /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
     fn q8_x(&self, q8: &mut (Buf, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
-        if !crate::cuda::Gpu::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        if !self.gemm_q8_supported(ty, cols) { return Ok(None); }
         let need = q8_gemm_bytes(n_x, cols, x_stride)?;
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         if q8.1 == key { return Ok(Some(q8.0.addr())); }
@@ -1267,6 +1273,8 @@ impl Vk {
             "{} matrix {rows}x{cols}: GEMM needs nonempty complete blocks and a multiple of 64 columns", ty.name());
         ensure!(n_x > 0 && x_stride >= cols && y_stride >= rows && [rows, cols, n_x, nd, x_stride, y_stride].iter().all(|&v| u32::try_from(v).is_ok()),
             "GEMM invalid dimensions or strides");
+        let sbb = ty.block_bytes() * 256 / ty.block_elems();
+        ensure!(cols.checked_mul(sbb).is_some_and(|v| v <= u32::MAX as usize), "GEMM rowb intermediate exceeds shader uint range");
         ensure!(rows.checked_mul(ty.row_bytes(cols as u64)).is_some_and(|v| v <= u32::MAX as usize),
             "GEMM weight offsets exceed shader uint range");
         ensure!(n_x.checked_mul(x_stride).is_some_and(|v| v <= u32::MAX as usize), "GEMM input offsets exceed shader uint range");
@@ -1279,7 +1287,7 @@ impl Vk {
         let reuse = same && q8.1 == key;
         // A gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the cached
         // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
-        let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
+        let int8 = self.gemm_q8_supported(ty, cols);
         let f = !int8 || (!reuse && self.0.st().batch);
         static R11_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *R11_PROFILE.get_or_init(|| std::env::var("STRATA_PS5_R11_PROFILE").as_deref() == Ok("1")) {

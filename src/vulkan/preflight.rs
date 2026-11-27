@@ -91,7 +91,7 @@ impl Vk {
             let float = ty.float_x();
             let mut push = |name: &'static str, spec: Vec<u32>| pairs.push((name, spec));
             // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
-            if float || !crate::cuda::Gpu::mmq(ty) {
+            if self.0.ps5 || float || !crate::cuda::Gpu::mmq(ty) {
                 if self.0.coop { push("gemm_f", ws.clone()); push("gemm_fs", ws.clone()); }
                 else { push("gemm_f_dp", ws.clone()); if self.r11_iq32(ty) { push("gemm_f_dp_ps5_iq32", ws.clone()); } }
             }
