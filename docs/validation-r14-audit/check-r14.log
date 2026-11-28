@@ -1,0 +1,41 @@
+test_contract_and_prescribed_tokens (__main__.Gates.test_contract_and_prescribed_tokens) ... ok
+test_eos_only_natural (__main__.Gates.test_eos_only_natural) ... ok
+test_fixed_rejects_invalid (__main__.Gates.test_fixed_rejects_invalid) ... ok
+test_fixed_valid (__main__.Gates.test_fixed_valid) ... ok
+test_greedy_guard_source_order (__main__.Gates.test_greedy_guard_source_order) ... ok
+test_lds_and_cargo_gate (__main__.Gates.test_lds_and_cargo_gate) ... ok
+test_marks (__main__.Gates.test_marks) ... ok
+test_mock_campaign (__main__.Gates.test_mock_campaign) ... R14 marker mutations rejected: 936
+prose-1-tile0-iq64
+prose-2-tile64-iq64
+prose-3-tile64-iq64
+prose-4-tile0-iq64
+holdout-1-tile0-iq64
+holdout-2-tile64-iq64
+holdout-3-tile64-iq64
+holdout-4-tile0-iq64
+prose-1-tile0-iq64
+prose-2-tile64-iq64
+holdout-1-tile0-iq64
+holdout-2-tile64-iq64
+prose-1-tile0-iq64
+prose-2-tile64-iq64
+holdout-1-tile0-iq64
+holdout-2-tile64-iq64
+ok
+test_model_identity_detects_restored_bytes (__main__.Gates.test_model_identity_detects_restored_bytes) ... ok
+test_natural_prompt_identity (__main__.Gates.test_natural_prompt_identity) ... ok
+test_paired_speed_gate (__main__.Gates.test_paired_speed_gate) ... ok
+test_predictions_must_match (__main__.Gates.test_predictions_must_match) ... ok
+test_profile_boundaries (__main__.Gates.test_profile_boundaries) ... ok
+test_raw_gate (__main__.Gates.test_raw_gate) ... ok
+test_raw_rejects_wrong_top5_and_ties (__main__.Gates.test_raw_rejects_wrong_top5_and_ties) ... ok
+test_dense_lanes_and_edges (__main__.Geometry.test_dense_lanes_and_edges) ... ok
+test_shader_reuse_and_contract (__main__.Geometry.test_shader_reuse_and_contract) ... ok
+test_actual_shell_campaign_and_negative_controls (__main__.PhysicalShell.test_actual_shell_campaign_and_negative_controls) ... ok
+
+----------------------------------------------------------------------
+Ran 18 tests in 31.119s
+
+OK
+R14 dense geometry checks: 14648

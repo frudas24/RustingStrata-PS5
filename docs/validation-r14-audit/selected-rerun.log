@@ -1,0 +1,8 @@
+test_contract_and_prescribed_tokens (__main__.Gates.test_contract_and_prescribed_tokens) ... ok
+test_raw_rejects_wrong_top5_and_ties (__main__.Gates.test_raw_rejects_wrong_top5_and_ties) ... ok
+test_natural_prompt_identity (__main__.Gates.test_natural_prompt_identity) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.037s
+
+OK
