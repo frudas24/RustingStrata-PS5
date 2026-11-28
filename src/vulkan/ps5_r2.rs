@@ -1,7 +1,8 @@
 //! Immutable per-device selection. Experimental paths are opt-in and only on an AMD wave32 PS5 profile.
 use anyhow::{Context, ensure};
+use crate::quant::GgmlType;
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Kernels { pub(super) wg: usize, pub(super) small: bool, pub(super) dense64: bool }
+pub(super) struct Kernels { pub(super) wg: usize, pub(super) small: bool, pub(super) dense64: bool, r14_tile: usize, r14_types: u8 }
 impl Kernels {
     pub(super) fn read(ps5: bool, wave64: bool, dot_accel: bool) -> anyhow::Result<Self> {
         let wg = std::env::var("STRATA_PS5_GEMV_WG").ok().map(|v| v.parse::<usize>()).transpose()
@@ -18,10 +19,23 @@ impl Kernels {
             // The baseline gemmi_dp already uses shaderIntegerDotProduct. The device init requires
             // that feature; acceleration is not required for this independent research candidate.
         }
-        if wg == 256 && !small { return Ok(Self { wg, small, dense64 }); }
+        let r14_tile = match std::env::var("STRATA_PS5_R14_DENSE_TILE").as_deref().unwrap_or("0") {
+            "0" => 0, "32" => 32, "64" => 64,
+            v => anyhow::bail!("STRATA_PS5_R14_DENSE_TILE must be 0, 32 or 64; got {v}"),
+        };
+        let r14_types = match std::env::var("STRATA_PS5_R14_DENSE_TYPE").as_deref().unwrap_or("both") {
+            "q5" => 1, "q6" => 2, "both" => 3,
+            v => anyhow::bail!("STRATA_PS5_R14_DENSE_TYPE must be q5, q6 or both; got {v}"),
+        };
+        if r14_tile != 0 {
+            ensure!(cfg!(feature = "ps5-r2") && ps5 && !wave64,
+                "R14 requires AMD PS5 profile, wave32 and built shaders");
+            ensure!(!small && !dense64, "R14 cannot be combined with legacy R2/R7 dense tile switches");
+        }
+        if wg == 256 && !small { return Ok(Self { wg, small, dense64, r14_tile, r14_types }); }
         ensure!(cfg!(feature = "ps5-r2"), "PS5 R2 shaders not built: use --features ps5-r2");
         ensure!(ps5 && !wave64 && dot_accel, "PS5 R2 requires AMD PS5 profile, wave32 and accelerated signed packed INT8 dot products");
-        Ok(Self { wg, small, dense64 })
+        Ok(Self { wg, small, dense64, r14_tile, r14_types })
     }
     pub(super) fn gemv(self, nt: usize, moe: bool) -> (&'static str, usize) {
         // No change to high-NT register-heavy or multi-token MoE deduplication paths.
@@ -33,6 +47,13 @@ impl Kernels {
         };
         (name, wg / 32)
     }
+    /// R14: dense Q5_K/Q6_K only; the existing R2/R7 shaders use z=1,
+    /// preserve K reduction order and never require accelerated packed dot.
+    pub(super) fn dense_r14(self, ty: GgmlType, coop_i8: u32, tiles: u64, nd: usize) -> usize {
+        if coop_i8 != 0 || tiles != 0 || nd == 0 { return 0; }
+        let bit = match ty { GgmlType::Q5K => 1, GgmlType::Q6K => 2, _ => 0 };
+        if self.r14_types & bit != 0 { self.r14_tile } else { 0 }
+    }
     pub(super) fn tiled64(self, coop_i8: u32, tiles: u64, nd: usize) -> bool {
         self.dense64 && coop_i8 == 0 && tiles == 0 && nd > 64
     }
@@ -43,9 +64,22 @@ impl Kernels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn r14_dispatch_contract() {
+        for tile in [0, 32, 64] { for types in [1, 2, 3] {
+            let k = Kernels { wg: 256, small: false, dense64: false, r14_tile: tile, r14_types: types };
+            for n in [1, 32, 33, 64, 65, 128, 129, 512] {
+                for (ty, bit) in [(GgmlType::Q5K, 1), (GgmlType::Q6K, 2), (GgmlType::IQ3XXS, 0), (GgmlType::Q8_0, 0)] {
+                    assert_eq!(k.dense_r14(ty, 0, 0, n), if types & bit != 0 { tile } else { 0 });
+                    assert_eq!(k.dense_r14(ty, 32, 0, n), 0);
+                    assert_eq!(k.dense_r14(ty, 0, 1, n), 0);
+                    assert_eq!(k.dense_r14(ty, 0, 0, 0), 0);
+                }
+            }
+        }}
+    }
     #[test] fn dispatch_contract() {
         for wg in [64, 128, 256] {
-            let k = Kernels { wg, small: true, dense64: true };
+            let k = Kernels { wg, small: true, dense64: true, r14_tile: 0, r14_types: 3 };
             for nt in 1..=17 {
                 assert_eq!(k.gemv(nt, false).1, if nt <= 4 { wg/32 } else {8});
                 assert_eq!(k.gemv(nt, true).1, if nt == 1 { wg/32 } else {8});

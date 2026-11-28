@@ -1192,6 +1192,13 @@ impl Vk {
                 ("gemv_q", Some(8)) => "gemv_q:Q8_0",
                 ("gemv_q", Some(18)) => "gemv_q:IQ3_XXS",
                 ("gemm_f_dp", Some(17)) => "gemm_f_dp:IQ2_XS",
+                ("gemmi_dp", Some(13)) => "gemmi_dp:Q5_K",
+                ("gemmi_dp", Some(14)) => "gemmi_dp:Q6_K",
+                ("gemmi_dp", Some(8)) => "gemmi_dp:Q8_0",
+                ("gemmi_dp_ps5_32", Some(13)) => "gemmi_dp_ps5_32:Q5_K",
+                ("gemmi_dp_ps5_32", Some(14)) => "gemmi_dp_ps5_32:Q6_K",
+                ("gemmi_dp_ps5_64", Some(13)) => "gemmi_dp_ps5_64:Q5_K",
+                ("gemmi_dp_ps5_64", Some(14)) => "gemmi_dp_ps5_64:Q6_K",
                 ("gemmi_dp", Some(18)) => "gemmi_dp:IQ3_XXS",
                 ("gemmi_dp", Some(23)) => "gemmi_dp:IQ4_XS",
                 ("moe_gemv_q", Some(17)) => "moe_gemv_q:IQ2_XS",
@@ -1492,6 +1499,19 @@ impl Vk {
             let kernel = self.r13_gemm_kernel(ty, "gemmi_dp");
             self.run(kernel, &spec, grid, &args)?;
             self.mark_routed_iq(ty, kernel);
+            return Ok(());
+        }
+        let r14_tile = self.0.r2.dense_r14(ty, self.0.coop_i8, tiles, nd);
+        if r14_tile != 0 {
+            let kernel = if r14_tile == 32 { "gemmi_dp_ps5_32" } else { "gemmi_dp_ps5_64" };
+            self.run(kernel, &spec, [grid[0], nd.div_ceil(r14_tile), 1], &args)?;
+            // The two remaining R6 bits identify both target types, independently
+            // of the legacy dense shader marker. Emit only after recording succeeds.
+            match ty {
+                GgmlType::Q5K => self.0.r6_mark(1u32 << 30, "r14_dense_q5"),
+                GgmlType::Q6K => self.0.r6_mark(1u32 << 31, "r14_dense_q6"),
+                _ => unreachable!("R14 dense type gate"),
+            }
             return Ok(());
         }
         if self.0.r2.tiled64(self.0.coop_i8, tiles, nd) {
