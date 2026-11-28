@@ -1408,29 +1408,47 @@ impl<'a> GpuModel<'a> {
     /// of them change or, out of VRAM, none. The recorded graphs, which hold the old caches' addresses, go.
     fn kv_resize(&mut self, s: usize, new: usize, keep: bool) -> anyhow::Result<()> {
         let (g, cap) = (&*self.gpu, self.kv_cap[s]);
+        anyhow::ensure!(cap > 0 && (1..=self.ctx).contains(&new), "invalid KV resize {cap} -> {new}");
         let mut fresh = vec![];
         for l in &self.layers {
             if let Mixer::Attn { kc, vc, .. } = &l.mixer {
                 for b in [&kc[s], &vc[s]] {
-                    fresh.push(g.alloc(b.len() / cap * new).map_err(|e| anyhow::anyhow!(
+                    anyhow::ensure!(b.len().is_multiple_of(cap), "invalid KV row size");
+                    let bytes = (b.len() / cap).checked_mul(new).context("KV resize size overflow")?;
+                    fresh.push(g.alloc(bytes).map_err(|e| anyhow::anyhow!(
                         "no VRAM to grow a slot's KV cache to {new} positions (lower --parallel or --ctx): {e:#}"))?);
                 }
             }
         }
+        // Retire graphs while their old device addresses are still alive. Prepare
+        // every copy without publishing any replacement; a failed allocation,
+        // copy or wait must not leave half the layers with a different capacity.
         g.sync()?;
+        g.graph_clear()?;
+        if keep {
+            let mut dest = fresh.iter();
+            for l in &self.layers {
+                if let Mixer::Attn { kc, vc, .. } = &l.mixer {
+                    for b in [&kc[s], &vc[s]] {
+                        let nb = dest.next().unwrap();
+                        g.dtod(b, 0, nb, 0, b.len().min(nb.len()))?;
+                    }
+                }
+            }
+            g.sync()?;
+        }
+        // No fallible GPU operation remains between publication of the buffers
+        // and the new capacity. Device-loss recovery is not promised.
         let mut fresh = fresh.into_iter();
         for l in &mut self.layers {
             if let Mixer::Attn { kc, vc, .. } = &mut l.mixer {
                 for b in [&mut kc[s], &mut vc[s]] {
-                    let nb = fresh.next().unwrap();
-                    if keep { g.dtod(b, 0, &nb, 0, b.len().min(nb.len()))?; }
-                    *b = nb;
+                    *b = fresh.next().unwrap();
                 }
             }
         }
         self.kv_cap[s] = new;
-        g.sync()?;
-        g.graph_clear()
+        Ok(())
     }
 
     /// Positions the current slot's attention KV holds.
@@ -3800,6 +3818,73 @@ mod tests {
     fn routing_tally_of_a_resident_layer_has_no_miss() {
         let r: Vec<(i32, f32, i32)> = (0..8).map(|e| (e, 0.125, e)).collect();
         assert_eq!(tally(&r), (8, 0));
+    }
+
+    /// Requires a small dense attention GGUF and a real Vulkan device. Test the
+    /// old KV bytes and the other slot, not just a matching greedy prediction.
+    #[cfg(feature = "ps5-r2")]
+    #[test]
+    #[ignore = "physical Vulkan and dense GGUF required"]
+    fn r14_kv_growth_preserves_slots() {
+        use crate::{gguf::Gguf, model::Model, tokenizer::Tokenizer, vulkan::Vk};
+        fn snapshot(g: &GpuModel<'_>, slot: usize) -> Vec<Vec<u8>> {
+            let mut out = vec![];
+            for l in &g.layers {
+                if let super::Mixer::Attn { kc, vc, .. } = &l.mixer {
+                    for b in [&kc[slot], &vc[slot]] {
+                        out.push(g.gpu.get::<u8>(b, 0, b.len()).unwrap());
+                    }
+                }
+            }
+            out
+        }
+        let path = std::env::var("PS5_R14_DENSE_MODEL").expect("explicit dense GGUF required");
+        let gg = Gguf::open(std::path::Path::new(&path)).unwrap();
+        let m = Model::load(&gg).unwrap();
+        assert!(!m.cfg.is_moe(), "dense attention model required");
+        let t = Tokenizer::from_gguf(&gg).unwrap();
+        let ids = t.encode("The river town woke before dawn.").unwrap();
+        assert!(!ids.is_empty());
+        let mut g = GpuModel::load_slots(&m, Box::new(Vk::new(0).unwrap()), 1024, 128, 768 << 20, 2).unwrap();
+        assert_eq!(g.slots(), 2, "both slots must fit");
+        assert_eq!(g.kv_cap.len(), 2, "dynamic KV must be active");
+        let cap = g.kv_cap[0];
+        assert!(cap >= 3 && cap < g.ctx());
+        g.use_slot(1);
+        g.prefill(&[ids[0], ids[0], ids[0]]).unwrap();
+        g.step_greedy(ids[0]).unwrap();
+        let other_pos = g.pos;
+        let other = snapshot(&g, 1);
+        assert!(!other.is_empty(), "attention KV required");
+        g.use_slot(0);
+        let prompt: Vec<u32> = ids.iter().copied().cycle().take(cap-2).collect();
+        g.prefill(&prompt).unwrap();
+        g.step_greedy(ids[0]).unwrap();
+        g.step_greedy(ids[0]).unwrap();
+        assert_eq!(g.pos, cap);
+        let old = snapshot(&g, 0);
+        assert!(old.iter().any(|b| b.iter().any(|&x| x != 0)), "nontrivial KV required");
+        let invalid = g.ctx()+1;
+        assert!(g.kv_resize(0, invalid, true).is_err());
+        assert_eq!(g.kv_cap[0], cap);
+        assert_eq!(snapshot(&g, 0), old);
+        let pred = g.step_greedy(ids[0]).unwrap();
+        assert!((pred as usize) < m.cfg.n_vocab);
+        assert_eq!(g.pos, cap+1);
+        assert!(g.kv_cap[0] > cap);
+        let grown = snapshot(&g, 0);
+        assert_eq!(old.len(), grown.len());
+        for (a,b) in old.iter().zip(&grown) { assert_eq!(a.as_slice(), &b[..a.len()]); }
+        assert_eq!(snapshot(&g, 1), other);
+        g.reset().unwrap();
+        assert_eq!(g.kv_cap[0], cap);
+        assert_eq!(g.pos, 0);
+        assert!(snapshot(&g, 0).iter().all(|b| b.iter().all(|&x| x==0)));
+        g.use_slot(1);
+        assert_eq!(g.pos, other_pos);
+        assert_eq!(snapshot(&g, 1), other);
+        g.step_greedy(ids[0]).unwrap();
+        eprintln!("R14 KV GROWTH PASS: old bytes, other slot, shrink and reuse");
     }
 
     /// The fast-path method is off without a cache (CPU experts or a dense model): the compile-time check that the

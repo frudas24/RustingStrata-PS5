@@ -190,6 +190,39 @@ def compare(runs):
                 accepted=score>=1.03 and min(p[0] for p in pairs)>=1.03 and worst>=.95)
 
 
+def load_bench_reference(root, ident, holdout, corpus):
+    summary = json.loads((root/'summary.json').read_text())
+    r6.require(summary.get('mode')=='bench' and summary.get('validated') is True,
+               'cross-mode reference must be a validated benchmark (ROI rejection is allowed)')
+    identity = json.loads((root/'identity.json').read_text())
+    # Each campaign creates its own copy of the same holdout, so its path differs.
+    content = lambda f: (f['size'], f['sha256'])
+    r6.require(identity['environment']==ident and content(identity['holdout'])==content(holdout)
+               and identity['corpus']==corpus, 'cross-mode reference identity differs')
+    tasks = {'prose','holdout'} | ({'corpus'} if corpus is not None else set())
+    r6.require(set(summary['reports'])==tasks, 'cross-mode reference workloads differ')
+
+
+def cross_check_greedy(root, task, enabled, tile, iq, types, k, s, model, flags, sig, nv):
+    # Validate the original scored-arm records, not only the generated summary.
+    # A/B/B/A means quality's control is matched with 1 and 4, candidate with 2 and 3.
+    hashes={}
+    for arm in ((2,3) if enabled else (1,4)):
+        stem=f'{task}-{arm}-tile{tile}-iq{iq}'
+        request_path=root/(stem+'-request.json'); log=root/(stem+'.log'); record=root/(stem+'.json')
+        stamp=stat_identity([request_path,log,record])
+        request=json.loads(request_path.read_text())
+        r6.require(request.get('mode')=='bench' and request.get('flags')==flags and request.get('knobs')==k,
+                   'cross-mode reference dispatch/settings differ')
+        text=log.read_text(errors='replace');r6.evidence(text,k);check_marks(text,tile,types,iq)
+        _,greedy,vocab,_=fixed_record(json.loads(record.read_text()),k,s,model,'fixed')
+        r6.require(vocab==nv, 'cross-mode vocabulary differs')
+        match(greedy,sig,True)
+        hashes[stem]=dict(json=r6.digest(record),log=r6.digest(log),request=r6.digest(request_path))
+        r6.require(stat_identity([request_path,log,record])==stamp,'cross-mode reference changed during verification')
+    return hashes
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',type=Path,required=True);p.add_argument('--bin',type=Path,default=r6.DEFAULT_BIN);p.add_argument('--out',type=Path,required=True)
@@ -199,11 +232,13 @@ def main():
     p.add_argument('--ctx',type=int,default=8192);p.add_argument('--pp',default='128,512,2048,4096');p.add_argument('--tg',type=int,default=32);p.add_argument('--reps',type=int,default=3)
     p.add_argument('--threads',type=int,choices=(4,6,8,16),default=6);p.add_argument('--chunk',type=int,choices=(128,256,512,1024),default=512)
     p.add_argument('--timeout',type=int,default=7200);p.add_argument('--min-ram-mb',type=int,default=1024)
+    p.add_argument('--bench-reference',type=Path,help='cross-check quality against matching validated fixed-decode A/B/B/A evidence')
     p.add_argument('--corpus',type=Path);p.add_argument('--ctx-len',type=int,default=512);p.add_argument('--chunks',type=int,default=8)
     a=p.parse_args()
     s=r6.settings_ok(dict(ctx=a.ctx,pp=list(map(int,a.pp.split(','))),tg=a.tg,reps=a.reps,timeout=a.timeout,min_ram_mb=a.min_ram_mb,kv='q8'))
     k=r6.knobs_ok({**r6.BASE,'threads':a.threads,'chunk':a.chunk})
     r6.require(a.tile or a.base_iq_tile!=a.iq_tile,'identical control/candidate')
+    r6.require(a.bench_reference is None or a.mode=='quality','--bench-reference is only valid in quality mode')
     r6.require(a.mode!='kld' or (a.corpus is not None and 128<=a.ctx_len<=a.ctx and a.chunks>0),'KLD requires valid corpus/coverage')
     session=r6.Session(a.model,a.bin,s,a.out); reports={}
     try:
@@ -211,6 +246,7 @@ def main():
         stamp=stat_identity(paths)
         ident=r6.identity(a.model,a.bin); r6.require(stat_identity(paths)==stamp,'model/binary changed during initial identity'); holdout=r6.file_id(session.holdout); corpus=r6.file_id(a.corpus) if a.corpus else None
         r6.atomic_json(session.out/'identity.json',dict(environment=ident,holdout=holdout,corpus=corpus))
+        if a.bench_reference is not None:load_bench_reference(a.bench_reference,ident,holdout,corpus)
         for task in (('corpus',) if a.mode=='kld' else ('prose','holdout')+ (('corpus',) if a.corpus else ())):
             runs=[]
             for i,enabled in enumerate((0,1,1,0) if a.mode=='bench' else (0,1),1):
@@ -241,7 +277,10 @@ def main():
                     rec=json.loads(result.read_text())
                     rates,sig,nv,rows=fixed_record(rec,k,s,a.model,{'natural':'natural','quality':'fixed_logits'}.get(a.mode,'fixed'))
                     run.update(rates=rates,signatures=sig,vocab=nv)
-                    if a.mode=='quality':run['sha256']=check_raw(dump,sig,nv,rows)
+                    if a.mode=='quality':
+                        run['sha256']=check_raw(dump,sig,nv,rows)
+                        if a.bench_reference is not None:
+                            run['greedy_reference']=cross_check_greedy(a.bench_reference,task,enabled,tile,iq,a.types,k,s,a.model,flags,sig,nv)
                     match(sig,sig,a.mode!='natural')
                     if a.mode=='profile':run['diagnostics']=profile_report(text)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run);runs.append(run)
@@ -254,7 +293,7 @@ def main():
                 reports[task]=dict(accepted=False,validated=True,mode=a.mode,runs=runs)
         r6.require(r6.identity(a.model,a.bin)==ident and stat_identity(paths)==stamp,'model, binary or hardware identity changed')
         accepted=a.mode=='bench' and all(x['accepted'] for x in reports.values())
-        r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=accepted,validated=True,reports=reports,production_promotion=False))
+        r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=accepted,validated=True,reports=reports,production_promotion=False,greedy_cross_validated=a.mode=='quality' and a.bench_reference is not None))
         return 0 if accepted or a.mode!='bench' else 1
     except (r6.Reject,ValueError,KeyError,TypeError,OSError,IndexError,OverflowError,subprocess.SubprocessError) as exc:
         r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=False,validated=False,error=str(exc),reports=reports));print(f'REJECT: {exc}',file=sys.stderr);return 1

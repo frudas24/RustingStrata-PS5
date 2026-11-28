@@ -201,9 +201,48 @@ class Gates(unittest.TestCase):
             with patch.object(r6,'identity',return_value={'mock':True}),patch.object(r6,'run_child',side_effect=child):
                 for mode in ('bench','natural','quality'):
                     calls.clear();out=root/mode
-                    with patch.object(sys,'argv',['r14','--model',str(root/'model'),'--bin',str(root/'engine'),'--out',str(out),'--tile','64','--ctx','65536','--pp','65024','--tg','2','--reps','2','--mode',mode]):self.assertEqual(c.main(),0)
+                    argv=['r14','--model',str(root/'model'),'--bin',str(root/'engine'),'--out',str(out),'--tile','64','--ctx','65536','--pp','65024','--tg','2','--reps','2','--mode',mode]
+                    if mode=='quality':argv+=['--bench-reference',str(root/'bench')]
+                    with patch.object(sys,'argv',argv):self.assertEqual(c.main(),0)
                     summary=json.loads((out/'summary.json').read_text());self.assertTrue(summary['validated']);self.assertEqual(summary['accepted'],mode=='bench')
                     self.assertEqual(calls,([(0,64),(64,64),(64,64),(0,64)] if mode=='bench' else [(0,64),(64,64)])*2)
+                    self.assertEqual(summary['greedy_cross_validated'],mode=='quality')
+                # Make both scored arms internally consistent but different from
+                # FP32 predictions: the cross-mode gate must reject the evidence.
+                for arm in (1,2,3,4):
+                    tile=0 if arm in (1,4) else 64
+                    p=root/'bench'/f'prose-{arm}-tile{tile}-iq64.json'
+                    r=json.loads(p.read_text())
+                    for sample in r['r6']['rows'][0]['samples']:sample['predictions']=[1,1]
+                    p.write_text(json.dumps(r))
+                with patch.object(sys,'argv',[*argv[:argv.index('--out')+1],str(root/'bad-quality'),*argv[argv.index('--out')+2:]]):self.assertEqual(c.main(),1)
+                self.assertIn('argmax divergence',json.loads((root/'bad-quality'/'summary.json').read_text())['error'])
+
+    def test_cross_reference_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); ident={'driver':'test'}; holdout=dict(path='/quality/holdout',size=5,sha256='same')
+            identity=dict(environment=ident,holdout={**holdout,'path':'/bench/holdout'},corpus=None)
+            summary=dict(mode='bench',validated=True,accepted=False,reports={'prose':{},'holdout':{}})
+            def write(i,s):
+                (root/'identity.json').write_text(json.dumps(i));(root/'summary.json').write_text(json.dumps(s))
+            write(identity,summary);c.load_bench_reference(root,ident,holdout,None)
+            for i,s in [({**identity,'environment':{'driver':'wrong'}},summary),
+                        ({**identity,'holdout':{**holdout,'sha256':'wrong'}},summary),
+                        ({**identity,'corpus':{'sha256':'wrong'}},summary),
+                        (identity,{**summary,'validated':False}),
+                        (identity,{**summary,'mode':'profile'}),
+                        (identity,{**summary,'reports':{'prose':{}}})]:
+                write(i,s)
+                with self.assertRaises(r6.Reject):c.load_bench_reference(root,ident,holdout,None)
+
+    def test_kv_resize_publication_order(self):
+        source=(HERE.parents[1]/'src/gpu_model.rs').read_text()
+        body=source.split('fn kv_resize(',1)[1].split('fn kv_rows(',1)[0]
+        graph=body.index('g.graph_clear()?');copy=body.index('g.dtod(');sync=body.index('g.sync()?',copy)
+        publish=body.index('*b = fresh.next()');cap=body.index('self.kv_cap[s] = new')
+        self.assertLess(graph,copy);self.assertLess(copy,sync);self.assertLess(sync,publish);self.assertLess(publish,cap)
+        self.assertNotIn('?',body[publish:])
+
 
 
 # Exercise the actual Bash entry point, not a reimplementation of its logic.
