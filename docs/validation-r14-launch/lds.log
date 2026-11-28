@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running tests/r14_dense.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/a59cd7aa17f5194b/out/r14_dense-a59cd7aa17f5194b)
+
+running 1 test
+R14 LDS type=13 base=40960 tile32=20992 tile64=27648
+R14 LDS type=14 base=49152 tile32=29184 tile64=35840
+test shared_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

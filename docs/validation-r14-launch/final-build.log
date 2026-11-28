@@ -1,0 +1,6 @@
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+target_feature="avx2"
+target_feature="f16c"
+target_feature="fma"
+    Finished `release` profile [optimized] target(s) in 0.05s
+PS5 binary: /tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/rustingstrata

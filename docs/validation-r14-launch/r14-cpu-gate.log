@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running unittests src/lib.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/e577f374d86915e2/out/rusting_strata-e577f374d86915e2)
+
+running 1 test
+test vulkan::ps5_r2::tests::r14_dispatch_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 194 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running unittests src/main.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/180f3d8dbe9e0981/out/rustingstrata-180f3d8dbe9e0981)
+
+running 1 test
+test r14_fixed_logit_writer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.00s

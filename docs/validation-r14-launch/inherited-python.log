@@ -1,0 +1,183 @@
+test_reject_invalid (__main__.PhysicalGate.test_reject_invalid) ... ok
+test_valid (__main__.PhysicalGate.test_valid) ... ok
+test_copy_overlap_guard_before_recording (__main__.SourceOrder.test_copy_overlap_guard_before_recording) ... ok
+test_drop_commit_after_wait (__main__.SourceOrder.test_drop_commit_after_wait) ... ok
+test_readback_guard_before_recording (__main__.SourceOrder.test_readback_guard_before_recording) ... ok
+test_rejected_nesting_before_mutation (__main__.SourceOrder.test_rejected_nesting_before_mutation) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 10.127s
+
+OK
+test_batch_gate_rejects_invalid_bytes_even_with_python_optimized (__main__.Launch.test_batch_gate_rejects_invalid_bytes_even_with_python_optimized) ... ok
+test_changed_corpus_rejected (__main__.Launch.test_changed_corpus_rejected) ... REJECT: corpus changed during quality arm
+ok
+test_changed_holdout_rejected (__main__.Launch.test_changed_holdout_rejected) ... prose-1-off
+REJECT: holdout changed during measurement
+ok
+test_child_cannot_finish_after_deadline (__main__.Launch.test_child_cannot_finish_after_deadline) ... ok
+test_mark_parser_rejects_malformed_extra_records (__main__.Launch.test_mark_parser_rejects_malformed_extra_records) ... ok
+test_noop_rejected (__main__.Launch.test_noop_rejected) ... REJECT: no experimental change: use a different --base-tile with --lut off
+ok
+test_tile_only_benchmark (__main__.Launch.test_tile_only_benchmark) ... prose-1-off
+prose-2-candidate-off
+prose-3-candidate-off
+prose-4-off
+holdout-1-off
+holdout-2-candidate-off
+holdout-3-candidate-off
+holdout-4-off
+ok
+test_tile_only_quality (__main__.Launch.test_tile_only_quality) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.103s
+
+OK
+test_alignment_counterexample (__main__.Gates.test_alignment_counterexample) ... ok
+test_each_format_and_fallback (__main__.Gates.test_each_format_and_fallback) ... ok
+test_lds_records (__main__.Gates.test_lds_records) ... ok
+test_pairwise_return_gate (__main__.Gates.test_pairwise_return_gate) ... ok
+test_r12_exact_route_markers (__main__.Gates.test_r12_exact_route_markers) ... ok
+test_swap_telemetry (__main__.Gates.test_swap_telemetry) ... ok
+test_zero_write_poison_wiring (__main__.Gates.test_zero_write_poison_wiring) ... ok
+test_bad_size (__main__.MockCampaign.test_bad_size) ... ok
+test_duplicate_lds (__main__.MockCampaign.test_duplicate_lds) ... ok
+test_missing_format (__main__.MockCampaign.test_missing_format) ... ok
+test_mixed_fallback (__main__.MockCampaign.test_mixed_fallback) ... ok
+test_valid_mock (__main__.MockCampaign.test_valid_mock) ... ok
+test_wrong_arm (__main__.MockCampaign.test_wrong_arm) ... ok
+test_zero_tests (__main__.MockCampaign.test_zero_tests) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 41.346s
+
+OK
+R13 adversarial dispatch mutations rejected: 756
+test_all_legal_dispatch_sets (__main__.Gates.test_all_legal_dispatch_sets) ... ok
+test_distinct_marker_arms (__main__.Gates.test_distinct_marker_arms) ... ok
+test_profile_flags_do_not_leak (__main__.Gates.test_profile_flags_do_not_leak) ... ok
+test_profile_summary (__main__.Gates.test_profile_summary) ... ok
+test_cooperative_initialization (__main__.Lookup.test_cooperative_initialization) ... ok
+test_grid_data_and_indices (__main__.Lookup.test_grid_data_and_indices) ... ok
+test_iq4_packed_bytes (__main__.Lookup.test_iq4_packed_bytes) ... ok
+test_shader_wiring (__main__.Lookup.test_shader_wiring) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.130s
+
+OK
+R13 model arm combinations: 12 single-marker corruptions: 204
+R13 independent IQ grid index cases: 65792
+R13 independent IQ4 packed cases: 65536
+test_empty_proc_fields (__main__.Guard.test_empty_proc_fields) ... ok
+test_missing_memory_fails_closed (__main__.Guard.test_missing_memory_fails_closed) ... ok
+test_leaked_candidate (__main__.ParityScript.test_leaked_candidate) ... ok
+test_truncated_fingerprint (__main__.ParityScript.test_truncated_fingerprint) ... ok
+test_valid_mock (__main__.ParityScript.test_valid_mock) ... ok
+test_wrong_tile (__main__.ParityScript.test_wrong_tile) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 4.741s
+
+OK
+test_changed_target_combine (__main__.Boundaries.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Boundaries.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Boundaries.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Boundaries.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Boundaries.test_missing_layer) ... ok
+test_no_write (__main__.Boundaries.test_no_write) ... ok
+test_r12_all_controls_same_but_wrong_stage (__main__.Boundaries.test_r12_all_controls_same_but_wrong_stage) ... ok
+test_r12_changed_replay (__main__.Boundaries.test_r12_changed_replay) ... ok
+test_r12_missing_stage (__main__.Boundaries.test_r12_missing_stage) ... ok
+test_r12_nonfinite (__main__.Boundaries.test_r12_nonfinite) ... ok
+test_r12_sham_changed (__main__.Boundaries.test_r12_sham_changed) ... ok
+test_r12_signed_zero_change (__main__.Boundaries.test_r12_signed_zero_change) ... ok
+test_r12_valid (__main__.Boundaries.test_r12_valid) ... ok
+test_replay_wrong_route (__main__.Boundaries.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Boundaries.test_replay_wrong_weight) ... ok
+test_sham (__main__.Boundaries.test_sham) ... ok
+test_valid (__main__.Boundaries.test_valid) ... ok
+test_lds (__main__.Geometry.test_lds) ... ok
+test_routed_subtile_coverage (__main__.Geometry.test_routed_subtile_coverage) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 2.083s
+
+OK
+R12 routed integer geometries: 2322
+test_dedup_coverage (__main__.Audit.test_dedup_coverage) ... ok
+test_old_overflow_counterexample (__main__.Audit.test_old_overflow_counterexample) ... ok
+test_quality_dump (__main__.Audit.test_quality_dump) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 6.968s
+
+OK
+20000 dedup coverage scenarios PASS (independent model)
+16 invalid quality evidence fixtures rejected
+test_good (__main__.Gates.test_good) ... ok
+test_input_change (__main__.Gates.test_input_change) ... ok
+test_missing_stage (__main__.Gates.test_missing_stage) ... ok
+test_missing_write (__main__.Gates.test_missing_write) ... ok
+test_nonfinite (__main__.Gates.test_nonfinite) ... ok
+test_route_change (__main__.Gates.test_route_change) ... ok
+test_shadow_changed (__main__.Gates.test_shadow_changed) ... ok
+test_wrong_slot (__main__.Gates.test_wrong_slot) ... ok
+test_wrong_stage_identity (__main__.Gates.test_wrong_stage_identity) ... ok
+test_wrong_stage_width (__main__.Gates.test_wrong_stage_width) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.013s
+
+OK
+test_changed_target_combine (__main__.Gates.test_changed_target_combine) ... ok
+test_changed_target_hidden (__main__.Gates.test_changed_target_hidden) ... ok
+test_corrupt_tape (__main__.Gates.test_corrupt_tape) ... ok
+test_fixed_route_not_tape (__main__.Gates.test_fixed_route_not_tape) ... ok
+test_missing_layer (__main__.Gates.test_missing_layer) ... ok
+test_no_write (__main__.Gates.test_no_write) ... ok
+test_replay_wrong_route (__main__.Gates.test_replay_wrong_route) ... ok
+test_replay_wrong_weight (__main__.Gates.test_replay_wrong_weight) ... ok
+test_sham (__main__.Gates.test_sham) ... ok
+test_valid (__main__.Gates.test_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.023s
+
+OK
+test_benchmark_gate (__main__.Test.test_benchmark_gate) ... ok
+test_decode_geometry (__main__.Test.test_decode_geometry) ... ok
+test_fp16_fixture_fma (__main__.Test.test_fp16_fixture_fma) ... 8000 IQ2 fixture FP16 row FMA results PASS\nok
+test_iq_codes (__main__.Test.test_iq_codes) ... ok
+test_signed_dot (__main__.Test.test_signed_dot) ... 100036 signed dot cases PASS
+ok
+test_tile_geometry (__main__.Test.test_tile_geometry) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 1.618s
+
+OK
+R11 IQ fixture values: 1024
+R11 tile coverage: 1152
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.015s
+
+OK
+test_cli_mock_end_to_end (__main__.Tests.test_cli_mock_end_to_end) ... ok
+test_dispatch_noop (__main__.Tests.test_dispatch_noop) ... ok
+test_metadata_and_fingerprint_rejections (__main__.Tests.test_metadata_and_fingerprint_rejections) ... ok
+test_metrics_guard (__main__.Tests.test_metrics_guard) ... ok
+test_numerics (__main__.Tests.test_numerics) ... ok
+test_r7_quarantine (__main__.Tests.test_r7_quarantine) ... ok
+test_random_metrics (__main__.Tests.test_random_metrics) ... ok
+test_record (__main__.Tests.test_record) ... ok
+test_settings_and_env (__main__.Tests.test_settings_and_env) ... ok
+test_shards_and_atomic (__main__.Tests.test_shards_and_atomic) ... ok
+test_timeout_and_child_failure (__main__.Tests.test_timeout_and_child_failure) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 41.141s
+
+OK

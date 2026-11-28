@@ -1,0 +1,287 @@
+   Compiling rusting_strata v1.4.1 (/tmp/r14-launch)
+    Finished `release` profile [optimized] target(s) in 2m 57s
+     Running unittests src/lib.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/e577f374d86915e2/out/rusting_strata-e577f374d86915e2)
+
+running 195 tests
+test backend::tests::a_gpu_index_is_the_same_card_on_cuda_and_vulkan ... ok
+test backend::r12_audit_typed_ranges ... ok
+test backend::tests::hip_refuses_a_device_split_and_nothing_else ... ok
+test calibrate::tests::aggregate_score_ignores_invalid_workloads ... ok
+test calibrate::tests::an_empty_baseline_still_allows_the_search_to_run ... ok
+test calibrate::tests::a_slower_candidate_can_never_beat_the_baseline ... ok
+test calibrate::tests::deadline_stops_the_search ... ok
+test calibrate::tests::every_start_converging_is_recorded_as_converged ... ok
+test calibrate::tests::failed_measurements_are_recorded_and_never_win ... ok
+test calibrate::tests::every_start_gets_a_full_descent_not_one_round ... ok
+test calibrate::tests::low_discrepancy_is_deterministic_and_spread ... ok
+test calibrate::tests::objective_is_a_geometric_mean_of_two_signals ... ok
+test calibrate::tests::search_respects_the_sample_budget_and_finds_the_best_region ... ok
+test calibrate::tests::short_prompt_only_gains_cannot_win_the_search ... ok
+test chat::ds_tests::deepseek_parses_calls ... ok
+test calibrate::tests::the_same_knob_point_is_never_measured_twice ... ok
+test chat::ds_tests::deepseek_plain_chat ... ok
+test chat::flint_tests::flint_parses_calls ... ok
+test chat::flint_tests::flint_plain_chat ... ok
+test chat::flint_tests::flint_tools ... ok
+test chat::ds_tests::deepseek_tools ... ok
+test chat::think_tests::image_source_must_be_a_url ... ok
+test chat::think_tests::splits_across_tokens ... ok
+test config::hadamard_rotation_is_the_matrix_product ... ok
+test chat::think_tests::partial_calls_are_prefixes ... ok
+test cpu_moe::tests::dot4_matches_four_dots ... ok
+test cpu_moe::tests::f8_e4m3_dot_and_scale_match_dequant ... ok
+test cpu_moe::tests::group_rows_match_single_dots ... ok
+test cpu_moe::tests::int_dots_match_dequant ... ok
+test cpu_moe::tests::q8_group_sums_match_scalar_including_tail_and_zero ... ok
+test cpu_moe::tests::tq_dots_match_dequant ... ok
+test cpu_moe::tests::unique_quantization_is_slice_identity_not_value_or_pointer_alone ... ok
+test cuda::nvrtc::tests::windows_names_cover_cuda12_and_cuda_path ... ok
+test cuda::tests::arch_log_marks_volta ... ok
+test cuda::tests::arch_support_error_allows_cuda12_on_sm70 ... ok
+test cuda::tests::arch_support_error_allows_cuda13_on_turing_and_newer ... ok
+test cuda::tests::arch_support_error_allows_sm80_on_cuda13 ... ok
+test cuda::tests::arch_support_error_rejects_cuda13_on_sm70 ... ok
+test cuda::tests::attn_prefill_smem_matches_launch ... ok
+test cuda::tests::cache_key_depends_on_nvrtc_tag ... ok
+test cuda::tests::carveout_for_modes ... ok
+test cuda::tests::carveout_mode_parsing ... ok
+test cuda::tests::carveout_policy ... ok
+test cuda::tests::device_log_does_not_call_pascal_volta ... ok
+test cuda::tests::device_log_names_turing_not_volta ... ok
+test cuda::tests::dyn_shmem_need_per_family ... ok
+test cuda::tests::dyn_shmem_optin_clamps_to_optin_and_static ... ok
+test cuda::tests::gemv_knobs_fall_back_and_override_per_family ... ok
+test cuda::tests::ink_flags_parse_ctrl_tile ... ok
+test cuda::tests::int8_gemm_arch ... ok
+test cuda::tests::kernel_names ... ok
+test cuda::tests::legacy_symmetric_kv ... ok
+test cuda::tests::min_arch_error_allows_volta_and_newer ... ok
+test cuda::tests::min_arch_error_rejects_pascal_and_older ... ok
+test cpu_moe::tests::batch_rows_match_individual_matvecs ... ok
+test cuda::tests::nvrtc_compiles_full_source_for_sm70 ... ok
+test cuda::tests::nvrtc_compiles_full_source_for_sm75 ... ok
+test cuda::tests::nvrtc_compiles_trivial_kernel_for_sm70 ... ok
+test cuda::tests::nvrtc_version_is_detected ... ok
+test cuda::tests::smem_log_reports_device_numbers ... ok
+test cuda::tests::prune_ptx_drops_only_stale_ptx ... ok
+test cuda::tests::tuned_falls_back_on_invalid_values ... ok
+test deepseek::mat::dev::expert_group_is_consumed_on_a_cache_hit ... ok
+test deepseek::mat::dev::gpu_fraction_takes_one_value_or_a_pair ... ok
+test deepseek::mat::dev::plain_first_env_zero_is_off ... ok
+test deepseek::mat::dev::plain_first_reserves_the_state ... ok
+test deepseek::ops::tests::rope_roundtrip_and_plain ... ok
+test deepseek::ops::tests::route_picks_and_normalises ... ok
+test deepseek::ops::tests::sinkhorn_doubly_stochastic ... ok
+test deepseek::ops::tests::yarn_limits ... ok
+test expert_cache::tests::active_set_is_k_slots_per_layer ... ok
+test expert_cache::tests::full_residency_does_not_clobber_the_saved_profile ... ok
+test expert_cache::tests::fully_resident_only_when_every_expert_is_placed ... ok
+test expert_cache::tests::layer_lookup_outside_partition_is_none ... ok
+test expert_cache::tests::prefill_protect_blends_gently_and_preserves_hot_decode_counts ... ok
+test expert_cache::tests::profile_update_keeps_other_caches_layers ... ok
+test gemma4::chat_tests::prompt_matches_template ... ok
+test gemma4::forward::tests::chunked_prefill_matches_token_by_token ... ok
+test gemma4::forward::tests::rope_pos0_is_identity ... ok
+test gemma4::forward::tests::route_normalises_top_k ... ok
+test glm::chat_tests::parses_calls ... ok
+test glm::chat_tests::template_matches_llama ... ok
+test glm::chat_tests::tools_match_llama ... ok
+test glm::forward::tests::l2_norm_unit_and_floor ... ok
+test glm::forward::tests::router_picks_by_bias_weights_by_prob ... ok
+test cuda::tests::source_injects_tiles ... ok
+test gpu_model::prefill::u1_batch_tests::adaptive_share_keeps_feedback_and_partition ... ok
+test gpu_model::prefill::u1_batch_tests::fixed_share_is_bounded_and_zero_is_exact ... ok
+test gpu_model::prefill::u1_batch_tests::ps5_batch_cannot_bypass_hybrid_quarantine ... ok
+test gpu_model::tests::r14_kv_growth_preserves_slots ... ignored, physical Vulkan and dense GGUF required
+test gpu_model::tests::no_cache_has_no_fast_path_bytes ... ok
+test gpu_model::tests::routing_tally_of_a_partial_cache_counts_every_miss ... ok
+test gpu_model::tests::routing_tally_of_a_resident_layer_has_no_miss ... ok
+test gpu_model::tests::split_ends_keep_layer_counts ... ok
+test gpu_model::tests::split_shares_take_one_positive_number_per_device ... ok
+test grammar::tests::arithmetic_and_list_grammars ... ok
+test grammar::tests::json_grammar ... ok
+test grammar::tests::logit_bias_forms ... ok
+test grammar::tests::grammar_syntax ... ok
+test hip::ffi::tests::find_gfx_reads_only_inside_the_buffer ... ok
+test hip::tests::add_kernel_round_trips ... ok
+test hip::tests::argmax_rows_breaks_ties_at_the_first_index ... ok
+test hip::tests::argmax_rows_takes_64_rows ... ok
+test hip::tests::attn_prefill_matches_cpu ... ok
+test grammar::tests::response_format_schema ... ok
+test hip::tests::gemm_dense_matches_cpu_in_both_tile_regimes ... ok
+test hip::tests::hiprtc_compiles_the_kernels ... ok
+test hip::tests::hiprtc_compiles_the_kernels_for_gfx11 ... ok
+test hip::tests::norm_gate_matches_the_reference ... ok
+test hip::tests::opens_through_backend_open ... ok
+test hy4::chat::template_and_calls ... ok
+test inkling2::chat::template_and_calls ... ok
+test inkling2::forward::tests::clip_caps_the_row_norm ... ok
+test inkling2::forward::tests::convolve_uses_the_last_inputs ... ok
+test inkling2::forward::tests::f16_dot_and_axpy_follow_the_f16_values ... ok
+test inkling2::forward::tests::exp_and_tanh_follow_libm ... ok
+test inkling2::forward::tests::mix_of_equal_scores_is_the_mean_of_the_normed_states ... ok
+test inkling2::forward::tests::rows_in_one_pass_follow_the_row_kernels_and_do_not_depend_on_the_row_count ... ok
+test kolibri::chat::template_and_calls ... ok
+test kolibri::forward::tests::gpu_window_attention_matches_cpu ... ok
+test kolibri::forward::tests::gpu_list_attention_matches_cpu ... ok
+test kolibri::forward::tests::nvfp4_rounding_follows_ggml ... ok
+test kolibri::forward::tests::rope_is_neox ... ok
+test kolibri::forward::tests::routing_adds_the_bias_only_to_pick ... ok
+test kv_turbo::tests::centroids_are_sorted_and_symmetric ... ok
+test kolibri::forward::tests::sparse_selection ... ok
+test kv_turbo::tests::turbo4_encode_decode_random_vectors ... ok
+test kv_turbo::tests::wht_is_orthogonal_and_involutive ... ok
+test memory::tests::explicit_max_ram_wins ... ok
+test memory::tests::margin_is_subtracted ... ok
+test model::tests::cpu_projection_modes ... ok
+test kv_turbo::tests::qjl_estimates_inner_products_unbiasedly ... ok
+test model::tests::dflash_safetensors_auto_converts_and_loads ... ok
+test model::tests::load_eagle3_aux_config ... ok
+test model::tests::eagle3_safetensors_auto_converts_and_loads ... ok
+test model::tests::routed_expert_lora_dimensions_are_checked ... ok
+test model::tests::load_lora_adapter ... ok
+test model::tests::standalone_external_draft_model_spec_step_matches_greedy ... ok
+test ngram::tests::ngram_cache_roundtrip_and_draft ... ok
+test ngram::tests::ngram_map_k_and_k4v_draft_and_adapt_acceptance ... ok
+test ngram::tests::ngram_mod_hashes_and_drafts_long_sequences ... ok
+test ngram::tests::ngram_simple_finds_exact_match_and_respects_draft_max ... ok
+test ngram::tests::test_ngram_cache_draft_short_history ... ok
+test ngram::tests::test_ngram_cache_try_draft_primary_indexes_by_ngram_len ... ok
+test ngram::tests::test_ngram_cache_vocab_filter ... ok
+test ops::tests::min_p_drops_the_unlikely_tokens ... ok
+test ops::tests::mrope_matches_neox_for_text_positions ... ok
+test ps5_r10::tests::route_validation ... ok
+test ps5_r11::tests::captured_iq_bench ... ignored, requires real GGUF and R9/R10 shadow log
+test ps5_r11::tests::fixture_contracts ... ok
+test ps5_r11::tests::integer_extremes ... ok
+test ps5_r11::tests::real_iq_bench ... ignored, requires real Qwen MoE GGUF
+test ps5_r4::tests::learns_and_explores ... ok
+test ps5_r4::tests::memory_and_partition ... ok
+test ps5_r4::tests::one_candidate_has_two_arms ... ok
+test ps5_r8::tests::projection_contract ... ok
+test ps5_r8::tests::q8_contract ... ok
+test quant::tests::nvfp4_dequant ... ok
+test raon::chat::template_and_calls ... ok
+test raon::forward::tests::raon_mhc_is_doubly_stochastic ... ok
+test raon::forward::tests::rda_recurrent_matches_scalar_reference ... ok
+test raon::forward::tests::router_uses_bias_for_selection_only ... ok
+test raon::forward::tests::situ_glu_matches_definition ... ok
+test serve::usage_tests::usage_adds_and_persists ... ok
+test term::tests::clock_and_speed_lines ... ok
+test term::tests::status_styles_by_prefix_and_is_plain_when_off ... ok
+test tokenizer::tests::gpt2_byte_map_is_the_inverse ... ok
+test update::tests::package_manager_installs_are_left_alone ... ok
+test update::tests::versions_compare_as_numbers ... ok
+test venus_f16::tests::venus_bf16_matvec_reference_and_fallback ... ok
+test venus_f16::tests::venus_f16_matvec_reference ... ok
+test venus_f16::tests::venus_f16_real_gguf ... ignored, requires a local F16 GGUF; see test-venus.sh
+test venus_f16::tests::venus_f16_rejects_without_writing ... ok
+test model::tests::sensenova_loop_mhc_cpu_matches_gpu ... ok
+test venus_f16::tests::venus_f16_tail_real_gguf ... ignored, requires local F16 GGUF; compares old/new Venus tails
+test venus_f16::tests::venus_f16_shapes_and_reference ... ok
+test venus_trace::tests::venus_trace_metrics ... ok
+test vision::image::tests::bilinear_identity ... ok
+test vision::image::tests::smart_resize_matches_llama ... ok
+test vision::prompt::tests::expands_one_image ... ok
+test vision::prompt::tests::image_positions_are_row_then_column ... ok
+test vision::prompt::tests::text_resumes_after_wider_side ... ok
+test vulkan::ps5_r2::tests::dispatch_contract ... ok
+test vulkan::ps5_r2::tests::r14_dispatch_contract ... ok
+test vulkan::ps5_r3::tests::gpu_import_parity ... ignored, requires real AMD Vulkan device; run tools/ps5/test-r3.sh
+test vulkan::ps5_r3::tests::windows ... ok
+test vulkan::r12_audit_q8_geometry ... ok
+test vulkan::r13_audit_f16_alignment ... ok
+test vulkan::r13_audit_matrix_span ... ok
+test vulkan::spv_smem::tests::attn_prefill_non_turbo_fits_48kb ... ok
+test vulkan::spv_smem::tests::shared_memory_matches_the_committed_spirv ... ok
+test vulkan::spv_smem::tests::shared_memory_of_every_weight_kernel_and_type ... ok
+test vulkan::spv_smem::tests::shared_memory_refusal_names_the_kernel_spec_and_both_sizes ... ok
+test weights::net_fs_reads_mountinfo ... ok
+test venus_f16::tests::venus_f16_tail_reference ... ok
+
+test result: ok. 189 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running unittests src/main.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/180f3d8dbe9e0981/out/rustingstrata-180f3d8dbe9e0981)
+
+running 47 tests
+test bench_tests::bench_record_expert_object_uses_the_printed_numbers ... ok
+test audit_log_probs_rejects_invalid_input ... ok
+test bench_tests::bench_record_omits_expert_without_a_cache ... ok
+test bench_tests::bench_record_rates_match_the_text_rendering ... ok
+test bench_tests::bench_record_schema_and_one_result_per_pp_in_order ... ok
+test bench_tests::cpu_inference_loader_selects_requested_numerics ... ok
+test bench_tests::own_state_restores_the_environment ... ok
+test calibrate_cli_tests::a_failing_baseline_does_not_abort_the_search_setup ... ok
+test calibrate_cli_tests::a_new_calibration_clears_the_stale_v1_split ... ok
+test calibrate_cli_tests::a_spec_sweep_preserves_the_engine_calibration ... ok
+test calibrate_cli_tests::calibration_chunk_environment_is_restored_for_the_next_model ... ok
+test calibrate_cli_tests::chunks_larger_than_the_context_are_dropped ... ok
+test bench_tests::bench_record_rejects_json_out_dash ... ok
+test calibrate_cli_tests::cli_parses_the_v2_calibration_flags ... ok
+test calibrate_cli_tests::cli_parses_the_spec_subcommand ... ok
+test calibrate_cli_tests::draft_counts_are_read_from_both_json_and_stdout ... ok
+test calibrate_cli_tests::explicit_chunk_environment_variables_are_not_overwritten ... ok
+test calibrate_cli_tests::gemma_bench_reports_the_chunk_it_actually_used ... ok
+test calibrate_cli_tests::inkling_chunks_larger_than_its_gpu_cap_are_not_searched ... ok
+test calibrate_cli_tests::knob_space_is_only_chunk_mtp_and_short ... ok
+test calibrate_cli_tests::spec_baseline_uses_current_defaults_not_first_list_values ... ok
+test calibrate_cli_tests::short_candidates_cross_the_workload_depths ... ok
+test calibrate_cli_tests::spec_defaults_are_added_when_the_lists_omit_them ... ok
+test calibrate_cli_tests::spec_space_stores_indices_not_actual_values ... ok
+test calibrate_cli_tests::the_baseline_chunk_is_each_engines_own_default ... ok
+test calibrate_cli_tests::the_calibration_file_is_named_like_the_reader_looks_for_it ... ok
+test calibrate_cli_tests::workload_groups_keep_task_and_depth_order ... ok
+test calibrate_cli_tests::workloads_must_fit_the_context_being_measured ... ok
+test flag_tests::calibrated_split_needs_the_same_devices_in_the_same_order ... ok
+test flag_tests::calibration_file_per_backend_and_device_set ... ok
+test flag_tests::calibration_from_another_gpu_is_refused ... ok
+test flag_tests::cpu_requires_the_gpu_for_both ... ok
+test flag_tests::mtp_without_a_head_runs_without_drafts ... ok
+test flag_tests::parallel_mtp_are_explained ... ok
+test flag_tests::load_options_apply_and_validate ... ok
+test flag_tests::parallel_range_is_rejected ... ok
+test flag_tests::serve_takes_an_mcp_file ... ok
+test flag_tests::vram_margins_are_per_device ... ok
+test flag_tests::physical_cores_count_distinct_sibling_groups ... ok
+test flag_tests::vram_margins_reject_bad_specs ... ok
+test kv_type_tests::arbitrary_kv_pairs_are_allowed ... ok
+test interface_tests::answers_become_the_arguments_of_the_command ... ok
+test kv_type_tests::invalid_types_are_rejected ... ok
+test kv_type_tests::turbo_aliases_expand_to_independent_types ... ok
+test kv_type_tests::symmetric_flag_and_overrides ... ok
+test r14_fixed_logit_writer ... ok
+test timing_tests::timings_match_llama_server ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gguf.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/96186a3746d9fed8/out/gguf-96186a3746d9fed8)
+
+running 11 tests
+test arch_table_fields ... ok
+test audit_rejects_deep_metadata ... ok
+test flint_config ... ok
+test malformed_metadata_must_not_panic ... ok
+test opens_split_model ... ok
+test parses_synthetic_file ... ok
+test qwen3next_ssm_ba_split ... ok
+test qwen4exp_config ... ok
+test audit_rejects_inconsistent_tensor_layouts ... ok
+test real_file_config ... ok
+test rejects_bad_ssm_dims ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/r14_context.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/af5a5ccc338b4fad/out/r14_context-af5a5ccc338b4fad)
+
+running 1 test
+test greedy_context_boundary ... ignored, physical Vulkan and explicit GGUF required
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/r14_dense.rs (/tmp/r14/RustingStrata-PS5/target/ps5/x86_64-unknown-linux-gnu/release/build/rusting_strata/a59cd7aa17f5194b/out/r14_dense-a59cd7aa17f5194b)
+
+running 2 tests
+test fingerprint ... ignored, physical Vulkan required
+test shared_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
