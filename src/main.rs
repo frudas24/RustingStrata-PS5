@@ -1657,13 +1657,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(r.backend_name() == "vulkan" && engine.mtp() == 0, "R6 requires Vulkan and no MTP");
                 anyhow::ensure!(engine.threads == Some(rayon::current_num_threads()), "R6 Rayon pool differs from requested threads");
             }
+            if fixed_decode { anyhow::ensure!(matches!(&r, Runner::Gpu(g) if g.ngram.is_none()), "fixed decode requires GPU runner without ngram speculation"); }
             let mut fixed_out = fixed_logits.as_ref().map(|path| std::fs::OpenOptions::new().write(true).create_new(true).open(path).map(std::io::BufWriter::new)).transpose()?;
-            if fixed_decode { anyhow::ensure!(matches!(&r, Runner::Gpu(_)), "fixed decode requires GPU runner"); }
+            // Reserve JSON exclusively before the expensive loop. Even an alias
+            // spelling of fixed_logits cannot overwrite the already-open dump.
+            let mut fixed_json = if fixed_decode {
+                Some(std::fs::OpenOptions::new().write(true).create_new(true).open(json_out.as_ref().context("fixed JSON path")?)?)
+            } else { None };
             let mut fixed_rows = 0usize;
             for n in pp {
                 let sequence = prose(&tok, if fixed_decode { n + tg } else { n })?;
                 let (ids, continuation) = sequence.split_at(n);
-                anyhow::ensure!(!fixed_decode || continuation.iter().all(|&id| (id as usize) < m.cfg.n_vocab), "fixed token outside vocabulary");
+                if r6 { anyhow::ensure!(sequence.iter().all(|&id| (id as usize) < m.cfg.n_vocab), "benchmark token outside vocabulary"); }
                 let (mut p, mut d) = (Vec::new(), Vec::new());
                 let mut fingerprints = Vec::new();
                 for rep in 0..reps {
@@ -1671,7 +1676,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let t = Instant::now();
                     let l = r.prefill(ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
-                    if fixed_decode { anyhow::ensure!(l.len() == m.cfg.n_vocab && l.len() >= 5, "fixed prefill vocabulary mismatch"); }
+                    if r6 { anyhow::ensure!(l.len() == m.cfg.n_vocab && l.len() >= 5, "benchmark prefill vocabulary mismatch"); }
                     let prefill_fp = if r6 {
                         anyhow::ensure!(!l.is_empty() && l.iter().all(|v| v.is_finite()), "R6 non-finite/empty prefill logits");
                         let top = ops::top_k(&l, 5);
@@ -1721,7 +1726,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 if r6 {
                     let mut row = json!({"pp":n, "samples":fingerprints});
-                    if fixed_decode { row["input_ids"] = json!(ids); }
+                    row["input_ids"] = json!(ids);
+                    if fixed_decode { row["continuation_ids"] = json!(continuation); }
                     r6_rows.push(row);
                 }
                 let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
@@ -1762,16 +1768,21 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 record["kv_v"] = json!(kv_v);
                 if fixed_decode {
                     record["r14_decode"] = json!(if fixed_out.is_some() { "fixed_logits" } else { "fixed" });
-                    record["r14_vocab"] = json!(m.cfg.n_vocab);
                     record["r14_logit_rows"] = json!(fixed_rows);
                 }
                 if r6 {
+                    record["r14_vocab"] = json!(m.cfg.n_vocab);
                     record["r6"] = json!({"threads":rayon::current_num_threads(), "short":engine.short,
                         "rows":r6_rows});
                 }
                 let mut line = serde_json::to_string(&record)?;
                 line.push('\n');
-                std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
+                if let Some(out) = &mut fixed_json {
+                    out.write_all(line.as_bytes())?;
+                    out.flush()?;
+                } else {
+                    std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
+                }
             }
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,

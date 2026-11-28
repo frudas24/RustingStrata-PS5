@@ -54,12 +54,14 @@ fn fingerprint() {
                 assert!(row.iter().all(|x|x.is_finite()));
                 assert!(row[rows..].iter().all(|&x|x==0.125));
                 if r==0 || r==n+1 { assert!(row.iter().all(|&x|x==0.125)); }
+                else if act!=0 { assert!(row[..rows].iter().any(|&x|x!=0.125), "active accumulation row unchanged"); }
             }
             for val in &v { out.write_all(&val.to_bits().to_le_bytes()).unwrap(); }
             cases+=1; values+=v.len();
         }
     }
     assert_eq!(cases,498);
+    assert_eq!(values,4_486_580);
     out.flush().unwrap();
     eprintln!("R14 dense GPU parity: {cases} cases {values} values");
 }

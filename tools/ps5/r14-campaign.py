@@ -6,6 +6,8 @@ import argparse
 from array import array
 import importlib.util
 import hashlib
+import heapq
+import subprocess
 import json
 import math
 from pathlib import Path
@@ -24,14 +26,13 @@ def load(name, file):
 r6 = load('r6', 'autotune-r6.py')
 r13 = load('r13', 'r13-campaign.py')
 quality = load('quality', 'quality-r11.py')
-DENSE = {'r14_dense_q5', 'r14_dense_q6', 'gemmi_dp_ps5_32', 'gemmi_dp_ps5_64'}
+DENSE = {'r14_dense_q5', 'r14_dense_q6', 'gemmi_dp_ps5_32', 'gemmi_dp_ps5_64', 'r14_base_q5', 'r14_base_q6', 'r14_f16_q5', 'r14_f16_q6'}
 
 
 def dense_marks(tile, types):
     r6.require(tile in (0, 32, 64) and types in ('q5', 'q6', 'both'), 'invalid R14 selector')
-    if not tile:
-        return set()
-    return {f'gemmi_dp_ps5_{tile}', *(f'r14_dense_{t}' for t in ('q5', 'q6') if types in (t, 'both'))}
+    selected = {t for t in ('q5','q6') if tile and types in (t,'both')}
+    return ({f'gemmi_dp_ps5_{tile}'} if tile else set()) | {f'r14_{"dense" if t in selected else "base"}_{t}' for t in ('q5','q6')}
 
 
 def check_marks(log, tile, types, iq=None):
@@ -43,35 +44,51 @@ def check_marks(log, tile, types, iq=None):
 
 
 def fixed_record(record, k, s, model, mode):
-    r6.require(record.get('r14_decode') == mode, 'wrong decode mode')
+    natural = mode == 'natural'
+    r6.require(record.get('r14_decode') == (None if natural else mode), 'wrong decode mode')
     nv = record.get('r14_vocab')
     r6.require(type(nv) is int and 5 <= nv <= 2**32, 'invalid vocabulary')
+    r6.require(record.get('kv_k') == s['kv'] == record.get('kv_v'), 'mixed or missing KV contract')
+    r6.require(record.get('drafts') == {'made':0,'accepted':0}, 'unexpected speculative work')
     rows = len(s['pp'])*s['reps']*(s['tg']+1) if mode == 'fixed_logits' else 0
-    r6.require(type(record.get('r14_logit_rows')) is int and record['r14_logit_rows'] == rows, 'wrong logit row count')
-    rates, sig = r6.checked_rates(record, k, s, model, decode_mode=mode)
+    if natural:
+        r6.require('r14_logit_rows' not in record, 'natural mode has raw logit metadata')
+    else:
+        r6.require(type(record.get('r14_logit_rows')) is int and record['r14_logit_rows'] == rows, 'wrong logit row count')
+    rates, sig = r6.checked_rates(record, k, s, model, allow_eos=natural, decode_mode=None if natural else mode)
+    def token_list(ids, size):
+        return isinstance(ids,list) and len(ids)==size and all(type(x) is int and 0<=x<nv for x in ids)
     for entry in record['r6']['rows']:
         pp=entry['pp']; inputs=entry.get('input_ids')
-        r6.require(isinstance(inputs,list) and len(inputs)==pp and all(type(x) is int and 0<=x<nv for x in inputs),'invalid fixed prefill inputs')
+        r6.require(token_list(inputs,pp),'invalid prefill inputs')
         data=array('I',inputs)
         r6.require(data.itemsize==4,'unsupported token representation')
         if sys.byteorder!='little':data.byteswap()
         prompt_hash=hashlib.sha256(data.tobytes()).hexdigest()
+        forced=entry.get('continuation_ids')
+        if not natural: r6.require(token_list(forced,s['tg']), 'missing or invalid prescribed continuation')
+        else: r6.require(forced is None,'natural mode contains forced continuation')
         for sample in sig[pp]:
             sample['input_sha256']=prompt_hash
-            pred = sample.get('predictions')
-            r6.require(isinstance(pred, list) and len(pred) == s['tg'], 'missing forced-step predictions')
-            r6.require(all(type(x) is int and 0 <= x < nv for x in pred+sample['tokens']+[x[0] for x in sample['top5']]), 'token outside vocabulary')
+            top=sample['top5']; tokens=sample['tokens']
+            r6.require(token_list(tokens,len(tokens)) and all(0<=x[0]<nv for x in top), 'token outside vocabulary')
+            r6.require(math.fsum(math.exp(x[1]) for x in top)<=1.000001,'impossible top5 probability mass')
+            if natural:
+                r6.require('predictions' not in sample, 'natural mode contains forced predictions')
+                r6.require(not tokens or tokens[0]==top[0][0], 'natural first token disagrees with prefill greedy')
+            else:
+                r6.require(tokens==forced,'executed tokens differ from prescribed continuation')
+                r6.require(token_list(sample.get('predictions'),s['tg']), 'missing or invalid forced-step predictions')
     return rates, sig, nv, rows
 
 
 def match(ref, cur, fixed=True):
     r6.match_signatures(ref, cur)
-    if fixed:
-        for pp in ref:
-            for a in ref[pp]:
-                for b in cur[pp]:
-                    r6.require(a['input_sha256']==b['input_sha256'], f'prefill token sequence divergence at pp={pp}')
-                    r6.require(a['predictions'] == b['predictions'], f'forced-step argmax divergence at pp={pp}')
+    for pp in ref:
+        for a in ref[pp]:
+            for b in cur[pp]:
+                r6.require(a['input_sha256']==b['input_sha256'], f'prefill token sequence divergence at pp={pp}')
+                if fixed: r6.require(a['predictions'] == b['predictions'], f'forced-step argmax divergence at pp={pp}')
 
 
 def check_raw(path, sig, nv, rows):
@@ -80,17 +97,62 @@ def check_raw(path, sig, nv, rows):
     with path.open('rb') as f:
         for samples in sig.values():
             for sample in samples:
-                # One row after prefill, then one row after each forced token.
-                for token in [sample['top5'][0][0], *sample['predictions']]:
+                for step, token in enumerate([sample['top5'][0][0], *sample['predictions']]):
                     data = array('f'); data.frombytes(f.read(nv*4))
                     if sys.byteorder != 'little': data.byteswap()
                     r6.require(len(data)==nv and all(map(math.isfinite,data)), 'invalid raw logits')
-                    # Rust total_cmp distinguishes +0 from -0; the strict byte gate
-                    # handles this distinction. Accept either signed zero for argmax.
-                    r6.require(data[token]==max(data), 'FP32 dump disagrees with prediction')
+                    maximum=max(data)
+                    # CPU quality mode uses Rust total_cmp: +0 wins over -0,
+                    # then the lowest index for exactly equal representations.
+                    def order(i): return (-data[i], -math.copysign(1.,data[i]), i)
+                    if step == 0:
+                        ids=heapq.nsmallest(5,range(nv),key=order)
+                        r6.require(ids==[x[0] for x in sample['top5']], 'FP32 dump disagrees with top5 order')
+                        lse=maximum+math.log(math.fsum(math.exp(x-maximum) for x in data))
+                        r6.require(all(abs(data[i]-lse-lp)<=1e-8 for i,lp in sample['top5']), 'FP32 dump disagrees with top5 logprob')
+                    else:
+                        winner=data.index(maximum)
+                        if maximum==0 and math.copysign(1.,data[winner])<0:
+                            winner=next((i for i,x in enumerate(data) if x==0 and math.copysign(1.,x)>0),winner)
+                        r6.require(token==winner, 'FP32 dump disagrees with prediction')
                     count += 1
         r6.require(count == rows and not f.read(1), 'FP32 dump coverage mismatch')
     return r6.digest(path)
+
+
+def stat_identity(paths):
+    # Full hashes at campaign boundaries, cheap inode/ctime/mtime checks per arm.
+    # A restored byte-identical file still changes ctime on ordinary Linux filesystems.
+    result=[]
+    for path in paths:
+        p=Path(path).resolve(strict=True); s=p.stat()
+        r6.require(p.is_file(),f'not a regular file: {p}')
+        result.append((str(p),s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns))
+    return result
+
+
+def test_lines(text):
+    # libtest --nocapture may prefix the first stderr line with the test name.
+    return [re.sub(r'^test (?:shared_bound|fingerprint) \.\.\. (?=R14 )','',line) for line in text.splitlines()]
+
+
+def check_test_log(text, marker=None):
+    summaries=[l for l in text.splitlines() if l.startswith('test result:')]
+    r6.require(len(summaries)==1 and re.match(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;',summaries[0]),'missing or contradictory Cargo test result')
+    if marker: r6.require(test_lines(text).count(marker)==1,'missing or duplicate parity marker')
+
+
+def check_lds(text):
+    check_test_log(text)
+    seen=set()
+    for line in test_lines(text):
+        if not line.startswith('R14 LDS '): continue
+        m=re.fullmatch(r'R14 LDS type=(13|14) base=(\d+) tile32=(\d+) tile64=(\d+)',line)
+        r6.require(m is not None,'malformed LDS marker')
+        ty,a,b,c=map(int,m.groups())
+        r6.require(ty not in seen and 0<b<c<a<=65536,'invalid/duplicate LDS marker')
+        seen.add(ty)
+    r6.require(seen=={13,14},'missing LDS markers')
 
 
 def profile_report(text):
@@ -145,14 +207,16 @@ def main():
     r6.require(a.mode!='kld' or (a.corpus is not None and 128<=a.ctx_len<=a.ctx and a.chunks>0),'KLD requires valid corpus/coverage')
     session=r6.Session(a.model,a.bin,s,a.out); reports={}
     try:
-        ident=r6.identity(a.model,a.bin); holdout=r6.file_id(session.holdout); corpus=r6.file_id(a.corpus) if a.corpus else None
+        paths=[*r6.model_files(a.model),session.binary]
+        stamp=stat_identity(paths)
+        ident=r6.identity(a.model,a.bin); r6.require(stat_identity(paths)==stamp,'model/binary changed during initial identity'); holdout=r6.file_id(session.holdout); corpus=r6.file_id(a.corpus) if a.corpus else None
         r6.atomic_json(session.out/'identity.json',dict(environment=ident,holdout=holdout,corpus=corpus))
         for task in (('corpus',) if a.mode=='kld' else ('prose','holdout')+ (('corpus',) if a.corpus else ())):
             runs=[]
             for i,enabled in enumerate((0,1,1,0) if a.mode=='bench' else (0,1),1):
                 tile=a.tile if enabled else 0; iq=a.iq_tile if enabled else a.base_iq_tile
                 stem=f'{task}-{i}-tile{tile}-iq{iq}'; log=session.out/(stem+'.log'); result=session.out/(stem+'.json'); dump=session.out/(stem+'.bin')
-                env=r6.child_env(k); flags=dict(STRATA_PS5_R11_IQ32='1',STRATA_PS5_R12_IQ_INT_TILE=str(iq),STRATA_PS5_R13_LUT='off',STRATA_PS5_R14_DENSE_TILE=str(tile),STRATA_PS5_R14_DENSE_TYPE=a.types)
+                env=r6.child_env(k); flags=dict(STRATA_PS5_R11_IQ32='1',STRATA_PS5_R12_IQ_INT_TILE=str(iq),STRATA_PS5_R13_LUT='off',STRATA_PS5_R14_DENSE_TILE=str(tile),STRATA_PS5_R14_DENSE_TYPE=a.types,STRATA_PS5_R14_TRACE='1')
                 env.update(flags)
                 if a.mode=='profile': env.update(STRATA_VK_PROF='1',STRATA_VK_STATS='1',STRATA_PS5_R11_PROFILE='1',STRATA_PS5_R13_MEM_TRACE='1',STRATA_PS5_R13_QUANT_TRACE='1',STRATA_R7_TOKEN_TIMING='1')
                 if a.mode=='kld':
@@ -166,6 +230,7 @@ def main():
                 r6.atomic_json(session.out/(stem+'-request.json'),dict(cmd=cmd,knobs=k,mode=a.mode,flags=flags))
                 print(stem,flush=True)
                 def inputs_ok():
+                    r6.require(stat_identity(paths)==stamp,'model/binary changed during campaign')
                     r6.require(r6.file_id(session.holdout)==holdout and (a.corpus is None or r6.file_id(a.corpus)==corpus),'corpus changed')
                 inputs_ok(); mem=r6.run_child(cmd,env,log,a.timeout,a.min_ram_mb);inputs_ok()
                 text=log.read_text(errors='replace'); evidence=r6.evidence(text,k);check_marks(text,tile,a.types,iq)
@@ -174,14 +239,9 @@ def main():
                     quality.check_dump(dump,text,a.ctx_len,a.chunks);run['sha256']=r6.digest(dump)
                 else:
                     rec=json.loads(result.read_text())
-                    if a.mode=='natural':
-                        r6.require('r14_decode' not in rec,'natural control used fixed mode')
-                        rates,sig=r6.checked_rates(rec,k,s,a.model,allow_eos=True)
-                        run.update(rates=rates,signatures=sig)
-                    else:
-                        rates,sig,nv,rows=fixed_record(rec,k,s,a.model,'fixed_logits' if a.mode=='quality' else 'fixed')
-                        run.update(rates=rates,signatures=sig,vocab=nv)
-                        if a.mode=='quality':run['sha256']=check_raw(dump,sig,nv,rows)
+                    rates,sig,nv,rows=fixed_record(rec,k,s,a.model,{'natural':'natural','quality':'fixed_logits'}.get(a.mode,'fixed'))
+                    run.update(rates=rates,signatures=sig,vocab=nv)
+                    if a.mode=='quality':run['sha256']=check_raw(dump,sig,nv,rows)
                     match(sig,sig,a.mode!='natural')
                     if a.mode=='profile':run['diagnostics']=profile_report(text)
                 r6.atomic_json(session.out/(stem+'-checked.json'),run);runs.append(run)
@@ -189,14 +249,14 @@ def main():
             else:
                 if a.mode!='kld':
                     match(runs[0]['signatures'],runs[1]['signatures'],a.mode!='natural')
-                    if a.mode!='natural':r6.require(runs[0]['vocab']==runs[1]['vocab'],'vocabulary changed')
+                    r6.require(runs[0]['vocab']==runs[1]['vocab'],'vocabulary changed')
                 if a.mode in ('quality','kld'):r6.require(runs[0]['sha256']==runs[1]['sha256'],'full-vocabulary identity failed')
                 reports[task]=dict(accepted=False,validated=True,mode=a.mode,runs=runs)
-        r6.require(r6.identity(a.model,a.bin)==ident,'model, binary or hardware identity changed')
+        r6.require(r6.identity(a.model,a.bin)==ident and stat_identity(paths)==stamp,'model, binary or hardware identity changed')
         accepted=a.mode=='bench' and all(x['accepted'] for x in reports.values())
         r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=accepted,validated=True,reports=reports,production_promotion=False))
         return 0 if accepted or a.mode!='bench' else 1
-    except (r6.Reject,ValueError,KeyError,TypeError,OSError,IndexError) as exc:
+    except (r6.Reject,ValueError,KeyError,TypeError,OSError,IndexError,OverflowError,subprocess.SubprocessError) as exc:
         r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=False,validated=False,error=str(exc),reports=reports));print(f'REJECT: {exc}',file=sys.stderr);return 1
 
 

@@ -1599,6 +1599,12 @@ impl<'a> GpuModel<'a> {
 
     /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's argmax.
     fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, u32)> {
+        // Match verify_run/step: reserve KV before recording any work.
+        let nt = tokens.len();
+        anyhow::ensure!((1..=self.tmax()).contains(&nt), "greedy verify: invalid token count {nt}");
+        let end = self.pos.checked_add(nt).context("greedy verify position overflow")?;
+        anyhow::ensure!(end <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        self.kv_need(self.cur, end)?;
         self.dflash_commit_ctx()?;
         let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
         let prof = std::env::var_os("STRATA_VK_PROF").is_some();

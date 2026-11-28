@@ -248,6 +248,8 @@ struct Inner {
     // R6 records only first actual dispatch/allocation per class, never pipeline creation.
     r6_trace: bool,
     r6_seen: std::sync::atomic::AtomicU32,
+    r14_trace: bool,
+    r14_seen: std::sync::atomic::AtomicU32,
     /// AMD RDNA3 / RDNA3.5 (gfx11xx) or iGPU whose small L2 cache hurts from next-layer MoE prefetch.
     gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
@@ -676,7 +678,7 @@ impl Vk {
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
         let r3 = r3_cfg.map(|cfg| ps5_r3::HostImport::new(cfg, &instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, max_dispatch: limits.max_compute_work_group_count, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), r7_commands: Default::default(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, ps5, r2, r3, ps5_gtt, ps5_direct, ps5_host_reserve, ps5_upload_bytes: Default::default(), r6_trace: ps5 && std::env::var("STRATA_PS5_R6").is_ok_and(|v| v == "1"), r6_seen: Default::default(), r14_trace: ps5 && std::env::var("STRATA_PS5_R14_TRACE").as_deref() == Ok("1"), r14_seen: Default::default(), gfx11, wave64, rcp_d, coop, dp_tile, r5, r5_logged: Default::default(), coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, max_dispatch: limits.max_compute_work_group_count, ts_period, r7_trace: std::env::var("STRATA_R7_VK_TRACE").is_ok_and(|v| v == "1"), r7_commands: Default::default(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -832,6 +834,22 @@ impl Inner {
 
     fn r6_mark(&self, bit: u32, name: &str) {
         if self.r6_trace && self.r6_seen.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+            eprintln!("PS5 R6 exercised: {name}");
+        }
+    }
+
+    // Separate bitset: the inherited R6 marker namespace is exhausted. Only R14
+    // campaigns request these additional markers; older experiments are unchanged.
+    fn r14_mark_dense_reference(&self, ty: GgmlType, fp16: bool) {
+        if !self.r14_trace { return; }
+        let (bit, name) = match (ty, fp16) {
+            (GgmlType::Q5K, false) => (1, "r14_base_q5"),
+            (GgmlType::Q6K, false) => (2, "r14_base_q6"),
+            (GgmlType::Q5K, true) => (4, "r14_f16_q5"),
+            (GgmlType::Q6K, true) => (8, "r14_f16_q6"),
+            _ => return,
+        };
+        if self.r14_seen.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
             eprintln!("PS5 R6 exercised: {name}");
         }
     }
@@ -1458,6 +1476,7 @@ impl Vk {
             let kernel = if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" };
             self.run(kernel, &spec, grid, &args)?;
             if tiles != 0 { self.mark_routed_iq(ty, kernel); }
+            else { self.0.r14_mark_dense_reference(ty, true); }
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
@@ -1523,6 +1542,7 @@ impl Vk {
             return self.run("gemmi_dp_ps5_32", &spec, [grid[0], nd.div_ceil(32), 1], &args);
         }
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
+        if tiles == 0 { self.0.r14_mark_dense_reference(ty, false); }
         if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
         Ok(())
     }
