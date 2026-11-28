@@ -391,15 +391,15 @@ struct Mem { vk: Arc<Inner>, buf: vk::Buffer, mem: vk::DeviceMemory, addr: u64, 
 impl Drop for Mem {
     fn drop(&mut self) {
         let mut st = self.vk.st();
-        let flushed = self.vk.flush(&mut st); // queued work may still use the buffer
-        if self.imported.is_some() && flushed.is_err() {
-            // Never release host pages while GPU access may still be in flight. On an
-            // exceptional wait failure retain the mapping for the remaining process lifetime.
-            if unsafe { self.vk.dev.device_wait_idle() }.is_err() {
-                if let Some(imported) = self.imported.take() { std::mem::forget(imported); }
-                std::mem::forget(self.vk.clone());
-                return;
-            }
+        // Drop cannot return an error. A failed flush (including an active
+        // graph capture) is not proof that recorded GPU addresses are dead.
+        // Keep the allocation, device and any imported pages alive rather than
+        // freeing memory that a pending/recorded command may still reference.
+        if let Err(e) = self.vk.flush(&mut st) {
+            eprintln!("Vulkan buffer retirement failed; retaining allocation until process exit: {e:#}");
+            if let Some(imported) = self.imported.take() { std::mem::forget(imported); }
+            std::mem::forget(self.vk.clone());
+            return;
         }
         st.bufs.remove(&self.addr);
         if self.vk.r7_trace { self.vk.r7_commands.buffer_drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
@@ -865,8 +865,11 @@ impl Inner {
         if let Some(c) = st.cur { return Ok(c); }
         let c = match st.spare.pop() { Some(c) => c, None => unsafe { self.dev.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default().command_pool(st.pool).command_buffer_count(1)) }?[0] };
-        unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
+        if let Err(e) = unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) } {
+            unsafe { self.dev.free_command_buffers(st.pool, &[c]) };
+            return Err(e.into());
+        }
         st.cur = Some(c);
         if st.need_cond { self.cond_on(st, c); }
         Ok(c)
@@ -921,7 +924,10 @@ impl Inner {
         if let Some(c) = st.cur.take() {
             st.copied.1 = 0;
             self.end_cond(st, c);
-            unsafe { self.dev.end_command_buffer(c) }?;
+            if let Err(e) = unsafe { self.dev.end_command_buffer(c) } {
+                unsafe { self.dev.free_command_buffers(st.pool, &[c]) };
+                return Err(e.into());
+            }
             st.used.push(c);
             st.queued.push(c);
         }
@@ -1029,7 +1035,10 @@ impl Inner {
     /// Submit the open transfer command buffer, after compute submit `bwait`.
     fn tsubmit(&self, st: &mut State) -> anyhow::Result<()> {
         let (Some(c), Some(q)) = (st.tcur.take(), self.tq) else { return Ok(()) };
-        unsafe { self.dev.end_command_buffer(c) }?;
+        if let Err(e) = unsafe { self.dev.end_command_buffer(c) } {
+            unsafe { self.dev.free_command_buffers(st.tpool, &[c]) };
+            return Err(e.into());
+        }
         st.tused.push(c);
         st.tval += 1;
         let (a, b, v) = (st.tstart, st.staged, st.tval);
@@ -1061,8 +1070,11 @@ impl Inner {
         st.tstart = st.staged;
         let c = match st.tspare.pop() { Some(c) => c, None => unsafe { self.dev.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default().command_pool(st.tpool).command_buffer_count(1)) }?[0] };
-        unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
+        if let Err(e) = unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) } {
+            unsafe { self.dev.free_command_buffers(st.tpool, &[c]) };
+            return Err(e.into());
+        }
         st.tcur = Some(c);
         Ok(c)
     }
@@ -1671,6 +1683,8 @@ impl Backend for Vk {
         ensure!(!dst.is_read_only(), "cannot write imported immutable GGUF weights");
         ensure!(off.checked_add(src.len()).is_some_and(|end| end <= dst.len()), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
+        ensure!(st.rec.is_none(), "a host copy while recording a graph");
+        if src.is_empty() { return Ok(()); }
         if st.step_pos.is_some_and(|(a, _)| dst.addr() + off as u64 == a) { st.step_pos = None; }
         // A small copy goes inline into the open command buffer, with no staging round trip and no wait: the next
         // submit (a graph replay or a flush) carries it.
@@ -1686,7 +1700,6 @@ impl Backend for Vk {
         }
         // Larger copies fill `staging` front to back and wait only when it is full, so a run of uploads (experts
         // streamed in prefill) overlaps each copy on the GPU with the host filling the next.
-        ensure!(st.rec.is_none(), "a host copy while recording a graph");
         if st.beside {
             for (i, c) in src.chunks(STAGING).enumerate() {
                 if st.staged + c.len() > STAGING {

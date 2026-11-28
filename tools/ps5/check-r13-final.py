@@ -43,6 +43,7 @@ if mode!='missing': print(marker)
 if mode=='duplicate': print(marker)
 print('test result: ok. '+('0' if mode=='zero' else '1')+' passed; 0 failed; 0 ignored;')
 if mode=='extra': print('test result: FAILED. 0 passed; 1 failed; 0 ignored;')
+if mode=='retirement': print('Vulkan buffer retirement failed; simulated')
 if mode=='exit': sys.exit(1)
 '''
 class PhysicalGate(unittest.TestCase):
@@ -54,7 +55,7 @@ class PhysicalGate(unittest.TestCase):
     def test_valid(self):
         r=self.run_gate('valid');self.assertEqual(r.returncode,0,r.stdout+r.stderr)
     def test_reject_invalid(self):
-        for mode in ('missing','duplicate','zero','extra','exit'):
+        for mode in ('missing','duplicate','zero','extra','exit','retirement'):
             with self.subTest(mode=mode): self.assertNotEqual(self.run_gate(mode).returncode,0)
 
 if __name__=='__main__':unittest.main(verbosity=2)

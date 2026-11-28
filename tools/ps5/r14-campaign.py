@@ -92,13 +92,16 @@ def match(ref, cur, fixed=True):
 
 
 def check_raw(path, sig, nv, rows):
+    stamp = stat_identity([path])
     r6.require(path.stat().st_size == nv*rows*4, 'truncated or oversized FP32 dump')
+    digest = hashlib.sha256()
     count = 0
     with path.open('rb') as f:
         for samples in sig.values():
             for sample in samples:
                 for step, token in enumerate([sample['top5'][0][0], *sample['predictions']]):
-                    data = array('f'); data.frombytes(f.read(nv*4))
+                    raw = f.read(nv*4); digest.update(raw)
+                    data = array('f'); data.frombytes(raw)
                     if sys.byteorder != 'little': data.byteswap()
                     r6.require(len(data)==nv and all(map(math.isfinite,data)), 'invalid raw logits')
                     maximum=max(data)
@@ -117,7 +120,8 @@ def check_raw(path, sig, nv, rows):
                         r6.require(token==winner, 'FP32 dump disagrees with prediction')
                     count += 1
         r6.require(count == rows and not f.read(1), 'FP32 dump coverage mismatch')
-    return r6.digest(path)
+    r6.require(stat_identity([path]) == stamp, 'FP32 dump changed during verification')
+    return digest.hexdigest()
 
 
 def stat_identity(paths):
@@ -137,6 +141,7 @@ def test_lines(text):
 
 
 def check_test_log(text, marker=None):
+    r6.check_retirement(text)
     summaries=[l for l in text.splitlines() if l.startswith('test result:')]
     r6.require(len(summaries)==1 and re.match(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;',summaries[0]),'missing or contradictory Cargo test result')
     if marker: r6.require(test_lines(text).count(marker)==1,'missing or duplicate parity marker')
@@ -242,11 +247,21 @@ def main():
     r6.require(a.mode!='kld' or (a.corpus is not None and 128<=a.ctx_len<=a.ctx and a.chunks>0),'KLD requires valid corpus/coverage')
     session=r6.Session(a.model,a.bin,s,a.out); reports={}
     try:
-        paths=[*r6.model_files(a.model),session.binary]
+        paths=[*r6.model_files(a.model),session.binary,session.holdout]
+        if a.corpus is not None: paths.append(a.corpus)
         stamp=stat_identity(paths)
-        ident=r6.identity(a.model,a.bin); r6.require(stat_identity(paths)==stamp,'model/binary changed during initial identity'); holdout=r6.file_id(session.holdout); corpus=r6.file_id(a.corpus) if a.corpus else None
+        ident=r6.identity(a.model,a.bin); r6.require(stat_identity(paths)==stamp,'model/binary/corpus changed during initial identity'); holdout=r6.file_id(session.holdout); corpus=r6.file_id(a.corpus) if a.corpus else None
         r6.atomic_json(session.out/'identity.json',dict(environment=ident,holdout=holdout,corpus=corpus))
-        if a.bench_reference is not None:load_bench_reference(a.bench_reference,ident,holdout,corpus)
+        ref_paths = []
+        if a.bench_reference is not None:
+            ref_paths = [a.bench_reference/'identity.json', a.bench_reference/'summary.json']
+            for task in ('prose','holdout') + (('corpus',) if a.corpus else ()):
+                for arm in (1,2,3,4):
+                    tile,iq = (0,a.base_iq_tile) if arm in (1,4) else (a.tile,a.iq_tile)
+                    stem = f'{task}-{arm}-tile{tile}-iq{iq}'
+                    ref_paths.extend(a.bench_reference/(stem+suffix) for suffix in ('-request.json','.log','.json'))
+            ref_stamp = stat_identity(ref_paths)
+            load_bench_reference(a.bench_reference,ident,holdout,corpus)
         for task in (('corpus',) if a.mode=='kld' else ('prose','holdout')+ (('corpus',) if a.corpus else ())):
             runs=[]
             for i,enabled in enumerate((0,1,1,0) if a.mode=='bench' else (0,1),1):
@@ -266,7 +281,7 @@ def main():
                 r6.atomic_json(session.out/(stem+'-request.json'),dict(cmd=cmd,knobs=k,mode=a.mode,flags=flags))
                 print(stem,flush=True)
                 def inputs_ok():
-                    r6.require(stat_identity(paths)==stamp,'model/binary changed during campaign')
+                    r6.require(stat_identity(paths)==stamp,'model/binary/corpus changed during campaign')
                     r6.require(r6.file_id(session.holdout)==holdout and (a.corpus is None or r6.file_id(a.corpus)==corpus),'corpus changed')
                 inputs_ok(); mem=r6.run_child(cmd,env,log,a.timeout,a.min_ram_mb);inputs_ok()
                 text=log.read_text(errors='replace'); evidence=r6.evidence(text,k);check_marks(text,tile,a.types,iq)
@@ -292,6 +307,7 @@ def main():
                 if a.mode in ('quality','kld'):r6.require(runs[0]['sha256']==runs[1]['sha256'],'full-vocabulary identity failed')
                 reports[task]=dict(accepted=False,validated=True,mode=a.mode,runs=runs)
         r6.require(r6.identity(a.model,a.bin)==ident and stat_identity(paths)==stamp,'model, binary or hardware identity changed')
+        if ref_paths: r6.require(stat_identity(ref_paths)==ref_stamp,'cross-mode reference changed during campaign')
         accepted=a.mode=='bench' and all(x['accepted'] for x in reports.values())
         r6.atomic_json(session.out/'summary.json',dict(mode=a.mode,accepted=accepted,validated=True,reports=reports,production_promotion=False,greedy_cross_validated=a.mode=='quality' and a.bench_reference is not None))
         return 0 if accepted or a.mode!='bench' else 1

@@ -10,6 +10,7 @@ log=$(mktemp); trap 'rm -f "$log"' EXIT
 run_case() {
     local name=$1 marker=$2
     cargo test "${args[@]}" --test r13_launch "$name" -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+    if grep -Fq 'Vulkan buffer retirement failed;' "$log"; then echo 'Vulkan resource retirement failure: stop campaign' >&2; exit 1; fi
     [[ $(grep -Fxc "$marker" "$log" || true) == 1 ]]
     [[ $(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log" || true) == 1 ]]
     [[ $(grep -c '^test result:' "$log" || true) == 1 ]]

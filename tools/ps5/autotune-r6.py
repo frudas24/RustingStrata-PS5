@@ -195,7 +195,12 @@ def dispatch_marks(log):
         marks.add(m[1])
     return marks
 
+def check_retirement(log):
+    require('Vulkan buffer retirement failed;' not in log, 'Vulkan buffer retirement failed; stop and restart process')
+
+
 def evidence(log,k):
+    check_retirement(log)
     marks=dispatch_marks(log)
     require('PS5 profile: GTT ' in log,'PS5 AMD profile not active')
     modes=re.findall(r'PS5 profile: GTT (true|false), mapped upload (true|false)',log)

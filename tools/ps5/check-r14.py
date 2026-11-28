@@ -127,6 +127,41 @@ class Gates(unittest.TestCase):
             wrong=copy.deepcopy(sig);wrong[65024][0]['predictions'][0]=1
             with self.assertRaisesRegex(r6.Reject,'prediction'):c.check_raw(p,wrong,nv,rows)
 
+    def test_raw_hash_and_mutation_during_read(self):
+        r=record();r.update(r14_decode='fixed_logits',r14_logit_rows=6)
+        _,sig,nv,rows=c.fixed_record(r,r6.BASE,S,MODEL,'fixed_logits')
+        data=struct.pack('<5f',4.,3.,2.,1.,0.)*rows
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'raw';p.write_bytes(data)
+            self.assertEqual(c.check_raw(p,sig,nv,rows),c.hashlib.sha256(data).hexdigest())
+            original=c.heapq.nsmallest
+            def mutate(*args,**kwargs):
+                # Restore identical bytes, but change file identity during validation.
+                p.write_bytes(data)
+                return original(*args,**kwargs)
+            with patch.object(c.heapq,'nsmallest',side_effect=mutate):
+                with self.assertRaisesRegex(r6.Reject,'changed during verification'):
+                    c.check_raw(p,sig,nv,rows)
+
+    def test_retirement_error_rejects_success_markers(self):
+        error='Vulkan buffer retirement failed; retaining allocation until process exit: test'
+        summary='test result: ok. 1 passed; 0 failed; 0 ignored; 1 filtered out'
+        with self.assertRaisesRegex(r6.Reject,'retirement failed'):
+            c.check_test_log(summary+'\n'+error)
+        with self.assertRaisesRegex(r6.Reject,'retirement failed'):
+            r6.evidence('PS5 profile: GTT true, mapped upload true\n'+error,r6.BASE)
+
+    def test_retirement_source_order(self):
+        source=(HERE.parents[1]/'src/vulkan/mod.rs').read_text()
+        body=source.split('impl Drop for Mem {',1)[1].split('impl Drop for Inner {',1)[0]
+        failed=body.index('if let Err(e) = self.vk.flush');forget=body.index('std::mem::forget(self.vk.clone())')
+        ret=body.index('return;',forget);remove=body.index('st.bufs.remove');destroy=body.index('destroy_buffer')
+        self.assertLess(failed,forget);self.assertLess(forget,ret);self.assertLess(ret,remove);self.assertLess(remove,destroy)
+        self.assertNotIn('self.imported.is_some()',body[:ret])
+        copy=source.split('fn htod(&self',1)[1].split('fn dtoh(&self',1)[0]
+        self.assertLess(copy.index('ensure!(st.rec.is_none()'),copy.index('st.step_pos = None'))
+        self.assertLess(copy.index('if src.is_empty()'),copy.index('st.step_pos = None'))
+
     def test_contract_and_prescribed_tokens(self):
         for edit in [lambda r:r.update(kv_v='f16'),lambda r:r.update(drafts={'made':1,'accepted':0}),lambda r:r['r6']['rows'][0].update(continuation_ids=[2,1]),lambda r:r['r6']['rows'][0]['samples'][0].update(top5=[[i,0.] for i in range(5)])]:
             r=record();edit(r)
@@ -207,6 +242,14 @@ class Gates(unittest.TestCase):
                     summary=json.loads((out/'summary.json').read_text());self.assertTrue(summary['validated']);self.assertEqual(summary['accepted'],mode=='bench')
                     self.assertEqual(calls,([(0,64),(64,64),(64,64),(0,64)] if mode=='bench' else [(0,64),(64,64)])*2)
                     self.assertEqual(summary['greedy_cross_validated'],mode=='quality')
+                target=root/'bench'/'summary.json'; before=target.read_bytes()
+                def mutate_reference(*args,**kwargs):
+                    result=child(*args,**kwargs)
+                    target.write_bytes(before)
+                    return result
+                with patch.object(r6,'run_child',side_effect=mutate_reference), patch.object(sys,'argv',[*argv[:argv.index('--out')+1],str(root/'changed-reference'),*argv[argv.index('--out')+2:]]):
+                    self.assertEqual(c.main(),1)
+                self.assertIn('reference changed during campaign',json.loads((root/'changed-reference'/'summary.json').read_text())['error'])
                 # Make both scored arms internally consistent but different from
                 # FP32 predictions: the cross-mode gate must reject the evidence.
                 for arm in (1,2,3,4):

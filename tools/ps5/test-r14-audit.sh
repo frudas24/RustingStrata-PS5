@@ -35,6 +35,7 @@ PY
       PS5_R14_CONTEXT_MODEL="$model" cargo test "${args[@]}" --test r14_context greedy_context_boundary -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
       marker='R14 GREEDY CONTEXT PASS: exact limit, inert rejection, reset and replay'
     fi
+    if grep -Fq 'Vulkan buffer retirement failed;' "$log"; then echo 'Vulkan resource retirement failure: stop campaign' >&2; exit 1; fi
     [[ $(grep -Fxc "$marker" "$log" || true) == 1 ]]
     [[ $(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log" || true) == 1 ]]
     [[ $(grep -c '^test result:' "$log" || true) == 1 ]]

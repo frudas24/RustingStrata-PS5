@@ -71,6 +71,7 @@ fn rejected_graph_operations_are_inert() {
         assert!(g.graph_clear().is_err());
         assert!(g.dtoh(&a,0,&mut host).is_err());
         assert_eq!(host,[0xa5u8;16]);
+        assert!(g.htod(&[0xff;16],&a,0).is_err());
         assert!(g.graph(203,&mut || panic!("nested graph executed")).is_err());
         g.batch(&mut || {
             assert!(g.batch(&mut || panic!("nested batch executed")).is_err());

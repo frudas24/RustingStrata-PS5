@@ -1407,8 +1407,10 @@ impl<'a> GpuModel<'a> {
     /// Give slot `s` attention KV caches of `new` positions (zeroed; `keep`: with the old caches' rows). Either all
     /// of them change or, out of VRAM, none. The recorded graphs, which hold the old caches' addresses, go.
     fn kv_resize(&mut self, s: usize, new: usize, keep: bool) -> anyhow::Result<()> {
-        let (g, cap) = (&*self.gpu, self.kv_cap[s]);
-        anyhow::ensure!(cap > 0 && (1..=self.ctx).contains(&new), "invalid KV resize {cap} -> {new}");
+        let cap = *self.kv_cap.get(s).context("invalid dynamic KV slot")?;
+        let g = &*self.gpu;
+        anyhow::ensure!(cap > 0 && (1..=self.ctx).contains(&new) && (!keep || new >= cap),
+            "invalid KV resize {cap} -> {new} (keep={keep})");
         let mut fresh = vec![];
         for l in &self.layers {
             if let Mixer::Attn { kc, vc, .. } = &l.mixer {
@@ -3866,6 +3868,8 @@ mod tests {
         assert!(old.iter().any(|b| b.iter().any(|&x| x != 0)), "nontrivial KV required");
         let invalid = g.ctx()+1;
         assert!(g.kv_resize(0, invalid, true).is_err());
+        assert!(g.kv_resize(2, cap, true).is_err());
+        assert!(g.kv_resize(0, cap-1, true).is_err());
         assert_eq!(g.kv_cap[0], cap);
         assert_eq!(snapshot(&g, 0), old);
         let pred = g.step_greedy(ids[0]).unwrap();

@@ -339,7 +339,28 @@ fn f16tz(v: f32) -> f32 {
     let h = half::f16::from_f32(v);
     let b = h.to_bits();
     let mag = b & 0x7fff;
-    if h.to_f32().abs() > v.abs() && mag > 1 { half::f16::from_bits((b & 0x8000) | (mag - 1)).to_f32() } else { h.to_f32() }
+    if h.to_f32().abs() > v.abs() && mag > 0 { half::f16::from_bits((b & 0x8000) | (mag - 1)).to_f32() } else { h.to_f32() }
+}
+
+/// Independent CPU reference: truncation must choose the smaller magnitude
+/// across every adjacent finite binary16 pair, including the zero/subnormal edge.
+#[test]
+fn f16_trunc_reference_boundaries() {
+    for bits in 0u16..0x7bff {
+        let lo = half::f16::from_bits(bits).to_f32();
+        let hi = half::f16::from_bits(bits + 1).to_f32();
+        let mid = lo + (hi - lo) * 0.5;
+        for sign in [1.0f32, -1.0] {
+            for v in [lo, mid.next_down(), mid, mid.next_up()] {
+                assert_eq!(f16tz(sign * v).to_bits(), (sign * lo).to_bits(), "bits={bits:#06x} input={v:?} sign={sign}");
+            }
+            assert_eq!(f16tz(sign * hi).to_bits(), (sign * hi).to_bits());
+        }
+    }
+    for sign in [1.0f32, -1.0] {
+        assert_eq!(f16tz(sign * f32::MAX).to_bits(), (sign * 65504.0).to_bits());
+        assert_eq!(f16tz(sign * f32::INFINITY).to_bits(), (sign * f32::INFINITY).to_bits());
+    }
 }
 
 /// The f16 conversion the backend's f16 GEMM uses: CUDA `__float2half` rounds to nearest even; the Vulkan shader's
