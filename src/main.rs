@@ -1604,7 +1604,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(kv_k == engine.kv && kv_v == engine.kv && matches!(engine.kv.as_str(), "f16" | "q8" | "q4" | "q2"),
                     "R6 profiles require symmetric legacy K/V; benchmark mixed formats without STRATA_PS5_R6");
             }
+            anyhow::ensure!(fixed_logits.is_none() || fixed_decode, "fixed logits requires fixed decode");
             if fixed_decode {
+                anyhow::ensure!(fixed_logits.is_none() || fixed_logits.as_ref() != json_out.as_ref(), "fixed logit dump and JSON output must differ");
                 anyhow::ensure!(r6 && engine.mtp() == 0 && !pp.is_empty() && pp.iter().all(|&n| n > 0 && n.checked_add(tg).is_some_and(|end| end <= engine.ctx)),
                     "fixed decode requires R6, MTP=0 and explicit sufficient context");
             }
@@ -1669,6 +1671,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let t = Instant::now();
                     let l = r.prefill(ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
+                    if fixed_decode { anyhow::ensure!(l.len() == m.cfg.n_vocab && l.len() >= 5, "fixed prefill vocabulary mismatch"); }
                     let prefill_fp = if r6 {
                         anyhow::ensure!(!l.is_empty() && l.iter().all(|v| v.is_finite()), "R6 non-finite/empty prefill logits");
                         let top = ops::top_k(&l, 5);
@@ -1696,6 +1699,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             } else { unreachable!() };
                             anyhow::ensure!((predicted as usize) < m.cfg.n_vocab, "fixed prediction outside vocabulary");
                             predictions.push(predicted);
+                            term::decoded(1);
                             if r7_timing { token_times.push(prefill_start.elapsed().as_nanos()); }
                         }
                         (continuation.to_vec(), false)
@@ -1715,7 +1719,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         fingerprints.push(fp);
                     }
                 }
-                if r6 { r6_rows.push(json!({"pp":n, "samples":fingerprints})); }
+                if r6 {
+                    let mut row = json!({"pp":n, "samples":fingerprints});
+                    if fixed_decode { row["input_ids"] = json!(ids); }
+                    r6_rows.push(row);
+                }
                 let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
                 println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
                 // R3: the attained expert-read bandwidth (bytes per token x tokens per second), against the ~900 GB/s
@@ -2326,6 +2334,16 @@ fn write_fixed_logits(out: &mut impl Write, logits: &[f32], vocab: usize) -> any
     anyhow::ensure!(vocab > 0 && logits.len() == vocab && logits.iter().all(|v| v.is_finite()), "invalid fixed decode logits");
     for &v in logits { out.write_all(&v.to_bits().to_le_bytes())?; }
     Ok(())
+}
+
+#[test]
+fn r14_fixed_logit_writer() {
+    let mut buf = Vec::new();
+    write_fixed_logits(&mut buf, &[0.0, -0.0, 1.0], 3).unwrap();
+    assert_eq!(buf, [0u32, 0x80000000, 0x3f800000].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+    assert!(write_fixed_logits(&mut buf, &[f32::NAN], 1).is_err());
+    assert!(write_fixed_logits(&mut buf, &[0.0], 2).is_err());
+    assert_eq!(buf.len(), 12);
 }
 
 /// Expert-cache counters for a DeepSeek/GLM bench run. `tensors_per_expert` is 3 (gate, up, down).

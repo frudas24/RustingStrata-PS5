@@ -153,7 +153,8 @@ def run_child(cmd,env,log,timeout,min_ram):
                 system_swap_start_kib=used(before),system_swap_end_kib=used(after),system_swap_sampled_peak_kib=swap_peak,
                 system_swap_pages_delta={k:swap_end[k]-v for k,v in swap_start.items() if k in swap_end})
 
-def checked_rates(record, k, s, model):
+def checked_rates(record, k, s, model, *, allow_eos=False, decode_mode=None):
+    require(record.get('r14_decode') == decode_mode, 'benchmark decode mode differs')
     require(record.get('schema')=='strata.bench.v1' and record.get('backend')=='vulkan' and record.get('device')==[0], 'not the requested Vulkan backend')
     require(Path(record['model']['path']).resolve()==Path(model).resolve(), 'wrong model in benchmark')
     require(all(record.get(x)==s[x] for x in ('ctx','kv','tg','reps')) and record.get('chunk')==k['chunk'] and record.get('mtp')==0, 'benchmark changed fixed settings')
@@ -164,11 +165,13 @@ def checked_rates(record, k, s, model):
         pp=row['pp']; rates[pp]=[]
         for metric in ('prefill_tok_s','decode_tok_s'):
             stat=row[metric]; a,b,c=(stat[x] for x in ('min','mean','max'))
-            require(all(type(v) in (int,float) and math.isfinite(v) and v>0 for v in (a,b,c)) and a<=b<=c,'bad rate')
+            require(all(type(v) in (int,float) and math.isfinite(v) and (v>=0 if allow_eos and metric=='decode_tok_s' else v>0) for v in (a,b,c)) and a<=b<=c,'bad rate')
             rates[pp].append(b)
         samples=f['samples']; require(len(samples)==s['reps'],'missing fingerprint repetitions')
         for sample in samples:
-            t=sample['tokens']; top=sample['top5']; require(len(t)==s['tg'] and all(type(i) is int and i>=0 for i in t) and sample['stopped'] is False,'early EOS or invalid decode length')
+            t=sample['tokens']; top=sample['top5']
+            valid_length=(len(t)==s['tg'] and sample['stopped'] is False) or (allow_eos and len(t)<s['tg'] and sample['stopped'] is True)
+            require(valid_length and all(type(i) is int and i>=0 for i in t),'early EOS or invalid decode length')
             require(len(top)==5 and all(len(x)==2 and type(x[0]) is int and x[0]>=0 and type(x[1]) in (float,int) and math.isfinite(x[1]) and x[1]<=1e-6 for x in top) and len({x[0] for x in top})==5 and all(top[i][1]>=top[i+1][1] for i in range(4)),'invalid top5')
         signatures[pp]=samples
     return rates,signatures
