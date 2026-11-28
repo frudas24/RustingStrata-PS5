@@ -1,0 +1,11 @@
+test_reject_invalid (__main__.PhysicalGate.test_reject_invalid) ... ok
+test_valid (__main__.PhysicalGate.test_valid) ... ok
+test_copy_overlap_guard_before_recording (__main__.SourceOrder.test_copy_overlap_guard_before_recording) ... ok
+test_drop_commit_after_wait (__main__.SourceOrder.test_drop_commit_after_wait) ... ok
+test_readback_guard_before_recording (__main__.SourceOrder.test_readback_guard_before_recording) ... ok
+test_rejected_nesting_before_mutation (__main__.SourceOrder.test_rejected_nesting_before_mutation) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 8.933s
+
+OK
