@@ -1217,6 +1217,14 @@ enum Cmd {
         /// prose routes few experts; a real prompt shows what a first request costs.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
+        /// Benchmark-only teacher forcing: feed exactly tg continuation tokens, even if the model predicts EOS.
+        /// Requires the generic Vulkan engine, R6 fingerprints and MTP disabled. Not a generation benchmark.
+        #[arg(long)]
+        fixed_decode: bool,
+        /// Untimed quality experiment: write full FP32 little-endian logits after prefill and every forced token.
+        /// Use a new file; this path includes readback and must never be scored as timed decode.
+        #[arg(long, requires = "fixed_decode")]
+        fixed_logits: Option<PathBuf>,
         #[command(flatten)]
         engine: Engine,
     },
@@ -1586,7 +1594,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("\nPPL = {ppl:.4} over {n_chunk} chunks of {n} tokens ({count} scored)");
             if let Some(run) = &mut r { run.finish()?; }
         }
-        Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+        Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, fixed_decode, fixed_logits, mut engine } => {
             let (kv_k, kv_v) = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let r7_timing = std::env::var("STRATA_R7_TOKEN_TIMING").is_ok_and(|v| v == "1");
             let load_start = r7_timing.then(Instant::now);
@@ -1595,6 +1603,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(json_out.is_some() && reps > 0 && tg > 0, "R6 requires JSON output and positive reps/tg");
                 anyhow::ensure!(kv_k == engine.kv && kv_v == engine.kv && matches!(engine.kv.as_str(), "f16" | "q8" | "q4" | "q2"),
                     "R6 profiles require symmetric legacy K/V; benchmark mixed formats without STRATA_PS5_R6");
+            }
+            if fixed_decode {
+                anyhow::ensure!(r6 && engine.mtp() == 0 && !pp.is_empty() && pp.iter().all(|&n| n > 0 && n.checked_add(tg).is_some_and(|end| end <= engine.ctx)),
+                    "fixed decode requires R6, MTP=0 and explicit sufficient context");
             }
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
@@ -1643,14 +1655,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(r.backend_name() == "vulkan" && engine.mtp() == 0, "R6 requires Vulkan and no MTP");
                 anyhow::ensure!(engine.threads == Some(rayon::current_num_threads()), "R6 Rayon pool differs from requested threads");
             }
+            let mut fixed_out = fixed_logits.as_ref().map(|path| std::fs::OpenOptions::new().write(true).create_new(true).open(path).map(std::io::BufWriter::new)).transpose()?;
+            if fixed_decode { anyhow::ensure!(matches!(&r, Runner::Gpu(_)), "fixed decode requires GPU runner"); }
+            let mut fixed_rows = 0usize;
             for n in pp {
-                let ids = prose(&tok, n)?;
+                let sequence = prose(&tok, if fixed_decode { n + tg } else { n })?;
+                let (ids, continuation) = sequence.split_at(n);
+                anyhow::ensure!(!fixed_decode || continuation.iter().all(|&id| (id as usize) < m.cfg.n_vocab), "fixed token outside vocabulary");
                 let (mut p, mut d) = (Vec::new(), Vec::new());
                 let mut fingerprints = Vec::new();
                 for rep in 0..reps {
                     r.reset()?;
                     let t = Instant::now();
-                    let l = r.prefill(&ids)?;
+                    let l = r.prefill(ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
                     let prefill_fp = if r6 {
                         anyhow::ensure!(!l.is_empty() && l.iter().all(|v| v.is_finite()), "R6 non-finite/empty prefill logits");
@@ -1659,19 +1676,43 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         let lse = max + l.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
                         Some(top.into_iter().map(|j| (j, l[j] as f64 - lse)).collect::<Vec<_>>())
                     } else { None };
+                    if let Some(out) = &mut fixed_out {
+                        write_fixed_logits(out, &l, m.cfg.n_vocab)?;
+                        fixed_rows += 1;
+                    }
                     let prefill_start = t;
                     let t = Instant::now();
                     let mut token_times = Vec::new();
-                    let mut token_event = || token_times.push(prefill_start.elapsed().as_nanos());
-                    let observer = r7_timing.then_some(&mut token_event as &mut dyn FnMut());
-                    let (tokens, stopped) = decode_observed(&mut r, &tok, engine.mtp() > 0,
-                        &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false), observer)?;
+                    let mut predictions = Vec::new();
+                    let (tokens, stopped) = if fixed_decode {
+                        for &token in continuation {
+                            let predicted = if let Some(out) = &mut fixed_out {
+                                let logits = r.step(token)?;
+                                write_fixed_logits(out, &logits, m.cfg.n_vocab)?;
+                                fixed_rows += 1;
+                                ops::argmax(&logits) as u32
+                            } else if let Runner::Gpu(g) = &mut r {
+                                g.step_greedy(token)?
+                            } else { unreachable!() };
+                            anyhow::ensure!((predicted as usize) < m.cfg.n_vocab, "fixed prediction outside vocabulary");
+                            predictions.push(predicted);
+                            if r7_timing { token_times.push(prefill_start.elapsed().as_nanos()); }
+                        }
+                        (continuation.to_vec(), false)
+                    } else {
+                        let mut token_event = || token_times.push(prefill_start.elapsed().as_nanos());
+                        let observer = r7_timing.then_some(&mut token_event as &mut dyn FnMut());
+                        decode_observed(&mut r, &tok, engine.mtp() > 0,
+                            &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false), observer)?
+                    };
                     d.push(tokens.len() as f64 / t.elapsed().as_secs_f64());
                     if r7_timing {
                         eprintln!("r7_tokens {}", json!({"pp": n, "rep": rep, "observed_ns": token_times}));
                     }
                     if let Some(top5) = prefill_fp {
-                        fingerprints.push(json!({"top5":top5, "tokens":tokens, "stopped":stopped}));
+                        let mut fp = json!({"top5":top5, "tokens":tokens, "stopped":stopped});
+                        if fixed_decode { fp["predictions"] = json!(predictions); }
+                        fingerprints.push(fp);
                     }
                 }
                 if r6 { r6_rows.push(json!({"pp":n, "samples":fingerprints})); }
@@ -1688,6 +1729,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: eb, decode_median: mid });
             }
             r.finish()?;
+            if let Some(out) = &mut fixed_out { out.flush()?; }
             // After `finish()`: the expert counters are final, and the record cannot reorder `save_profile()`.
             if let Some(path) = json_out {
                 let device: &[usize] = if r.backend_name() == "cpu" { &[] } else { &engine.device };
@@ -1710,6 +1752,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 record["drafts"] = json!({"made": drafts.0, "accepted": drafts.1});
                 record["kv_k"] = json!(kv_k);
                 record["kv_v"] = json!(kv_v);
+                if fixed_decode {
+                    record["r14_decode"] = json!(if fixed_out.is_some() { "fixed_logits" } else { "fixed" });
+                    record["r14_vocab"] = json!(m.cfg.n_vocab);
+                    record["r14_logit_rows"] = json!(fixed_rows);
+                }
                 if r6 {
                     record["r6"] = json!({"threads":rayon::current_num_threads(), "short":engine.short,
                         "rows":r6_rows});
@@ -2272,6 +2319,13 @@ fn prose(tok: &Tokenizer, n: usize) -> anyhow::Result<Vec<u32>> {
     let ids: Vec<u32> = tok.encode(&text.repeat(n / 20 + 1))?.into_iter().take(n).collect();
     anyhow::ensure!(ids.len() == n, "prose prompt too short");
     Ok(ids)
+}
+
+// Only the separate, non-scored R14 quality mode uses full-logit readback.
+fn write_fixed_logits(out: &mut impl Write, logits: &[f32], vocab: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(vocab > 0 && logits.len() == vocab && logits.iter().all(|v| v.is_finite()), "invalid fixed decode logits");
+    for &v in logits { out.write_all(&v.to_bits().to_le_bytes())?; }
+    Ok(())
 }
 
 /// Expert-cache counters for a DeepSeek/GLM bench run. `tensors_per_expert` is 3 (gate, up, down).
